@@ -1,6 +1,28 @@
 workspace:
+  artifacts_dir: .ai-native/runs
+  specs_dir: specs
   base_branch: main
-  dependency_policy: wait_for_base_merge
+  parallel_mode: independent_only
+  parallel_workers: 4
+  worktrees_dir: .ai-native/worktrees
+  dependency_policy: assume_committed
+  parallel_overlap_policy: path_prefix_block
+  question_budget_per_stage: 3
+  question_budget_per_run: 9
+  plan_max_attempts: 6
+  architecture_max_attempts: 6
+  prd_max_attempts: 10
+  loop_max_attempts: 25
+  verification_max_attempts: 10
+  mermaid_validate_command:
+    - mmdc
+  mermaid_validate_args:
+    - --quiet
+
+git:
+  branch_prefix: codex
+  conventional_prefix: feat
+  pr_draft: true
 agents:
   builder:
     type: codex-exec
@@ -34,8 +56,12 @@ agents:
     - -c
     - model_reasoning_effort="xhigh"
 registry:
+  heartbeat_interval_seconds: 15
+  liveness_ttl_seconds: 60
+  liveness_grace_period_seconds: 120
   remote_url: null
   auth_token: null
+  timeout_seconds: 5.0
 telemetry:
   enabled: false
   url: null
@@ -45,3 +71,9 @@ telemetry:
   username: null
   password: null
   tenant: null
+quality_gates:
+  require_plan_approval: true
+  require_diagram_approval: true
+  require_prd_approval: true
+  require_test_critique: true
+  require_red_green_refactor: true
