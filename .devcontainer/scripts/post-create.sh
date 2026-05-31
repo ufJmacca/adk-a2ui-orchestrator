@@ -4,8 +4,22 @@ set -euo pipefail
 VERIFY_ONLY="${1:-}"
 AI_NATIVE_TOOL="git+https://github.com/ufJmacca/ai-native"
 CODEX_HOME_DIR="/home/vscode/.codex"
+HOST_CODEX_DIR="/mnt/host-codex"
 
 export PATH="/home/vscode/.local/bin:${PATH}"
+
+mkdir -p "${CODEX_HOME_DIR}"
+
+for filename in auth.json config.toml; do
+  source_path="${HOST_CODEX_DIR}/${filename}"
+  target_path="${CODEX_HOME_DIR}/${filename}"
+
+  if [[ ! -f "${target_path}" && -f "${source_path}" ]]; then
+    cp "${source_path}" "${target_path}"
+    chmod 0600 "${target_path}" || true
+    echo "[seeded] ${target_path} from ${source_path}"
+  fi
+done
 
 declare -a REQUIRED_FILES=(
   "/home/vscode/.codex/auth.json"
@@ -51,6 +65,15 @@ if [[ -d "${CODEX_HOME_DIR}" ]]; then
   fi
 fi
 
+if [[ -f "${CODEX_HOME_DIR}/config.toml" ]]; then
+  if [[ -w "${CODEX_HOME_DIR}/config.toml" ]]; then
+    echo "[writable] ${CODEX_HOME_DIR}/config.toml"
+  else
+    echo "[not-writable] ${CODEX_HOME_DIR}/config.toml"
+    missing=1
+  fi
+fi
+
 for path in "${OPTIONAL_DIRS[@]}"; do
   if [[ -d "${path}" ]]; then
     echo "[ok] ${path}"
@@ -78,7 +101,7 @@ fi
 if [[ "${missing}" -eq 1 ]]; then
   echo "Required devcontainer credentials or runtime directories are not available." >&2
   echo "Check .devcontainer/compose.yaml and confirm ~/.codex, ~/.ssh, and ~/.gitconfig exist on the host." >&2
-  echo "Codex also requires ${CODEX_HOME_DIR} to be writable by the vscode user so it can persist runtime state." >&2
+  echo "Codex also requires ${CODEX_HOME_DIR} and ${CODEX_HOME_DIR}/config.toml to be writable by the vscode user so it can persist runtime state." >&2
 fi
 
 if [[ "${VERIFY_ONLY}" == "--verify-only" ]]; then

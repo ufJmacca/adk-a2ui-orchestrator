@@ -69,8 +69,8 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '' 'if [ "$(id -u)" 
     && printf '%s\n' 'vscode ALL=(root) NOPASSWD: /usr/local/bin/docker-real' > /etc/sudoers.d/vscode-docker \
     && chmod 0440 /etc/sudoers.d/vscode-docker
 
-RUN mkdir -p /home/vscode/.codex /home/vscode/.npm /workspace \
-    && chown -R vscode:vscode /home/vscode /workspace /ms-playwright
+RUN mkdir -p /home/vscode/.codex /home/vscode/.npm /mnt/host-codex /workspace \
+    && chown -R vscode:vscode /home/vscode /mnt/host-codex /workspace /ms-playwright
 
 USER vscode
 WORKDIR /workspace
