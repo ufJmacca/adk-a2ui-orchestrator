@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
 from orchestrator_demo.contracts import AgentDescriptor
@@ -25,17 +27,6 @@ REQUIRED_SPECIALIST_AGENT_IDS = frozenset(
     }
 )
 
-JSON_SCHEMA_TYPES = frozenset(
-    {
-        "array",
-        "boolean",
-        "integer",
-        "null",
-        "number",
-        "object",
-        "string",
-    }
-)
 SECRET_FIELD_MARKERS = (
     "api_key",
     "apikey",
@@ -112,50 +103,12 @@ def _validate_json_schema(schema: Any, location: str) -> None:
     if not isinstance(schema, Mapping):
         raise DescriptorValidationError(f"{location} must be a JSON-schema object")
 
-    schema_type = schema.get("type")
-    if schema_type is None:
-        raise DescriptorValidationError(f"{location} must declare a JSON-schema type")
-
-    invalid_types: list[str] = []
-    if isinstance(schema_type, str):
-        if schema_type not in JSON_SCHEMA_TYPES:
-            invalid_types.append(schema_type)
-    elif isinstance(schema_type, Sequence) and not isinstance(
-        schema_type, (bytes, bytearray)
-    ):
-        for type_name in schema_type:
-            if not isinstance(type_name, str) or type_name not in JSON_SCHEMA_TYPES:
-                invalid_types.append(str(type_name))
-    else:
-        invalid_types.append(str(schema_type))
-
-    if invalid_types:
-        invalid = ", ".join(invalid_types)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
         raise DescriptorValidationError(
-            f"{location} has invalid JSON-schema type: {invalid}"
-        )
-
-    properties = schema.get("properties")
-    if properties is not None:
-        if not isinstance(properties, Mapping):
-            raise DescriptorValidationError(f"{location}.properties must be an object")
-        for property_name, property_schema in properties.items():
-            _validate_json_schema(
-                property_schema,
-                f"{location}.properties.{property_name}",
-            )
-
-    items = schema.get("items")
-    if items is not None:
-        _validate_json_schema(items, f"{location}.items")
-
-    required = schema.get("required")
-    if required is not None and (
-        not isinstance(required, Sequence)
-        or isinstance(required, (str, bytes, bytearray))
-        or any(not isinstance(field_name, str) for field_name in required)
-    ):
-        raise DescriptorValidationError(f"{location}.required must be a string list")
+            f"{location} is not valid JSON Schema: {_schema_error_location(exc)}"
+        ) from None
 
 
 def _reject_secret_like_fields(value: Any, path: str) -> None:
@@ -189,6 +142,22 @@ def _redacted_validation_message(exc: ValidationError) -> str:
         location = ".".join(str(part) for part in error["loc"])
         messages.append(f"{location}: {error['msg']}")
     return "; ".join(messages)
+
+
+def _schema_error_location(exc: SchemaError) -> str:
+    details: list[str] = []
+    if exc.validator:
+        details.append(f"validator={exc.validator}")
+
+    invalid_schema_path = ".".join(str(part) for part in exc.path)
+    if invalid_schema_path:
+        details.append(f"path={invalid_schema_path}")
+
+    meta_schema_path = ".".join(str(part) for part in exc.schema_path)
+    if meta_schema_path:
+        details.append(f"schema_path={meta_schema_path}")
+
+    return "; ".join(details) if details else type(exc).__name__
 
 
 __all__ = [

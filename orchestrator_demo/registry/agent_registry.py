@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
 import runpy
 from pathlib import Path
@@ -130,14 +131,13 @@ class AgentRegistry:
 
         try:
             importlib.invalidate_caches()
-            module = importlib.import_module(self._config_module)
-            module = importlib.reload(module)
+            namespace = _load_source_namespace_for_module(self._config_module)
         except Exception as exc:
             raise RegistryValidationError(
                 f"failed to load registry config module: {type(exc).__name__}"
             ) from exc
 
-        return _available_agents_from_namespace(module)
+        return _available_agents_from_namespace(namespace)
 
     def _load_raw_descriptors_from_path(self) -> Any:
         if self._config_path is None:
@@ -163,6 +163,30 @@ def _available_agents_from_namespace(namespace: ModuleType | dict[str, Any]) -> 
         raise RegistryValidationError("registry config must define AVAILABLE_AGENTS")
 
     return raw_descriptors
+
+
+def _load_source_namespace_for_module(module_name: str) -> dict[str, Any]:
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        raise ModuleNotFoundError(module_name)
+
+    source_path = Path(spec.origin)
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+
+    package_name = module_name.rpartition(".")[0]
+    namespace: dict[str, Any] = {
+        "__name__": module_name,
+        "__file__": str(source_path),
+        "__package__": package_name,
+        "__loader__": spec.loader,
+        "__spec__": spec,
+        "__cached__": None,
+    }
+    source = source_path.read_text(encoding="utf-8")
+    code = compile(source, str(source_path), "exec", dont_inherit=True)
+    exec(code, namespace)
+    return namespace
 
 
 def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
