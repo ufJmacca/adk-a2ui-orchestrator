@@ -14,7 +14,7 @@ workspace:
   prd_max_attempts: 10
   loop_max_attempts: 25
   verification_max_attempts: 10
-  pr_review_max_attempts: 12
+  pr_review_max_attempts: 24
   mermaid_validate_command:
     - mmdc
   mermaid_validate_args:
