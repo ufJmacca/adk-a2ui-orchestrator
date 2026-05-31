@@ -157,7 +157,7 @@ class SyntheticSpecialistAgent:
             "details_label",
         )
 
-        return [
+        updates = [
             {
                 "version": A2UI_VERSION,
                 "createSurface": {
@@ -218,6 +218,7 @@ class SyntheticSpecialistAgent:
                 },
             },
         ]
+        return updates
 
 
 def citation(agent_id: str, title: str) -> SyntheticCitation:

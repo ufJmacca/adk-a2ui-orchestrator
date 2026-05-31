@@ -118,7 +118,11 @@ def _find_dependency_cycle(dependencies_by_id: dict[str, list[str]]) -> list[str
 
 
 def _is_plan_scoped_user_action(action_type: Any, surface_id: Any) -> bool:
-    return _is_plan_approval_surface(surface_id) and action_type in PLAN_USER_ACTION_TYPES
+    return (
+        isinstance(action_type, str)
+        and _is_plan_approval_surface(surface_id)
+        and action_type in PLAN_USER_ACTION_TYPES
+    )
 
 
 def _is_plan_approval_surface(surface_id: Any) -> bool:
@@ -400,6 +404,9 @@ class UserAction(ContractModel):
             for top_level_plan_id in top_level_plan_ids[1:]
         ):
             raise ValueError("top-level planId aliases must match")
+        if top_level_plan_ids:
+            normalized["planId"] = top_level_plan_ids[0]
+        normalized.pop("plan_id", None)
 
         payload_plan_ids = [
             value
@@ -423,7 +430,22 @@ class UserAction(ContractModel):
         if top_level_plan_id is None and payload_plan_id is not None:
             normalized["planId"] = payload_plan_id
 
-        top_level_plan_version = normalized.get("planVersion", normalized.get("plan_version"))
+        top_level_plan_versions = [
+            value
+            for value in (normalized.get("planVersion"), normalized.get("plan_version"))
+            if value is not None
+        ]
+        if top_level_plan_versions and any(
+            top_level_plan_version != top_level_plan_versions[0]
+            for top_level_plan_version in top_level_plan_versions[1:]
+        ):
+            raise ValueError("top-level planVersion aliases must match")
+        top_level_plan_version = (
+            top_level_plan_versions[0] if top_level_plan_versions else None
+        )
+        if top_level_plan_version is not None:
+            normalized["planVersion"] = top_level_plan_version
+        normalized.pop("plan_version", None)
         payload_plan_versions = [
             value
             for value in (

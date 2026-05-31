@@ -138,17 +138,20 @@ def test_core_contracts_accept_valid_business_banking_workflow() -> None:
         response_id="response_internal_notes",
         agent_id="internal_knowledge",
         content="ABC Manufacturing has two open follow-ups.",
-        a2ui_payload=[
-            {
-                "version": "v0.9",
-                "createSurface": {
-                    "surfaceId": "surface_internal_notes",
-                    "catalogId": (
-                        "https://a2ui.org/specification/v0_9/basic_catalog.json"
-                    ),
-                },
-            }
-        ],
+        a2ui_payload={
+            "surfaceId": "surface_internal_notes",
+            "updates": [
+                {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": "surface_internal_notes",
+                        "catalogId": (
+                            "https://a2ui.org/specification/v0_9/basic_catalog.json"
+                        ),
+                    },
+                }
+            ],
+        },
         surface_id="surface_internal_notes",
     )
     graph = GraphSpec(
@@ -974,6 +977,28 @@ def test_plan_user_action_accepts_plan_identifiers_inside_payload(
     assert user_action.plan_version == 2
 
 
+def test_plan_user_action_accepts_matching_top_level_plan_aliases() -> None:
+    # Arrange
+    from orchestrator_demo.contracts import UserAction
+
+    # Act
+    user_action = UserAction.model_validate(
+        {
+            "type": "approve_plan",
+            "surfaceId": "surface_plan_meeting_prep",
+            "planId": "plan_meeting_prep",
+            "plan_id": "plan_meeting_prep",
+            "planVersion": 1,
+            "plan_version": 1,
+            "payload": {"approvedStepIds": ["step_internal_notes"]},
+        }
+    )
+
+    # Assert
+    assert user_action.plan_id == "plan_meeting_prep"
+    assert user_action.plan_version == 1
+
+
 def test_plan_user_action_requires_plan_identifiers() -> None:
     # Arrange
     from orchestrator_demo.contracts import UserAction
@@ -1055,6 +1080,29 @@ def test_plan_approval_surface_rejects_unknown_user_action_type() -> None:
         )
 
     assert "plan user action types" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("action_type", [["approve_plan"], {"name": "approve_plan"}])
+def test_plan_approval_surface_rejects_malformed_user_action_type(
+    action_type: object,
+) -> None:
+    # Arrange
+    from orchestrator_demo.contracts import UserAction
+
+    # Act / Assert
+    with pytest.raises(ValidationError) as exc_info:
+        UserAction.model_validate(
+            {
+                "type": action_type,
+                "surfaceId": "surface_plan_meeting_prep",
+                "payload": {
+                    "planId": "plan_meeting_prep",
+                    "planVersion": 1,
+                },
+            }
+        )
+
+    assert "type" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
