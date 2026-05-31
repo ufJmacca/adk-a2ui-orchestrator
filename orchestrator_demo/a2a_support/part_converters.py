@@ -15,7 +15,7 @@ def text_part_from_text(text: str) -> TextPart:
 
 
 def a2ui_data_part_from_payload(payload: dict[str, Any]) -> DataPart:
-    return DataPart(mimeType=A2UI_MIME_TYPE, data=payload)
+    return DataPart(data=payload, metadata={"mimeType": A2UI_MIME_TYPE})
 
 
 def a2ui_user_action_from_part(part: DataPart) -> A2uiUserAction:
