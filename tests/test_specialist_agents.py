@@ -40,6 +40,17 @@ def _request_for(agent_id: str) -> SpecialistRequest:
     )
 
 
+def _basic_a2ui_validator():
+    from a2ui.basic_catalog import BasicCatalog
+    from a2ui.schema.manager import A2uiSchemaManager
+
+    catalog = A2uiSchemaManager(
+        version="0.9",
+        catalogs=[BasicCatalog.get_config("0.9")],
+    ).get_selected_catalog()
+    return catalog.validator
+
+
 def test_required_specialist_modules_expose_agent_classes() -> None:
     # Arrange
     expected_modules = REQUIRED_SPECIALIST_MODULES
@@ -173,7 +184,24 @@ async def test_specialist_a2ui_surfaces_use_stable_surface_ids_when_produced(
     assert first_response.surface_id == second_response.surface_id
     assert first_response.a2ui_payload is not None
     assert second_response.a2ui_payload is not None
-    assert first_response.a2ui_payload["surfaceId"] == first_response.surface_id
-    assert second_response.a2ui_payload["surfaceId"] == second_response.surface_id
-    assert first_response.a2ui_payload["metadata"]["ownerAgentId"] == agent_id
-    assert second_response.a2ui_payload["metadata"]["ownerAgentId"] == agent_id
+
+    first_payload = first_response.a2ui_payload
+    second_payload = second_response.a2ui_payload
+    assert isinstance(first_payload, list)
+    assert isinstance(second_payload, list)
+    assert first_payload[0]["createSurface"]["surfaceId"] == first_response.surface_id
+    assert second_payload[0]["createSurface"]["surfaceId"] == second_response.surface_id
+    assert first_payload[1]["updateComponents"]["surfaceId"] == (
+        first_response.surface_id
+    )
+    assert second_payload[1]["updateComponents"]["surfaceId"] == (
+        second_response.surface_id
+    )
+    assert first_payload[0]["createSurface"]["theme"]["agentDisplayName"] == (
+        agent.display_name
+    )
+    assert first_payload[1]["updateComponents"]["components"][0]["id"] == "root"
+
+    validator = _basic_a2ui_validator()
+    validator.validate(first_payload)
+    validator.validate(second_payload)

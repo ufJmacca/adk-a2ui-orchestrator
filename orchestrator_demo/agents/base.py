@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import re
 from typing import Any, Protocol
 
-from orchestrator_demo.contracts import SpecialistRequest, SpecialistResponse
+from orchestrator_demo.contracts import A2uiPayload, SpecialistRequest, SpecialistResponse
 
 
 DEFAULT_CAVEAT = (
@@ -17,6 +17,8 @@ DEFAULT_RISK_CONTROLS = {
     "binding_decision": False,
     "requires_human_review": True,
 }
+A2UI_VERSION = "v0.9"
+BASIC_CATALOG_ID = "https://a2ui.org/specification/v0_9/basic_catalog.json"
 
 
 class SpecialistAgent(Protocol):
@@ -140,30 +142,82 @@ class SyntheticSpecialistAgent:
         self,
         surface_id: str,
         structured_output: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "surfaceId": surface_id,
-            "catalog": "basic",
-            "components": [
-                {
-                    "type": "card",
-                    "id": _stable_contract_id("component", self.agent_id, "summary"),
-                    "title": self.display_name,
-                    "body": structured_output["summary"],
+    ) -> A2uiPayload:
+        content_id = _stable_contract_id("component", self.agent_id, "content")
+        title_id = _stable_contract_id("component", self.agent_id, "title")
+        summary_id = _stable_contract_id("component", self.agent_id, "summary")
+        details_button_id = _stable_contract_id(
+            "component",
+            self.agent_id,
+            "details",
+        )
+        details_label_id = _stable_contract_id(
+            "component",
+            self.agent_id,
+            "details_label",
+        )
+
+        return [
+            {
+                "version": A2UI_VERSION,
+                "createSurface": {
+                    "surfaceId": surface_id,
+                    "catalogId": BASIC_CATALOG_ID,
+                    "theme": {"agentDisplayName": self.display_name},
                 },
-                {
-                    "type": "button",
-                    "id": _stable_contract_id("component", self.agent_id, "details"),
-                    "label": "Show more detail",
-                    "action": {
-                        "type": "specialist_action",
-                        "surfaceId": surface_id,
-                        "payload": {"agentId": self.agent_id},
-                    },
+            },
+            {
+                "version": A2UI_VERSION,
+                "updateComponents": {
+                    "surfaceId": surface_id,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Card",
+                            "child": content_id,
+                        },
+                        {
+                            "id": content_id,
+                            "component": "Column",
+                            "children": [title_id, summary_id, details_button_id],
+                        },
+                        {
+                            "id": title_id,
+                            "component": "Text",
+                            "text": self.display_name,
+                            "variant": "h3",
+                        },
+                        {
+                            "id": summary_id,
+                            "component": "Text",
+                            "text": structured_output["summary"],
+                            "variant": "body",
+                        },
+                        {
+                            "id": details_button_id,
+                            "component": "Button",
+                            "child": details_label_id,
+                            "variant": "borderless",
+                            "action": {
+                                "event": {
+                                    "name": "specialist_action",
+                                    "context": {
+                                        "surfaceId": surface_id,
+                                        "agentId": self.agent_id,
+                                    },
+                                }
+                            },
+                        },
+                        {
+                            "id": details_label_id,
+                            "component": "Text",
+                            "text": "Show more detail",
+                            "variant": "body",
+                        },
+                    ],
                 },
-            ],
-            "metadata": {"ownerAgentId": self.agent_id},
-        }
+            },
+        ]
 
 
 def citation(agent_id: str, title: str) -> SyntheticCitation:
