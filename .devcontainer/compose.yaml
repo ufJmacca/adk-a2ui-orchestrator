@@ -1,5 +1,9 @@
 services:
   devcontainer:
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
     build:
       context: ..
       dockerfile: .devcontainer/Dockerfile
@@ -10,8 +14,9 @@ services:
       NPM_CONFIG_CACHE: /home/vscode/.npm
     volumes:
       - ..:/workspace
-      - ${HOME}/.codex/auth.json:/home/vscode/.codex/auth.json:ro
-      - ${HOME}/.codex/config.toml:/home/vscode/.codex/config.toml:ro
+      - devcontainer-codex-home:/home/vscode/.codex
+      - ${HOME}/.codex/auth.json:/mnt/host-codex/auth.json:ro
+      - ${HOME}/.codex/config.toml:/mnt/host-codex/config.toml:ro
       - ${HOME}/.ssh:/home/vscode/.ssh:ro
       - ${HOME}/.gitconfig:/home/vscode/.gitconfig:ro
       - ${HOME}/.config:/mnt/host-config
@@ -19,4 +24,5 @@ services:
       - devcontainer-npm-cache:/home/vscode/.npm
 
 volumes:
+  devcontainer-codex-home:
   devcontainer-npm-cache:
