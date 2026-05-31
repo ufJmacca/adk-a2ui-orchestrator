@@ -252,27 +252,40 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
 
 
 def _validate_json_schema_type(schema_type: Any, location: str) -> None:
-    has_invalid_type = False
+    invalid_types: list[str] = []
     if isinstance(schema_type, str):
         if schema_type not in JSON_SCHEMA_TYPES:
-            has_invalid_type = True
+            invalid_types.append(schema_type)
     elif isinstance(schema_type, Sequence) and not isinstance(
         schema_type, (bytes, bytearray)
     ):
         if not schema_type:
-            has_invalid_type = True
+            invalid_types.append("<empty>")
         else:
             for type_name in schema_type:
                 if not isinstance(type_name, str) or type_name not in JSON_SCHEMA_TYPES:
-                    has_invalid_type = True
-                    break
+                    invalid_type = (
+                        type_name
+                        if isinstance(type_name, str)
+                        else type(type_name).__name__
+                    )
+                    invalid_types.append(invalid_type)
     else:
-        has_invalid_type = True
+        invalid_types.append(type(schema_type).__name__)
 
-    if has_invalid_type:
-        raise DescriptorValidationError(
-            f"{location}.type has invalid JSON-schema type"
-        )
+    if not invalid_types:
+        return
+
+    message = f"{location}.type has invalid JSON-schema type"
+    safe_invalid_types = [
+        type_name
+        for type_name in invalid_types
+        if type_name != "<empty>" and not _is_secret_like_value(type_name)
+    ]
+    if safe_invalid_types and len(safe_invalid_types) == len(invalid_types):
+        message = f"{message}: {', '.join(safe_invalid_types)}"
+
+    raise DescriptorValidationError(message)
 
 
 def _validate_schema_value_container(
