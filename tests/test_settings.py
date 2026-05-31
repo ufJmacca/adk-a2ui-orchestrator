@@ -1,7 +1,45 @@
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_documented_app_module_command_reaches_settings_validation(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    env = os.environ.copy()
+    env.pop("OPENROUTER_API_KEY", None)
+    env.pop("LLM_MODEL", None)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(REPOSITORY_ROOT)
+        if existing_pythonpath is None
+        else f"{REPOSITORY_ROOT}{os.pathsep}{existing_pythonpath}"
+    )
+
+    # Act
+    result = subprocess.run(
+        [sys.executable, "-m", "orchestrator_demo.app"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert result.returncode == 2
+    assert "Missing required runtime configuration" in result.stderr
+    assert "OPENROUTER_API_KEY" in result.stderr
+    assert "LLM_MODEL" in result.stderr
+    assert "No module named orchestrator_demo.app.__main__" not in result.stderr
 
 
 def test_settings_load_required_and_optional_openrouter_values(

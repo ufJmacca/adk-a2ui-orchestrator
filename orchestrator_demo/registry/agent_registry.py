@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import importlib
 import logging
 import runpy
+import sys
+from importlib import invalidate_caches
+from importlib import util as importlib_util
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -58,7 +60,7 @@ class AgentRegistry:
 
         previous_agent_ids = set(self._descriptors_by_id)
         try:
-            raw_descriptors = self._load_raw_descriptors()
+            raw_descriptors, module_to_publish = self._load_raw_descriptors()
             next_descriptors = validate_agent_descriptors(raw_descriptors)
         except RegistryValidationError as exc:
             self._logger.error(
@@ -79,6 +81,8 @@ class AgentRegistry:
         next_agent_ids = set(next_descriptors)
         added_agent_ids = sorted(next_agent_ids - previous_agent_ids)
         removed_agent_ids = sorted(previous_agent_ids - next_agent_ids)
+        if module_to_publish is not None:
+            sys.modules[self._config_module] = module_to_publish
         self._descriptors_by_id = dict(sorted(next_descriptors.items()))
         self._logger.info(
             "agent registry reloaded source=%s added=%s removed=%s total=%d",
@@ -124,20 +128,18 @@ class AgentRegistry:
             return str(self._config_path)
         return self._config_module
 
-    def _load_raw_descriptors(self) -> Any:
+    def _load_raw_descriptors(self) -> tuple[Any, ModuleType | None]:
         if self._config_path is not None:
-            return self._load_raw_descriptors_from_path()
+            return self._load_raw_descriptors_from_path(), None
 
         try:
-            importlib.invalidate_caches()
-            module = importlib.import_module(self._config_module)
-            module = importlib.reload(module)
+            module = _load_module_from_source(self._config_module)
         except Exception as exc:
             raise RegistryValidationError(
                 f"failed to load registry config module: {type(exc).__name__}"
             ) from exc
 
-        return _available_agents_from_namespace(module)
+        return _available_agents_from_namespace(module), module
 
     def _load_raw_descriptors_from_path(self) -> Any:
         if self._config_path is None:
@@ -163,6 +165,20 @@ def _available_agents_from_namespace(namespace: ModuleType | dict[str, Any]) -> 
         raise RegistryValidationError("registry config must define AVAILABLE_AGENTS")
 
     return raw_descriptors
+
+
+def _load_module_from_source(module_name: str) -> ModuleType:
+    invalidate_caches()
+    spec = importlib_util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        raise RegistryValidationError(f"cannot find source for {module_name}")
+
+    source_path = Path(spec.origin)
+    source = source_path.read_text(encoding="utf-8")
+    code = compile(source, str(source_path), "exec")
+    module = importlib_util.module_from_spec(spec)
+    exec(code, module.__dict__)
+    return module
 
 
 def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
