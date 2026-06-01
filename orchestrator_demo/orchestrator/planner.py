@@ -17,7 +17,7 @@ class PlanRequiredError(ValueError):
     """Raised when draft planning is requested for a non-plan route."""
 
 
-class PlanCreationError(ValueError):
+class PlanCreationError(PlanRequiredError):
     """Raised when a safe draft plan cannot be formed."""
 
 
@@ -48,7 +48,9 @@ class DraftExecutionPlanner:
         }
         requested_agent_ids = _dedupe(context.llm_assessment.required_agents)
         selected_agent_ids = [
-            agent_id for agent_id in requested_agent_ids if agent_id in available_agent_ids
+            agent_id
+            for agent_id in requested_agent_ids
+            if agent_id in available_agent_ids
         ]
         omitted_agent_ids = [
             agent_id
@@ -63,16 +65,22 @@ class DraftExecutionPlanner:
         )
         if requires_synthesis and SYNTHESIS_AGENT_ID not in available_agent_ids:
             raise PlanCreationError(
-                "draft execution plan requires synthesis but the synthesis "
-                "agent is unavailable"
+                "draft execution plan requires unavailable synthesis agent; "
+                "requires synthesis but the synthesis agent is unavailable"
             )
         if requires_synthesis and SYNTHESIS_AGENT_ID not in selected_agent_ids:
             selected_agent_ids.append(SYNTHESIS_AGENT_ID)
         selected_agent_ids = _move_synthesis_to_end(selected_agent_ids)
         if not _has_non_synthesis_workstream(selected_agent_ids):
+            unavailable_detail = (
+                f"; requested agents are unavailable: {', '.join(omitted_agent_ids)}"
+                if omitted_agent_ids
+                else ""
+            )
             raise PlanCreationError(
                 "draft execution plan cannot be formed because no available "
-                "non-synthesis specialist workstream remains after registry filtering"
+                "non-synthesis specialist workstream remains after registry "
+                f"filtering{unavailable_detail}"
             )
 
         plan_id = _plan_id_for(context)
@@ -87,7 +95,7 @@ class DraftExecutionPlanner:
                 f"Unavailable agents omitted: {', '.join(omitted_agent_ids)}."
             )
 
-        return ExecutionPlan(
+        plan = ExecutionPlan(
             plan_id=plan_id,
             objective=context.user_input,
             detected_intents=context.llm_assessment.intents,
@@ -97,6 +105,8 @@ class DraftExecutionPlanner:
             risk_notes=risk_notes,
             approval_surface_id=f"surface_{plan_id}",
         )
+        context.record_draft_plan(plan)
+        return plan
 
 
 def _build_steps(
@@ -105,12 +115,10 @@ def _build_steps(
     selected_agent_ids: Sequence[str],
     primary_parallel_group: str,
 ) -> list[PlanStep]:
-    step_ids_by_agent_id = dict(
-        zip(selected_agent_ids, _step_ids_for(selected_agent_ids), strict=True)
-    )
+    step_ids_by_agent_id = _step_ids_by_agent_id(selected_agent_ids)
     non_synthesis_step_ids = [
-        step_ids_by_agent_id[agent_id]
-        for agent_id in selected_agent_ids
+        step_id
+        for agent_id, step_id in step_ids_by_agent_id.items()
         if agent_id != SYNTHESIS_AGENT_ID
     ]
     steps: list[PlanStep] = []
@@ -134,6 +142,24 @@ def _build_steps(
         )
 
     return steps
+
+
+def _step_ids_by_agent_id(selected_agent_ids: Sequence[str]) -> dict[str, str]:
+    step_ids_by_agent_id: dict[str, str] = {}
+    used_step_ids: set[str] = set()
+
+    for agent_id in selected_agent_ids:
+        base_step_id = _step_id_for(agent_id)
+        step_id = base_step_id
+        suffix = 2
+        while step_id in used_step_ids:
+            step_id = f"{base_step_id}_{suffix}"
+            suffix += 1
+
+        step_ids_by_agent_id[agent_id] = step_id
+        used_step_ids.add(step_id)
+
+    return step_ids_by_agent_id
 
 
 class _StepMetadata:
@@ -236,7 +262,10 @@ def _step_metadata(agent_id: str, objective: str) -> _StepMetadata:
     return templates.get(
         agent_id,
         _StepMetadata(
-            instruction=f"Complete the {agent_id.replace('_', ' ')} workstream for: {objective}",
+            instruction=(
+                f"Complete the {agent_id.replace('_', ' ')} workstream for: "
+                f"{objective}"
+            ),
             expected_output=f"{agent_id.replace('_', ' ').title()} findings.",
             data_source_categories=[agent_id],
         ),
@@ -284,33 +313,19 @@ def _parallel_group_for(context: RequestContext) -> str:
 
 
 def _plan_id_for(context: RequestContext) -> str:
-    for candidate in [*context.llm_assessment.intents, *context.llm_assessment.required_agents]:
+    plan_id_candidates = [
+        *context.llm_assessment.intents,
+        *context.llm_assessment.required_agents,
+    ]
+    for candidate in plan_id_candidates:
         if candidate != "unknown":
-            return f"plan_{_slug(candidate)}"
+            return f"plan_{_slug(candidate)}_{_slug(context.plan_scope_id)}"
 
-    return "plan_data_quality"
+    return f"plan_data_quality_{_slug(context.plan_scope_id)}"
 
 
 def _step_id_for(agent_id: str) -> str:
     return f"step_{_slug(agent_id)}"
-
-
-def _step_ids_for(agent_ids: Sequence[str]) -> list[str]:
-    used_step_ids: set[str] = set()
-    step_ids: list[str] = []
-
-    for index, agent_id in enumerate(agent_ids, start=1):
-        base_step_id = _step_id_for(agent_id)
-        step_id = base_step_id
-        if step_id in used_step_ids:
-            step_id = f"{base_step_id}_{index}"
-            while step_id in used_step_ids:
-                index += 1
-                step_id = f"{base_step_id}_{index}"
-        used_step_ids.add(step_id)
-        step_ids.append(step_id)
-
-    return step_ids
 
 
 def _slug(value: str) -> str:

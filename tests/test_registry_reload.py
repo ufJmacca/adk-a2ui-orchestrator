@@ -471,6 +471,53 @@ def test_module_reload_rejects_invalid_descriptor_without_publishing_module_stat
     assert registry.agent_ids() == ["internal_knowledge"]
 
 
+def test_module_reload_rolls_back_unexpected_validation_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import (
+        AgentRegistry,
+        RegistryValidationError,
+    )
+
+    package_name = "registry_reload_unexpected_error_case"
+    module_name = f"{package_name}.agent_config"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    config_path = package_dir / "agent_config.py"
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop(module_name, None)
+    sys.modules.pop(package_name, None)
+
+    _write_config(config_path, [_descriptor_source("agent_alpha")])
+    registry = AgentRegistry(config_module=module_name)
+    accepted_module = sys.modules[module_name]
+
+    config_path.write_text(
+        "from collections.abc import Sequence\n\n"
+        "class BrokenDescriptors(Sequence):\n"
+        "    def __len__(self):\n"
+        "        return 1\n\n"
+        "    def __getitem__(self, index):\n"
+        "        raise RuntimeError('iterator should not publish rejected module')\n\n"
+        "AVAILABLE_AGENTS = BrokenDescriptors()\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with pytest.raises(RegistryValidationError) as exc_info:
+        registry.reload()
+
+    parent_package = importlib.import_module(package_name)
+    assert "RuntimeError" in str(exc_info.value)
+    assert registry.agent_ids() == ["agent_alpha"]
+    assert sys.modules[module_name] is accepted_module
+    assert parent_package.agent_config is accepted_module
+
+
 def test_module_reload_observes_same_size_rapid_config_edit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
