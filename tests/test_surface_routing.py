@@ -330,6 +330,129 @@ def test_validated_specialist_a2ui_is_preserved_unchanged_and_registered() -> No
     assert owner.owner_id == "product_opportunity"
 
 
+def test_mixed_incremental_update_allows_registered_component_reference() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    surface_id = "surface_product_incremental"
+    initial_payload = [
+        {
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": surface_id,
+                "catalogId": BASIC_CATALOG_ID,
+            },
+        },
+        {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                    {
+                        "component": "Column",
+                        "id": "root",
+                        "children": ["component_existing_summary"],
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_existing_summary",
+                        "text": "Existing relationship summary.",
+                    },
+                ],
+            },
+        },
+    ]
+    incremental_payload = [
+        {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                    {
+                        "component": "Table",
+                        "id": "component_metrics",
+                        "columns": [{"key": "metric", "label": "Metric"}],
+                        "rows": [{"metric": "Deposit growth"}],
+                    },
+                    {
+                        "component": "Row",
+                        "id": "component_actions",
+                        "children": ["component_existing_summary"],
+                    },
+                ],
+            },
+        }
+    ]
+
+    # Act
+    prepare_specialist_a2ui_for_renderer(
+        initial_payload,
+        owner_agent_id="product_opportunity",
+        surface_registry=registry,
+    )
+    parts = prepare_specialist_a2ui_for_renderer(
+        incremental_payload,
+        owner_agent_id="product_opportunity",
+        surface_registry=registry,
+    )
+
+    # Assert
+    assert [part.data for part in parts] == incremental_payload
+    owner = registry.owner_for(surface_id)
+    assert owner is not None
+    assert owner.owner_id == "product_opportunity"
+
+
+def test_mixed_incremental_update_still_rejects_unknown_component_reference() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        RendererContractError,
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    surface_id = "surface_product_incremental_rejected"
+    prepare_specialist_a2ui_for_renderer(
+        _specialist_a2ui(surface_id),
+        owner_agent_id="product_opportunity",
+        surface_registry=registry,
+    )
+    incremental_payload = [
+        {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                    {
+                        "component": "Table",
+                        "id": "component_metrics",
+                        "columns": [{"key": "metric", "label": "Metric"}],
+                        "rows": [{"metric": "Deposit growth"}],
+                    },
+                    {
+                        "component": "Row",
+                        "id": "component_actions",
+                        "children": ["component_missing"],
+                    },
+                ],
+            },
+        }
+    ]
+
+    # Act / Assert
+    with pytest.raises(RendererContractError, match="component_missing"):
+        prepare_specialist_a2ui_for_renderer(
+            incremental_payload,
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+
+
 def test_failed_specialist_renderer_preparation_leaves_registry_unchanged() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.renderer_contract import (
@@ -764,6 +887,60 @@ async def test_failed_multi_message_response_registration_leaves_registry_unchan
     assert registry.owner_for("surface_product_recommendation") == original_owner
     assert registry.owner_for("surface_product_recommendation_detail") is None
     assert registry.owner_for("surface_plan_specialist_claim") is None
+    assert adapter.received_user_actions == [user_action]
+
+
+@pytest.mark.asyncio
+async def test_mixed_invalid_response_registration_leaves_registry_unchanged() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    original_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    adapter = SurfaceReturningSpecialistAdapter("surface_product_recommendation_detail")
+    adapter.response = SpecialistResponse(
+        response_id="response_product_opportunity_mixed_invalid_a2ui",
+        agent_id="product_opportunity",
+        content="Product Opportunity Agent: mixed follow-up surfaces.",
+        structured_output={"summary": "mixed follow-up surfaces"},
+        a2ui_payload=(
+            _delete_surface_a2ui("surface_product_recommendation")
+            + _specialist_a2ui("surface_product_recommendation_detail")
+            + [
+                {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": "surface_invalid_specialist_delta",
+                        "components": [],
+                    },
+                }
+            ]
+        ),
+        surface_id="surface_product_recommendation_detail",
+    )
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"buttonId": "show_more_detail"},
+        }
+    }
+
+    # Act
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": adapter},
+    )
+
+    # Assert
+    assert result.status == "forwarded"
+    assert result.response is adapter.response
+    assert registry.owner_for("surface_product_recommendation") == original_owner
+    assert registry.owner_for("surface_product_recommendation_detail") is None
+    assert registry.owner_for("surface_invalid_specialist_delta") is None
     assert adapter.received_user_actions == [user_action]
 
 

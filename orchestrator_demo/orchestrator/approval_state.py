@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Literal
 
 from orchestrator_demo.a2a_support.transport import DataPart
@@ -126,25 +127,28 @@ class ApprovalStateStore:
         self._graph_runtime = graph_runtime or AdkGraphRuntime(
             specialist_handlers=default_specialist_handlers(self._agent_ids)
         )
+        self._lock = threading.RLock()
 
     def add_draft(self, plan: ExecutionPlan) -> ApprovalRecord:
         """Store a deep copy of a draft plan without owning the caller's object."""
 
-        draft = plan.model_copy(deep=True)
-        existing = self._records.get(draft.plan_id)
-        if existing is not None and existing.status != "draft":
-            raise PlanAlreadyFinalError(
-                f"plan {draft.plan_id} is already {existing.status}"
-            )
+        with self._lock:
+            draft = plan.model_copy(deep=True)
+            existing = self._records.get(draft.plan_id)
+            if existing is not None and existing.status != "draft":
+                raise PlanAlreadyFinalError(
+                    f"plan {draft.plan_id} is already {existing.status}"
+                )
 
-        record = ApprovalRecord(draft_plan=draft)
-        self._records[draft.plan_id] = record
-        return _record_snapshot(record)
+            record = ApprovalRecord(draft_plan=draft)
+            self._records[draft.plan_id] = record
+            return _record_snapshot(record)
 
     def get(self, plan_id: str) -> ApprovalRecord:
         """Return a defensive snapshot of a plan record for inspection."""
 
-        return _record_snapshot(self._get_live_record(plan_id))
+        with self._lock:
+            return _record_snapshot(self._get_live_record(plan_id))
 
     def _get_live_record(self, plan_id: str) -> ApprovalRecord:
         try:
@@ -162,15 +166,16 @@ class ApprovalStateStore:
 
         action = parse_plan_user_action(candidate)
         assert action.plan_id is not None
-        record = self._get_live_record(action.plan_id)
-        self._require_matching_surface(record, action)
+        with self._lock:
+            record = self._get_live_record(action.plan_id)
+            self._require_matching_surface(record, action)
 
-        if action.type == "approve_plan":
-            return self._approve(record, action)
-        if action.type == "reject_plan":
-            return self._reject(record, action)
+            if action.type == "approve_plan":
+                return self._approve(record, action)
+            if action.type == "reject_plan":
+                return self._reject(record, action)
 
-        return self._mutate_draft(record, action)
+            return self._mutate_draft(record, action)
 
     def _approve(
         self,
