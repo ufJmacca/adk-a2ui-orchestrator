@@ -1057,6 +1057,29 @@ def test_plan_approval_surface_rejects_unknown_user_action_type() -> None:
     assert "plan user action types" in str(exc_info.value)
 
 
+@pytest.mark.parametrize("action_type", [["approve_plan"], {"name": "approve_plan"}])
+def test_user_action_rejects_non_string_type_with_validation_error(
+    action_type: object,
+) -> None:
+    # Arrange
+    from orchestrator_demo.contracts import UserAction
+
+    # Act / Assert
+    with pytest.raises(ValidationError) as exc_info:
+        UserAction.model_validate(
+            {
+                "type": action_type,
+                "surfaceId": "surface_plan_meeting_prep",
+                "payload": {
+                    "planId": "plan_meeting_prep",
+                    "planVersion": 1,
+                },
+            }
+        )
+
+    assert "type" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     "payload_version_key",
     ["planVersion", "editedPlanVersion"],

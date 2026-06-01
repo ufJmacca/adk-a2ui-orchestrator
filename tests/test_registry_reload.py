@@ -1,6 +1,7 @@
 import importlib
 import logging
 import os
+import py_compile
 import sys
 import traceback
 import warnings
@@ -233,6 +234,65 @@ def test_module_registry_invalid_reload_restores_parent_package_submodule(
     assert sys.modules[module_name] is parent_package.agent_config
 
 
+def test_module_registry_unexpected_validation_error_restores_published_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import (
+        AgentRegistry,
+        RegistryValidationError,
+    )
+
+    package_name = "registry_reload_unexpected_rollback_case"
+    module_name = f"{package_name}.agent_config"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    config_path = package_dir / "agent_config.py"
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop(module_name, None)
+    sys.modules.pop(package_name, None)
+
+    _write_config(config_path, [_descriptor_source("agent_alpha")])
+    registry = AgentRegistry(config_module=module_name)
+    accepted_module = sys.modules[module_name]
+    parent_package = importlib.import_module(package_name)
+    assert parent_package.agent_config is accepted_module
+
+    config_path.write_text(
+        "from collections.abc import Sequence\n\n"
+        "class RaisingAgents(Sequence):\n"
+        "    def __len__(self):\n"
+        "        return 1\n\n"
+        "    def __getitem__(self, index):\n"
+        "        raise RuntimeError('must-not-publish')\n\n"
+        "    def __iter__(self):\n"
+        "        raise RuntimeError('must-not-publish')\n\n"
+        "AVAILABLE_AGENTS = RaisingAgents()\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    parent_package = importlib.import_module(package_name)
+    assert "failed to validate registry config: RuntimeError" in str(exc_info.value)
+    assert "must-not-publish" not in str(exc_info.value)
+    assert "must-not-publish" not in caplog.text
+    assert registry.agent_ids() == ["agent_alpha"]
+    assert sys.modules[module_name] is accepted_module
+    assert importlib.import_module(module_name) is accepted_module
+    assert parent_package.agent_config is accepted_module
+    assert [
+        descriptor.agent_id for descriptor in accepted_module.AVAILABLE_AGENTS
+    ] == ["agent_alpha"]
+
+
 def test_module_registry_reload_executes_config_with_import_compatible_module_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -328,6 +388,127 @@ def test_module_registry_compile_does_not_inherit_future_annotation_flags(
         sys.modules[module_name].build_descriptor.__annotations__["return"]
         is AgentDescriptor
     )
+
+def test_module_reload_rejects_missing_available_agents_without_publishing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import (
+        AgentRegistry,
+        RegistryValidationError,
+    )
+
+    module_name = "agent_config_missing_available_agents"
+    config_path = tmp_path / f"{module_name}.py"
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = AgentRegistry(config_module=module_name)
+    accepted_module = sys.modules[module_name]
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with pytest.raises(RegistryValidationError) as exc_info:
+        registry.reload()
+
+    assert "registry config must define AVAILABLE_AGENTS" in str(exc_info.value)
+    assert sys.modules[module_name] is accepted_module
+    assert importlib.import_module(module_name) is accepted_module
+    assert [
+        descriptor.agent_id for descriptor in accepted_module.AVAILABLE_AGENTS
+    ] == ["internal_knowledge"]
+    assert registry.agent_ids() == ["internal_knowledge"]
+
+
+def test_module_reload_rejects_invalid_descriptor_without_publishing_module_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import (
+        AgentRegistry,
+        RegistryValidationError,
+    )
+
+    module_name = "agent_config_invalid_descriptor"
+    config_path = tmp_path / f"{module_name}.py"
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = AgentRegistry(config_module=module_name)
+    accepted_module = sys.modules[module_name]
+    config_path.write_text(
+        "AVAILABLE_AGENTS = [\n"
+        "    {\n"
+        "        'agent_id': 'rejected_agent',\n"
+        "        'display_name': 'Rejected Agent',\n"
+        "        'capabilities': ['business banking support'],\n"
+        "        'input_schema': {'type': 'object'},\n"
+        "        'output_schema': {'type': 'object'},\n"
+        "        'a2ui_catalogs': ['basic'],\n"
+        "        'routing_examples': ['Handle a rejected request.'],\n"
+        "        'execution_mode': 'local_llm',\n"
+        "        'unsupported_field': 'must-not-publish',\n"
+        "    }\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with pytest.raises(RegistryValidationError) as exc_info:
+        registry.reload()
+
+    assert "unsupported_field" in str(exc_info.value)
+    assert sys.modules[module_name] is accepted_module
+    assert importlib.import_module(module_name) is accepted_module
+    assert [
+        descriptor.agent_id for descriptor in accepted_module.AVAILABLE_AGENTS
+    ] == ["internal_knowledge"]
+    assert registry.agent_ids() == ["internal_knowledge"]
+
+
+def test_module_reload_observes_same_size_rapid_config_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    module_name = "agent_config_same_size_edit"
+    config_path = tmp_path / f"{module_name}.py"
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    first_source = (
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        f"{_descriptor_source('alpha_agent')}\n"
+        "]\n"
+    )
+    second_source = (
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        f"{_descriptor_source('bravo_agent')}\n"
+        "]\n"
+    )
+    assert len(first_source) == len(second_source)
+    config_path.write_text(first_source, encoding="utf-8")
+    fixed_mtime = 1_700_000_000
+    os.utime(config_path, (fixed_mtime, fixed_mtime))
+    py_compile.compile(str(config_path), doraise=True)
+    registry = AgentRegistry(config_module=module_name)
+    config_path.write_text(second_source, encoding="utf-8")
+    os.utime(config_path, (fixed_mtime, fixed_mtime))
+
+    # Act
+    registry.reload()
+
+    # Assert
+    assert registry.agent_ids() == ["bravo_agent"]
 
 
 def test_invalid_reload_keeps_previous_registry_and_redacts_secret_like_values(
@@ -483,6 +664,90 @@ def test_invalid_reload_rejects_secret_like_string_values_without_leaking_them(
     assert "agent registry reload rejected" in caplog.text
     assert leaked_value not in str(exc_info.value)
     assert leaked_value not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("schema_source", "expected_error", "expected_path", "leaked_value"),
+    [
+        pytest.param(
+            "{'type': 'object', 'propertyNames': {'type': 'unsupported'}}",
+            "invalid JSON-schema type",
+            "input_schema.propertyNames.type",
+            None,
+            id="unsupported-type",
+        ),
+        pytest.param(
+            "{'type': 'object', 'propertyNames': {"
+            "'type': 'object', 'required': ['api_key']"
+            "}}",
+            "secret-like",
+            "input_schema.propertyNames.required[0]",
+            "api_key",
+            id="secret-like-required-name",
+        ),
+        pytest.param(
+            "{'type': 'object', 'propertyNames': {'type': "
+            "'sk-live-property-names-type-should-not-appear'"
+            "}}",
+            "invalid JSON-schema type",
+            "input_schema.propertyNames.type",
+            "sk-live-property-names-type-should-not-appear",
+            id="secret-like-type-value",
+        ),
+    ],
+)
+def test_invalid_reload_validates_property_names_schema_without_leak(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    schema_source: str,
+    expected_error: str,
+    expected_path: str,
+    leaked_value: str | None,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Mutated Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
+        f"        input_schema={schema_source},\n"
+        "        output_schema={'type': 'object'},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    current_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    assert current_descriptors == previous_descriptors
+    assert expected_error in str(exc_info.value)
+    assert expected_path in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+    if leaked_value is not None:
+        assert leaked_value not in repr(current_descriptors)
+        assert leaked_value not in str(exc_info.value)
+        assert leaked_value not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -724,6 +989,48 @@ def test_registry_rejects_invalid_input_and_output_schemas(
     assert "invalid JSON-schema type" in str(exc_info.value)
     assert leaked_value not in str(exc_info.value)
     assert leaked_value not in caplog.text
+
+
+@pytest.mark.parametrize("schema_field", ["input_schema", "output_schema"])
+def test_registry_reports_non_secret_invalid_schema_type_values(
+    tmp_path: Path,
+    schema_field: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    config_path = tmp_path / "agent_config.py"
+    invalid_schema_value = "definitely_not_a_json_schema_type"
+    input_schema = "{'type': 'object'}"
+    output_schema = "{'type': 'object'}"
+    if schema_field == "input_schema":
+        input_schema = f"{{'type': {invalid_schema_value!r}}}"
+    else:
+        output_schema = f"{{'type': {invalid_schema_value!r}}}"
+
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
+        f"        input_schema={input_schema},\n"
+        f"        output_schema={output_schema},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with pytest.raises(RegistryValidationError) as exc_info:
+        _registry_from(config_path)
+
+    assert schema_field in str(exc_info.value)
+    assert invalid_schema_value in str(exc_info.value)
 
 
 def test_registry_rejects_schema_type_arrays_without_leaking_values(
@@ -1289,6 +1596,265 @@ def test_invalid_reload_validates_schema_valued_maps(
     assert expected_error in str(exc_info.value)
     assert expected_path in str(exc_info.value)
     assert "agent registry reload rejected" in caplog.text
+
+
+def test_registry_reload_accepts_generator_backed_descriptor_fields(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    config_path.write_text(
+        "def one_shot(value):\n"
+        "    yield value\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    {\n"
+        "        'agent_id': 'internal_knowledge',\n"
+        "        'display_name': 'Internal Knowledge Agent',\n"
+        "        'capabilities': one_shot('crm notes'),\n"
+        "        'input_schema': {'type': 'object'},\n"
+        "        'output_schema': {'type': 'object'},\n"
+        "        'a2ui_catalogs': ['basic'],\n"
+        "        'routing_examples': one_shot('Summarize notes.'),\n"
+        "        'execution_mode': 'local_llm',\n"
+        "    }\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act
+    registry.reload()
+
+    # Assert
+    descriptor = registry.get("internal_knowledge")
+    assert descriptor is not None
+    assert descriptor.capabilities == ["crm notes"]
+    assert descriptor.routing_examples == ["Summarize notes."]
+
+
+@pytest.mark.parametrize(
+    "container_name",
+    ["$defs", "definitions", "dependentSchemas", "patternProperties"],
+)
+def test_invalid_reload_rejects_secret_like_schema_map_keys(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    container_name: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    leaked_key = "sk-live-map-key-should-not-appear"
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    schema_source = (
+        "{"
+        "'type': 'object', "
+        f"{container_name!r}: {{{leaked_key!r}: {{'type': 'object'}}}},"
+        "}"
+    )
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Mutated Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
+        f"        input_schema={schema_source},\n"
+        "        output_schema={'type': 'object'},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    assert {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    } == previous_descriptors
+    assert "secret-like schema map key" in str(exc_info.value)
+    assert f"input_schema.{container_name}.<redacted>" in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+    assert leaked_key not in str(exc_info.value)
+    assert leaked_key not in caplog.text
+
+
+def test_invalid_reload_rejects_secret_like_top_level_mapping_keys_without_leaking_them(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    leaked_key = "sk-live-top-level-map-key-should-not-appear"
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    config_path.write_text(
+        "AVAILABLE_AGENTS = [\n"
+        "    {\n"
+        "        'agent_id': 'internal_knowledge',\n"
+        "        'display_name': 'Mutated Internal Knowledge Agent',\n"
+        "        'capabilities': ['crm notes'],\n"
+        "        'input_schema': {'type': 'object'},\n"
+        "        'output_schema': {'type': 'object'},\n"
+        "        'a2ui_catalogs': ['basic'],\n"
+        "        'routing_examples': ['Summarize notes.'],\n"
+        "        'execution_mode': 'local_llm',\n"
+        f"        {leaked_key!r}: 'unused',\n"
+        "    }\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    assert {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    } == previous_descriptors
+    assert "secret-like mapping key" in str(exc_info.value)
+    assert "AVAILABLE_AGENTS[0].<redacted>" in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+    assert leaked_key not in str(exc_info.value)
+    assert leaked_key not in caplog.text
+
+
+def test_invalid_reload_rejects_secret_like_schema_property_keys_without_leaking_them(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    leaked_key = "sk-live-schema-property-key-should-not-appear"
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Mutated Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
+        "        input_schema={\n"
+        "            'type': 'object',\n"
+        "            'properties': {\n"
+        f"                {leaked_key!r}: {{'type': 'string'}},\n"
+        "            },\n"
+        "        },\n"
+        "        output_schema={'type': 'object'},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    assert {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    } == previous_descriptors
+    assert "secret-like schema map key" in str(exc_info.value)
+    assert "input_schema.properties.<redacted>" in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+    assert leaked_key not in str(exc_info.value)
+    assert leaked_key not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "dependent_fields_source",
+    [
+        pytest.param("['account_id']", id="valid-list"),
+        pytest.param("'account_id'", id="malformed-list"),
+    ],
+)
+def test_invalid_reload_rejects_secret_like_dependent_required_keys_without_leaking_them(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    dependent_fields_source: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    leaked_key = "sk-live-abcdefghijklmnop"
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    schema_source = (
+        "{"
+        "'type': 'object', "
+        "'dependentRequired': {"
+        f"{leaked_key!r}: {dependent_fields_source}"
+        "},"
+        "}"
+    )
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Mutated Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
+        f"        input_schema={schema_source},\n"
+        "        output_schema={'type': 'object'},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    assert {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    } == previous_descriptors
+    assert "secret-like schema map key" in str(exc_info.value)
+    assert "input_schema.dependentRequired.<redacted>" in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+    assert leaked_key not in str(exc_info.value)
+    assert leaked_key not in caplog.text
 
 
 @pytest.mark.parametrize("schema_field", ["input_schema", "output_schema"])
