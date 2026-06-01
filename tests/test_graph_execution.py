@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import pytest
+
 from orchestrator_demo.contracts import ExecutionPlan, PlanStep, SpecialistResponse
-from orchestrator_demo.orchestrator.graph_runtime import AdkGraphRuntime
+from orchestrator_demo.orchestrator.graph_runtime import (
+    AdkGraphRuntime,
+    GraphRuntimeError,
+)
 
 
 def _response_for(request) -> SpecialistResponse:
@@ -176,6 +181,12 @@ def test_fan_out_fan_in_workflow_executes_deterministically_and_synthesizes_outp
     ]
     synthesis_request = result.specialist_requests[-1]
     assert synthesis_request.agent_id == "synthesis"
+    assert [request.step_id for request in result.specialist_response_requests] == [
+        "step_relationship_summary",
+        "step_internal_knowledge",
+        "step_industry_research",
+        "step_synthesis",
+    ]
     assert list(synthesis_request.context["dependencyOutputs"]) == [
         "step_relationship_summary",
         "step_internal_knowledge",
@@ -190,3 +201,35 @@ def test_fan_out_fan_in_workflow_executes_deterministically_and_synthesizes_outp
             "step_industry_research",
         ],
     }
+
+
+def test_handler_failure_status_and_error_redact_exception_text() -> None:
+    # Arrange
+    plan = _sequential_plan()
+    leaked_message = (
+        "Authorization: Bearer sk-or-runtime-secret for customer account 12345"
+    )
+
+    def failing_handler(_request):
+        raise RuntimeError(leaked_message)
+
+    handlers = _recording_handlers(plan.selected_agents, [])
+    handlers["internal_knowledge"] = failing_handler
+    runtime = AdkGraphRuntime(specialist_handlers=handlers)
+
+    # Act / Assert
+    with pytest.raises(GraphRuntimeError) as exc_info:
+        runtime.execute(plan)
+
+    error = exc_info.value
+    assert "RuntimeError" in str(error)
+    assert "Error details redacted" in str(error)
+    assert leaked_message not in str(error)
+    failed_events = [
+        event for event in error.status_events if event.status == "step_failed"
+    ]
+    assert len(failed_events) == 1
+    failed_event_json = failed_events[0].model_dump_json()
+    assert "RuntimeError" in failed_event_json
+    assert "Error details redacted" in failed_event_json
+    assert leaked_message not in failed_event_json

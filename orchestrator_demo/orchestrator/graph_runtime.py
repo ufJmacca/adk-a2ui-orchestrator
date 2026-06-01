@@ -45,6 +45,7 @@ class GraphRuntimeError(RuntimeError):
         status_events: Sequence[StatusEvent] = (),
         specialist_requests: Sequence[SpecialistRequest] = (),
         specialist_responses: Sequence[SpecialistResponse] = (),
+        specialist_response_requests: Sequence[SpecialistRequest] = (),
         adk_event_outputs: Sequence[Any] = (),
     ) -> None:
         super().__init__(message)
@@ -52,6 +53,7 @@ class GraphRuntimeError(RuntimeError):
         self.status_events = tuple(status_events)
         self.specialist_requests = tuple(specialist_requests)
         self.specialist_responses = tuple(specialist_responses)
+        self.specialist_response_requests = tuple(specialist_response_requests)
         self.adk_event_outputs = tuple(adk_event_outputs)
 
 
@@ -68,6 +70,7 @@ class GraphExecutionResult:
     status_events: tuple[StatusEvent, ...]
     specialist_requests: tuple[SpecialistRequest, ...]
     specialist_responses: tuple[SpecialistResponse, ...]
+    specialist_response_requests: tuple[SpecialistRequest, ...]
     adk_event_outputs: tuple[Any, ...]
 
 
@@ -131,6 +134,7 @@ class AdkGraphRuntime:
         ]
         requests: list[SpecialistRequest] = []
         responses: list[SpecialistResponse] = []
+        response_requests: list[SpecialistRequest] = []
         step_outputs: dict[str, dict[str, Any]] = {}
         _raise_for_missing_specialist_handlers(
             plan=plan,
@@ -148,6 +152,7 @@ class AdkGraphRuntime:
                 events=events,
                 requests=requests,
                 responses=responses,
+                response_requests=response_requests,
                 step_outputs=step_outputs,
             )
             outputs = _run_coroutine_blocking(_collect_adk_outputs(workflow, plan))
@@ -159,6 +164,9 @@ class AdkGraphRuntime:
                     status_events=exc.status_events or events,
                     specialist_requests=exc.specialist_requests or requests,
                     specialist_responses=exc.specialist_responses or responses,
+                    specialist_response_requests=(
+                        exc.specialist_response_requests or response_requests
+                    ),
                     adk_event_outputs=exc.adk_event_outputs,
                 ) from exc
             raise GraphRuntimeError(
@@ -167,6 +175,7 @@ class AdkGraphRuntime:
                 status_events=events,
                 specialist_requests=requests,
                 specialist_responses=responses,
+                specialist_response_requests=response_requests,
             ) from exc
 
         events.append(
@@ -184,6 +193,7 @@ class AdkGraphRuntime:
             status_events=tuple(events),
             specialist_requests=tuple(requests),
             specialist_responses=tuple(responses),
+            specialist_response_requests=tuple(response_requests),
             adk_event_outputs=tuple(outputs),
         )
 
@@ -195,6 +205,7 @@ class AdkGraphRuntime:
         events: list[StatusEvent],
         requests: list[SpecialistRequest],
         responses: list[SpecialistResponse],
+        response_requests: list[SpecialistRequest],
         step_outputs: dict[str, dict[str, Any]],
     ) -> Any:
         workflow_api = _adk_workflow_api()
@@ -211,6 +222,7 @@ class AdkGraphRuntime:
                     events=events,
                     requests=requests,
                     responses=responses,
+                    response_requests=response_requests,
                     step_outputs=step_outputs,
                     specialist_handlers=self._specialist_handlers,
                 ),
@@ -512,6 +524,7 @@ def _step_function(
     events: list[StatusEvent],
     requests: list[SpecialistRequest],
     responses: list[SpecialistResponse],
+    response_requests: list[SpecialistRequest],
     step_outputs: dict[str, dict[str, Any]],
     specialist_handlers: Mapping[str, SpecialistStepHandler],
 ) -> Callable[[], Awaitable[dict[str, Any]]]:
@@ -583,9 +596,11 @@ def _step_function(
                 status_events=events,
                 specialist_requests=requests,
                 specialist_responses=responses,
-            ) from exc
+                specialist_response_requests=response_requests,
+            ) from None
 
         responses.append(response)
+        response_requests.append(request)
         step_outputs[step.step_id] = output
         events.append(
             _status_event(
@@ -730,7 +745,7 @@ def _step_failed_event(
         "step_failed",
         (
             f"Approved plan step {step.step_id} failed during execution: "
-            f"{type(exc).__name__}: {exc}."
+            f"{type(exc).__name__}. Error details redacted."
         ),
         step_id=graph_step_id,
         details={
@@ -755,7 +770,7 @@ def _handler_failure_message(
     return (
         f"specialist handler for approved plan {plan.plan_id} step "
         f"{step.step_id} agent {step.agent_id} failed: "
-        f"{type(exc).__name__}: {exc}"
+        f"{type(exc).__name__}. Error details redacted."
     )
 
 
