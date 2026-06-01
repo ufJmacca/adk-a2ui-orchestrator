@@ -17,6 +17,10 @@ class PlanRequiredError(ValueError):
     """Raised when draft planning is requested for a non-plan route."""
 
 
+class PlanCreationError(PlanRequiredError):
+    """Raised when a safe draft plan cannot be formed."""
+
+
 class DescriptorRegistry(Protocol):
     """Registry surface needed by the planner."""
 
@@ -44,34 +48,39 @@ class DraftExecutionPlanner:
         }
         requested_agent_ids = _dedupe(context.llm_assessment.required_agents)
         selected_agent_ids = [
-            agent_id for agent_id in requested_agent_ids if agent_id in available_agent_ids
+            agent_id
+            for agent_id in requested_agent_ids
+            if agent_id in available_agent_ids
         ]
         omitted_agent_ids = [
             agent_id
             for agent_id in requested_agent_ids
             if agent_id not in available_agent_ids
         ]
-        if not selected_agent_ids:
-            raise PlanRequiredError(
-                "draft execution plan cannot be created because requested agents "
-                f"are unavailable: {', '.join(omitted_agent_ids)}"
-            )
 
-        if _requires_synthesis(context) and SYNTHESIS_AGENT_ID not in selected_agent_ids:
-            if SYNTHESIS_AGENT_ID not in available_agent_ids:
-                raise PlanRequiredError(
-                    "draft execution plan requires unavailable synthesis agent"
-                )
+        requires_synthesis = _requires_synthesis(
+            context,
+            selected_agent_ids=selected_agent_ids,
+            requested_agent_ids=requested_agent_ids,
+        )
+        if requires_synthesis and SYNTHESIS_AGENT_ID not in available_agent_ids:
+            raise PlanCreationError(
+                "draft execution plan requires unavailable synthesis agent; "
+                "requires synthesis but the synthesis agent is unavailable"
+            )
+        if requires_synthesis and SYNTHESIS_AGENT_ID not in selected_agent_ids:
             selected_agent_ids.append(SYNTHESIS_AGENT_ID)
         selected_agent_ids = _move_synthesis_to_end(selected_agent_ids)
-
-        if not _non_synthesis_agent_ids(selected_agent_ids):
+        if not _has_non_synthesis_workstream(selected_agent_ids):
             unavailable_detail = (
-                f": {', '.join(omitted_agent_ids)}" if omitted_agent_ids else ""
+                f"; requested agents are unavailable: {', '.join(omitted_agent_ids)}"
+                if omitted_agent_ids
+                else ""
             )
-            raise PlanRequiredError(
-                "draft execution plan requires at least one non-synthesis "
-                f"workstream agent{unavailable_detail}"
+            raise PlanCreationError(
+                "draft execution plan cannot be formed because no available "
+                "non-synthesis specialist workstream remains after registry "
+                f"filtering{unavailable_detail}"
             )
 
         plan_id = _plan_id_for(context)
@@ -253,7 +262,10 @@ def _step_metadata(agent_id: str, objective: str) -> _StepMetadata:
     return templates.get(
         agent_id,
         _StepMetadata(
-            instruction=f"Complete the {agent_id.replace('_', ' ')} workstream for: {objective}",
+            instruction=(
+                f"Complete the {agent_id.replace('_', ' ')} workstream for: "
+                f"{objective}"
+            ),
             expected_output=f"{agent_id.replace('_', ' ').title()} findings.",
             data_source_categories=[agent_id],
         ),
@@ -272,23 +284,19 @@ def _plan_data_source_categories(steps: Sequence[PlanStep]) -> list[str]:
     return categories
 
 
-def _non_synthesis_agent_ids(agent_ids: Sequence[str]) -> list[str]:
-    return [agent_id for agent_id in agent_ids if agent_id != SYNTHESIS_AGENT_ID]
-
-
-def _move_synthesis_to_end(agent_ids: Sequence[str]) -> list[str]:
-    non_synthesis_agent_ids = _non_synthesis_agent_ids(agent_ids)
-    synthesis_agent_ids = [
-        agent_id for agent_id in agent_ids if agent_id == SYNTHESIS_AGENT_ID
+def _requires_synthesis(
+    context: RequestContext,
+    *,
+    selected_agent_ids: Sequence[str],
+    requested_agent_ids: Sequence[str],
+) -> bool:
+    selected_workstreams = [
+        agent_id for agent_id in selected_agent_ids if agent_id != SYNTHESIS_AGENT_ID
     ]
-    return [*non_synthesis_agent_ids, *synthesis_agent_ids]
-
-
-def _requires_synthesis(context: RequestContext) -> bool:
     return (
         context.llm_assessment.complexity == "complex"
-        or len(context.llm_assessment.required_agents) > 1
-        or SYNTHESIS_AGENT_ID in context.llm_assessment.required_agents
+        or len(selected_workstreams) > 1
+        or SYNTHESIS_AGENT_ID in requested_agent_ids
     )
 
 
@@ -335,8 +343,23 @@ def _dedupe(values: Sequence[str]) -> list[str]:
     return deduped
 
 
+def _move_synthesis_to_end(agent_ids: Sequence[str]) -> list[str]:
+    ordered_agent_ids = [
+        agent_id for agent_id in agent_ids if agent_id != SYNTHESIS_AGENT_ID
+    ]
+    if SYNTHESIS_AGENT_ID in agent_ids:
+        ordered_agent_ids.append(SYNTHESIS_AGENT_ID)
+
+    return ordered_agent_ids
+
+
+def _has_non_synthesis_workstream(agent_ids: Sequence[str]) -> bool:
+    return any(agent_id != SYNTHESIS_AGENT_ID for agent_id in agent_ids)
+
+
 __all__ = [
     "DraftExecutionPlanner",
+    "PlanCreationError",
     "PlanRequiredError",
     "SYNTHESIS_AGENT_ID",
 ]

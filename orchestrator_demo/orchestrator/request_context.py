@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
@@ -34,7 +35,7 @@ class PlanApprovalStateError(RuntimeError):
 class _ApprovedStepPayload:
     agent_id: str
     user_input: str
-    context: dict[str, Any]
+    context: Mapping[str, Any]
 
 
 def _new_plan_scope_id() -> str:
@@ -68,16 +69,35 @@ class RequestContext:
         repr=False,
     )
     approved_plan_id: str | None = None
-    approved_plan_step_agents: dict[str, dict[str, str]] = field(default_factory=dict)
-    approved_plan_step_payloads: dict[str, dict[str, _ApprovedStepPayload]] = field(
-        default_factory=dict
+    _approved_plan_step_agents: dict[str, Mapping[str, str]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
     )
+    _approved_plan_step_payloads: dict[
+        str,
+        Mapping[str, _ApprovedStepPayload],
+    ] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def approved_plan_step_agents(self) -> Mapping[str, Mapping[str, str]]:
+        return MappingProxyType(self._approved_plan_step_agents)
+
+    @property
+    def approved_plan_step_payloads(
+        self,
+    ) -> Mapping[str, Mapping[str, _ApprovedStepPayload]]:
+        return MappingProxyType(self._approved_plan_step_payloads)
 
     @property
     def has_structured_approval(self) -> bool:
         return (
             self.approved_plan_id is not None
-            and self.approved_plan_id in self.approved_plan_step_payloads
+            and self.approved_plan_id in self._approved_plan_step_payloads
         )
 
     def record_draft_plan(self, plan: ExecutionPlan) -> None:
@@ -92,22 +112,28 @@ class RequestContext:
         self._draft_plan_snapshot = _plan_snapshot(plan)
 
     def mark_plan_approved(self, plan: ExecutionPlan) -> None:
-        approved_step_agents = {step.step_id: step.agent_id for step in plan.steps}
-        approved_step_payloads = {
-            step.step_id: _ApprovedStepPayload(
-                agent_id=step.agent_id,
-                user_input=step.instruction,
-                context=_approved_step_context(plan, step),
-            )
-            for step in plan.steps
-        }
+        approved_step_agents = MappingProxyType(
+            {step.step_id: step.agent_id for step in plan.steps}
+        )
+        approved_step_payloads = MappingProxyType(
+            {
+                step.step_id: _ApprovedStepPayload(
+                    agent_id=step.agent_id,
+                    user_input=step.instruction,
+                    context=_freeze_approval_value(
+                        _approved_step_context(plan, step)
+                    ),
+                )
+                for step in plan.steps
+            }
+        )
 
         if self.approved_plan_id is not None:
             if (
                 self.approved_plan_id == plan.plan_id
-                and self.approved_plan_step_agents.get(plan.plan_id)
+                and self._approved_plan_step_agents.get(plan.plan_id)
                 == approved_step_agents
-                and self.approved_plan_step_payloads.get(plan.plan_id)
+                and self._approved_plan_step_payloads.get(plan.plan_id)
                 == approved_step_payloads
             ):
                 return
@@ -117,8 +143,8 @@ class RequestContext:
 
         self._require_plan_matches_current_draft(plan)
         self.approved_plan_id = plan.plan_id
-        self.approved_plan_step_agents[plan.plan_id] = approved_step_agents
-        self.approved_plan_step_payloads[plan.plan_id] = approved_step_payloads
+        self._approved_plan_step_agents[plan.plan_id] = approved_step_agents
+        self._approved_plan_step_payloads[plan.plan_id] = approved_step_payloads
 
     def _require_plan_matches_current_draft(self, plan: ExecutionPlan) -> None:
         self._require_plan_matches_request_scope(plan)
@@ -191,7 +217,7 @@ class RequestContext:
                 raise SpecialistPreApprovalError(
                     "complex route specialist call must include the approved plan_id"
                 )
-            approved_step_payloads = self.approved_plan_step_payloads.get(
+            approved_step_payloads = self._approved_plan_step_payloads.get(
                 approved_plan_id
             )
             if approved_step_payloads is None:
@@ -219,7 +245,7 @@ class RequestContext:
                     "complex route specialist call user_input must match the "
                     f"approved instruction for step {request.step_id!r}"
                 )
-            if request.context != approved_payload.context:
+            if _freeze_approval_value(request.context) != approved_payload.context:
                 raise SpecialistPreApprovalError(
                     "complex route specialist call context must match the approved "
                     f"context for step {request.step_id!r}"
@@ -246,6 +272,21 @@ def _approved_step_context(
         context["parallelGroup"] = step.parallel_group
 
     return context
+
+
+def _freeze_approval_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                key: _freeze_approval_value(child_value)
+                for key, child_value in value.items()
+            }
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_approval_value(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_freeze_approval_value(item) for item in value)
+    return value
 
 
 async def call_specialist_with_guard(

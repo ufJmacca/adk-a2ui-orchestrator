@@ -392,6 +392,43 @@ def test_a2ui_validation_falls_back_for_malformed_generic_component() -> None:
     assert any("action" in error for error in result.validation_errors)
 
 
+@pytest.mark.parametrize(
+    ("missing_field", "expected_error"),
+    [
+        ("context", "event.context must be an object for plan action"),
+        ("type", "event.context.type must be a non-empty string"),
+        ("surfaceId", "event.context.surfaceId must be a non-empty string"),
+        ("payload", "event.context.payload must be present"),
+    ],
+)
+def test_a2ui_validation_rejects_plan_action_button_without_user_action_context(
+    missing_field: str,
+    expected_error: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _valid_canvas_payload()
+    button = next(
+        component
+        for component in payload["updateComponents"]["components"]
+        if component.get("id") == "control_approve_plan"
+    )
+    event = button["action"]["event"]
+    if missing_field == "context":
+        event.pop("context")
+    else:
+        event["context"].pop(missing_field)
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(expected_error in error for error in result.validation_errors)
+
+
 def test_a2ui_validation_recursively_rejects_unsupported_nested_component() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui

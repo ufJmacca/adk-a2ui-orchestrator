@@ -456,15 +456,21 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
     if not isinstance(event, Mapping):
         return
 
+    plan_action_event = _is_plan_action_event(event, None)
     context = event.get("context")
     if not isinstance(context, Mapping):
+        if plan_action_event:
+            errors.append(f"{path}.event.context must be an object for plan action")
         return
 
-    if not (
-        isinstance(context.get("type"), str)
-        and isinstance(context.get("surfaceId"), str)
-        and "payload" in context
-    ):
+    plan_action_event = _is_plan_action_event(event, context)
+    if not _has_structured_user_action_context(context):
+        if plan_action_event:
+            _require_user_action_context_fields(
+                context,
+                f"{path}.event.context",
+                errors,
+            )
         return
 
     action_type = context["type"]
@@ -501,6 +507,49 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
             errors,
             path=f"{path}.event.context.payload",
         )
+
+
+def _is_plan_action_event(
+    event: Mapping[str, Any],
+    context: Mapping[str, Any] | None,
+) -> bool:
+    event_name = event.get("name")
+    if isinstance(event_name, str) and event_name in ALLOWED_CONTROL_ACTIONS:
+        return True
+
+    if context is None:
+        return False
+
+    context_type = context.get("type")
+    if isinstance(context_type, str) and context_type in ALLOWED_CONTROL_ACTIONS:
+        return True
+
+    surface_id = context.get("surfaceId")
+    return (
+        isinstance(surface_id, str)
+        and surface_id.startswith(PLAN_APPROVAL_SURFACE_PREFIX)
+    )
+
+
+def _has_structured_user_action_context(context: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(context.get("type"), str)
+        and isinstance(context.get("surfaceId"), str)
+        and "payload" in context
+    )
+
+
+def _require_user_action_context_fields(
+    context: Mapping[str, Any],
+    path: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(context.get("type"), str):
+        errors.append(f"{path}.type must be a non-empty string")
+    if not isinstance(context.get("surfaceId"), str):
+        errors.append(f"{path}.surfaceId must be a non-empty string")
+    if "payload" not in context:
+        errors.append(f"{path}.payload must be present")
 
 
 def _require_card_content(
