@@ -98,6 +98,22 @@ class AgentRegistry:
                 registry_error,
             )
             raise registry_error from None
+        except Exception as exc:
+            if restore_config_module_on_error:
+                _restore_config_module(
+                    self._config_module,
+                    previous_config_module,
+                    previous_parent_module_attribute,
+                )
+            registry_error = RegistryValidationError(
+                f"failed to validate registry config: {type(exc).__name__}"
+            )
+            self._logger.error(
+                "agent registry reload rejected source=%s error=%s",
+                self._source_label,
+                registry_error,
+            )
+            raise registry_error from None
 
         next_agent_ids = set(next_descriptors)
         added_agent_ids = sorted(next_agent_ids - previous_agent_ids)

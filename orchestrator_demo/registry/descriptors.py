@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 import re
 from typing import Any
 
@@ -44,12 +44,16 @@ JSON_SCHEMA_MAP_CONTAINERS = (
     "dependentSchemas",
     "patternProperties",
 )
+JSON_SCHEMA_REDACTED_KEY_CONTAINERS = JSON_SCHEMA_MAP_CONTAINERS + (
+    "dependentRequired",
+)
 JSON_SCHEMA_VALUE_CONTAINERS = (
     "not",
     "if",
     "then",
     "else",
     "contains",
+    "propertyNames",
     "unevaluatedItems",
     "unevaluatedProperties",
 )
@@ -80,6 +84,7 @@ SECRET_VALUE_PATTERNS = tuple(
         r"(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
     )
 )
+REDACTED_SCHEMA_PATH_SEGMENT = "<redacted>"
 
 
 class DescriptorValidationError(ValueError):
@@ -166,10 +171,15 @@ def _validate_json_schema(
     if properties is not None:
         if not isinstance(properties, Mapping):
             raise DescriptorValidationError(f"{location}.properties must be an object")
+        properties_location = f"{location}.properties"
         for property_name, property_schema in properties.items():
+            safe_property_name = _validated_mapping_key_path_segment(
+                properties_location,
+                property_name,
+            )
             _validate_json_schema(
                 property_schema,
-                f"{location}.properties.{property_name}",
+                f"{properties_location}.{safe_property_name}",
                 allow_boolean=True,
             )
 
@@ -227,14 +237,21 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
             )
 
         for property_name, field_names in dependent_required.items():
+            safe_property_name = _safe_path_component(property_name)
             if not isinstance(property_name, str):
                 raise DescriptorValidationError(
                     f"{location}.dependentRequired must map strings to string lists"
                 )
+            if _is_secret_like_value(property_name):
+                raise DescriptorValidationError(
+                    "descriptor config contains secret-like schema map key: "
+                    f"{location}.dependentRequired.{REDACTED_SCHEMA_PATH_SEGMENT}"
+                )
+            safe_property_name = _schema_map_path_segment(property_name)
             if _is_secret_like_field_name(property_name):
                 raise DescriptorValidationError(
                     f"descriptor config contains secret-like field: "
-                    f"{location}.dependentRequired.{property_name}"
+                    f"{location}.dependentRequired.{safe_property_name}"
                 )
             if (
                 not isinstance(field_names, Sequence)
@@ -242,7 +259,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
                 or any(not isinstance(field_name, str) for field_name in field_names)
             ):
                 raise DescriptorValidationError(
-                    f"{location}.dependentRequired.{property_name} "
+                    f"{location}.dependentRequired.{safe_property_name} "
                     "must be a string list"
                 )
 
@@ -250,32 +267,45 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
                 if _is_secret_like_field_name(field_name):
                     raise DescriptorValidationError(
                         f"descriptor config contains secret-like field: "
-                        f"{location}.dependentRequired.{property_name}[{index}]"
+                        f"{location}.dependentRequired.{safe_property_name}[{index}]"
                     )
 
 
 def _validate_json_schema_type(schema_type: Any, location: str) -> None:
-    has_invalid_type = False
+    invalid_types: list[str] = []
     if isinstance(schema_type, str):
         if schema_type not in JSON_SCHEMA_TYPES:
-            has_invalid_type = True
+            invalid_types.append(schema_type)
     elif isinstance(schema_type, Sequence) and not isinstance(
         schema_type, (bytes, bytearray)
     ):
         if not schema_type:
-            has_invalid_type = True
+            invalid_types.append("<empty>")
         else:
             for type_name in schema_type:
                 if not isinstance(type_name, str) or type_name not in JSON_SCHEMA_TYPES:
-                    has_invalid_type = True
-                    break
+                    invalid_type = (
+                        type_name
+                        if isinstance(type_name, str)
+                        else type(type_name).__name__
+                    )
+                    invalid_types.append(invalid_type)
     else:
-        has_invalid_type = True
+        invalid_types.append(type(schema_type).__name__)
 
-    if has_invalid_type:
-        raise DescriptorValidationError(
-            f"{location}.type has invalid JSON-schema type"
-        )
+    if not invalid_types:
+        return
+
+    message = f"{location}.type has invalid JSON-schema type"
+    safe_invalid_types = [
+        type_name
+        for type_name in invalid_types
+        if type_name != "<empty>" and not _is_secret_like_value(type_name)
+    ]
+    if safe_invalid_types and len(safe_invalid_types) == len(invalid_types):
+        message = f"{message}: {', '.join(safe_invalid_types)}"
+
+    raise DescriptorValidationError(message)
 
 
 def _validate_schema_value_container(
@@ -333,20 +363,30 @@ def _validate_schema_map_container(
             f"{location}.{container_name} must be a JSON-schema object"
         )
 
+    nested_location = f"{location}.{container_name}"
     for nested_name, nested_schema in nested_schemas.items():
+        safe_nested_name = _validated_mapping_key_path_segment(
+            nested_location,
+            nested_name,
+        )
         _validate_json_schema(
             nested_schema,
-            f"{location}.{container_name}.{nested_name}",
+            f"{nested_location}.{safe_nested_name}",
             allow_boolean=True,
         )
 
 
-def _reject_secret_like_fields(value: Any, path: str) -> None:
+def _reject_secret_like_fields(
+    value: Any,
+    path: str,
+    *,
+    schema_scan_context: str = "normal",
+) -> None:
     if isinstance(value, AgentDescriptor):
         value = value.model_dump(warnings=False)
 
     if isinstance(value, str):
-        if not _is_schema_type_value_path(path) and _is_secret_like_value(value):
+        if schema_scan_context != "schema_type" and _is_secret_like_value(value):
             raise DescriptorValidationError(
                 f"descriptor config contains secret-like value: {path}"
             )
@@ -357,7 +397,7 @@ def _reject_secret_like_fields(value: Any, path: str) -> None:
             value_text = bytes(value).decode("utf-8")
         except UnicodeDecodeError:
             return
-        if not _is_schema_type_value_path(path) and _is_secret_like_value(value_text):
+        if schema_scan_context != "schema_type" and _is_secret_like_value(value_text):
             raise DescriptorValidationError(
                 f"descriptor config contains secret-like value: {path}"
             )
@@ -365,22 +405,81 @@ def _reject_secret_like_fields(value: Any, path: str) -> None:
 
     if isinstance(value, Mapping):
         for key, child_value in value.items():
+            safe_key = _validated_mapping_key_path_segment(path, key)
+            child_path = f"{path}.{safe_key}"
             key_text = str(key)
-            if _is_secret_like_value(key_text):
-                raise DescriptorValidationError(
-                    f"descriptor config contains secret-like field: {path}.[REDACTED]"
-                )
-            child_path = f"{path}.{key_text}"
             if _is_secret_like_field_name(key_text):
                 raise DescriptorValidationError(
                     f"descriptor config contains secret-like field: {child_path}"
                 )
-            _reject_secret_like_fields(child_value, child_path)
+            _reject_secret_like_fields(
+                child_value,
+                child_path,
+                schema_scan_context=_schema_secret_scan_child_context(
+                    schema_scan_context,
+                    key_text,
+                    child_path,
+                ),
+            )
         return
 
-    if isinstance(value, Iterable):
+    if isinstance(value, Collection):
         for index, child_value in enumerate(value):
-            _reject_secret_like_fields(child_value, f"{path}[{index}]")
+            _reject_secret_like_fields(
+                child_value,
+                f"{path}[{index}]",
+                schema_scan_context=_schema_secret_scan_collection_child_context(
+                    schema_scan_context,
+                ),
+            )
+
+
+def _schema_secret_scan_child_context(
+    parent_context: str,
+    key: str,
+    child_path: str,
+) -> str:
+    if parent_context == "normal" and _is_descriptor_schema_root_path(child_path):
+        return "json_schema"
+
+    if parent_context in {"schema_properties", "schema_map"}:
+        return "json_schema"
+
+    if parent_context != "json_schema":
+        return "normal"
+
+    if key == "type":
+        return "schema_type"
+    if key == "properties":
+        return "schema_properties"
+    if key in JSON_SCHEMA_MAP_CONTAINERS:
+        return "schema_map"
+    if key in JSON_SCHEMA_LIST_CONTAINERS:
+        return "schema_list"
+    if (
+        key == "items"
+        or key == "additionalProperties"
+        or key in JSON_SCHEMA_VALUE_CONTAINERS
+    ):
+        return "json_schema"
+
+    return "normal"
+
+
+def _schema_secret_scan_collection_child_context(parent_context: str) -> str:
+    if parent_context == "schema_type":
+        return "schema_type"
+    if parent_context == "schema_list":
+        return "json_schema"
+
+    return "normal"
+
+
+def _is_descriptor_schema_root_path(path: str) -> bool:
+    return re.fullmatch(
+        r"AVAILABLE_AGENTS\[\d+\]\.(?:input_schema|output_schema)",
+        path,
+    ) is not None
 
 
 def _is_secret_like_value(value: str) -> bool:
@@ -390,10 +489,52 @@ def _is_secret_like_value(value: str) -> bool:
     )
 
 
-def _is_schema_type_value_path(path: str) -> bool:
-    if ".input_schema" not in path and ".output_schema" not in path:
+def _schema_map_path_segment(value: Any) -> str:
+    value_text = str(value)
+    if _is_secret_like_value(value_text):
+        return REDACTED_SCHEMA_PATH_SEGMENT
+
+    return value_text
+
+
+def _validated_mapping_key_path_segment(path: str, key: Any) -> str:
+    key_text = str(key)
+    if _is_secret_like_value(key_text):
+        redacted_path = f"{path}.{REDACTED_SCHEMA_PATH_SEGMENT}"
+        legacy_redacted_path = f"{path}.[REDACTED]"
+        raise DescriptorValidationError(
+            f"descriptor config contains {_secret_like_mapping_key_label(path)}: "
+            f"{redacted_path} ({legacy_redacted_path})"
+        )
+
+    return _safe_mapping_path_segment(path, key_text)
+
+
+def _safe_mapping_path_segment(path: str, key_text: str) -> str:
+    if _is_schema_map_container_path(path):
+        return _schema_map_path_segment(key_text)
+
+    return key_text
+
+
+def _secret_like_mapping_key_label(path: str) -> str:
+    if _is_json_schema_path(path):
+        return "secret-like field (secret-like schema map key)"
+
+    return "secret-like field (secret-like mapping key)"
+
+
+def _is_json_schema_path(path: str) -> bool:
+    return ".input_schema" in path or ".output_schema" in path
+
+
+def _is_schema_map_container_path(path: str) -> bool:
+    if not _is_json_schema_path(path):
         return False
-    return re.search(r"\.type(?:\[\d+\])?$", path) is not None
+    return any(
+        path.endswith(f".{container_name}")
+        for container_name in JSON_SCHEMA_REDACTED_KEY_CONTAINERS
+    )
 
 
 def _is_secret_like_field_name(field_name: str) -> bool:
@@ -406,10 +547,23 @@ def _is_secret_like_field_name(field_name: str) -> bool:
     )
 
 
+def _safe_path_component(value: Any) -> str:
+    if isinstance(value, int):
+        return str(value)
+
+    if not isinstance(value, str):
+        return type(value).__name__
+
+    if _is_secret_like_value(value):
+        return "<redacted-key>"
+
+    return value
+
+
 def _redacted_validation_message(exc: ValidationError) -> str:
     messages: list[str] = []
     for error in exc.errors(include_url=False, include_input=False):
-        location = ".".join(str(part) for part in error["loc"])
+        location = ".".join(_safe_path_component(part) for part in error["loc"])
         messages.append(f"{location}: {error['msg']}")
     return "; ".join(messages)
 
