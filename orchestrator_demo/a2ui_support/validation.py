@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
@@ -59,6 +59,11 @@ class A2UIValidationResult:
     renderer_part: DataPart | TextPart
     validation_errors: list[str]
     repaired: bool = False
+    renderer_parts: tuple[DataPart | TextPart, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not self.renderer_parts:
+            object.__setattr__(self, "renderer_parts", (self.renderer_part,))
 
 
 def validate_outbound_a2ui(
@@ -68,6 +73,68 @@ def validate_outbound_a2ui(
 ) -> A2UIValidationResult:
     """Parse, schema-validate, repair once, and return a renderer-safe part."""
 
+    candidate, parse_errors = _parse_serialized_candidate(candidate)
+    if parse_errors:
+        return _fallback_result(parse_errors, repair_attempted=False)
+
+    if isinstance(candidate, list):
+        return _validate_candidate_list(candidate, repair=repair)
+
+    return _validate_single_candidate(candidate, repair=repair)
+
+
+def _validate_candidate_list(
+    candidates: list[Any],
+    *,
+    repair: RepairCallback | None,
+) -> A2UIValidationResult:
+    if not candidates:
+        return _fallback_result(
+            ["A2UI payload list must contain at least one envelope"],
+            repair_attempted=False,
+        )
+
+    renderer_parts: list[DataPart | TextPart] = []
+    validation_errors: list[str] = []
+    repaired = False
+    repair_attempted = False
+    for index, candidate in enumerate(candidates):
+        result = _validate_single_candidate(candidate, repair=repair)
+        if not result.valid:
+            if isinstance(result.renderer_part, TextPart):
+                diagnostic = result.renderer_part.metadata.get("developerDiagnostic")
+                if isinstance(diagnostic, Mapping):
+                    repair_attempted = repair_attempted or (
+                        diagnostic.get("repairAttempted") is True
+                    )
+            validation_errors.extend(
+                f"payload[{index}]: {error}" for error in result.validation_errors
+            )
+            continue
+
+        repaired = repaired or result.repaired
+        renderer_parts.extend(result.renderer_parts)
+
+    if validation_errors:
+        return _fallback_result(
+            validation_errors,
+            repair_attempted=repair_attempted,
+        )
+
+    return A2UIValidationResult(
+        valid=True,
+        renderer_part=renderer_parts[0],
+        renderer_parts=tuple(renderer_parts),
+        validation_errors=[],
+        repaired=repaired,
+    )
+
+
+def _validate_single_candidate(
+    candidate: Any,
+    *,
+    repair: RepairCallback | None,
+) -> A2UIValidationResult:
     parsed = _parse_candidate(candidate)
     if parsed.errors:
         return _fallback_result(parsed.errors, repair_attempted=False)
@@ -129,6 +196,18 @@ def validate_outbound_a2ui(
         validation_errors=[],
         repaired=True,
     )
+
+
+def _parse_serialized_candidate(candidate: Any) -> tuple[Any, list[str]]:
+    if isinstance(candidate, str | bytes | bytearray):
+        try:
+            return json.loads(candidate), []
+        except UnicodeDecodeError:
+            return candidate, ["A2UI payload bytes must be valid UTF-8 JSON"]
+        except json.JSONDecodeError as exc:
+            return candidate, [f"A2UI payload must be valid JSON: {exc.msg}"]
+
+    return candidate, []
 
 
 @dataclass(frozen=True)
@@ -224,11 +303,13 @@ def _fallback_result(
 def _validation_error_summary(exc: ValidationError) -> str:
     errors = exc.errors()
     if not errors:
-        return str(exc)
+        return _redact_secret_like_values(str(exc))
 
     first_error = errors[0]
-    location = ".".join(str(part) for part in first_error.get("loc", ()))
-    message = first_error.get("msg", str(exc))
+    location = ".".join(
+        _safe_path_component(str(part)) for part in first_error.get("loc", ())
+    )
+    message = _redact_secret_like_values(first_error.get("msg", str(exc)))
     if location:
         return f"{location}: {message}"
     return str(message)

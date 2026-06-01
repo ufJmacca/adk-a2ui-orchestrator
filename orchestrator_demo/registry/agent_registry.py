@@ -131,10 +131,16 @@ class AgentRegistry:
         return list(self._descriptors_by_id)
 
     def descriptors(self) -> list[AgentDescriptor]:
-        return list(self._descriptors_by_id.values())
+        return [
+            _copy_descriptor(descriptor)
+            for descriptor in self._descriptors_by_id.values()
+        ]
 
     def get(self, agent_id: str) -> AgentDescriptor | None:
-        return self._descriptors_by_id.get(agent_id)
+        descriptor = self._descriptors_by_id.get(agent_id)
+        if descriptor is None:
+            return None
+        return _copy_descriptor(descriptor)
 
     def is_available_for_new_plan(self, agent_id: str) -> bool:
         return agent_id in self._descriptors_by_id
@@ -242,6 +248,10 @@ def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
 
 def _format_agent_ids(agent_ids: list[str]) -> str:
     return ",".join(agent_ids) if agent_ids else "-"
+
+
+def _copy_descriptor(descriptor: AgentDescriptor) -> AgentDescriptor:
+    return descriptor.model_copy(deep=True)
 
 
 def _install_config_module(module_name: str, module: ModuleType) -> None:

@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+from orchestrator_demo.agents import build_default_specialists
 from orchestrator_demo.contracts import (
     AgentDescriptor,
     ExecutionPlan,
@@ -16,6 +17,7 @@ from orchestrator_demo.contracts import (
 )
 from orchestrator_demo.intent.classifier import DeterministicIntentClassifier
 from orchestrator_demo.intent.slm_mock_client import MockSlmIntentClient
+from orchestrator_demo.a2ui_support.event_parser import parse_user_action
 from orchestrator_demo.orchestrator.planner import (
     DraftExecutionPlanner,
     PlanCreationError,
@@ -106,6 +108,29 @@ def _descriptor(agent_id: str) -> AgentDescriptor:
         a2ui_catalogs=["basic"],
         routing_examples=[f"Handle a {agent_id} request."],
         execution_mode="local_llm",
+    )
+
+
+def _write_registry_config(path: Path, agent_ids: list[str]) -> None:
+    descriptor_sources = [
+        f"""AgentDescriptor(
+        agent_id={agent_id!r},
+        display_name={agent_id.replace("_", " ").title()!r},
+        capabilities=["business banking support"],
+        input_schema={{"type": "object"}},
+        output_schema={{"type": "object"}},
+        a2ui_catalogs=["basic"],
+        routing_examples=["Handle a {agent_id} request."],
+        execution_mode="local_llm",
+    )"""
+        for agent_id in agent_ids
+    ]
+    path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        + ",\n".join(descriptor_sources)
+        + "\n]\n",
+        encoding="utf-8",
     )
 
 
@@ -247,6 +272,53 @@ def test_planner_excludes_agents_removed_from_current_registry() -> None:
     plan = planner.create_plan(context)
 
     # Assert
+    assert "industry_research" not in plan.selected_agents
+    assert "industry_research" not in {step.agent_id for step in plan.steps}
+    assert plan.selected_agents == [
+        "relationship_summary",
+        "internal_knowledge",
+        "synthesis",
+    ]
+    assert "Unavailable agents omitted: industry_research." in plan.risk_notes
+
+
+@pytest.mark.asyncio
+async def test_router_allows_partial_complex_plan_after_registry_reload(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(
+        config_path,
+        [
+            "relationship_summary",
+            "internal_knowledge",
+            "industry_research",
+            "synthesis",
+        ],
+    )
+    registry = AgentRegistry.from_config_path(config_path)
+    _write_registry_config(
+        config_path,
+        ["relationship_summary", "internal_knowledge", "synthesis"],
+    )
+    registry.reload()
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=registry,
+    )
+    planner = DraftExecutionPlanner(registry=registry)
+
+    # Act
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    plan = planner.create_plan(context)
+
+    # Assert
+    assert context.decision.path == "plan_required"
+    assert "industry_research" in context.llm_assessment.required_agents
     assert "industry_research" not in plan.selected_agents
     assert "industry_research" not in {step.agent_id for step in plan.steps}
     assert plan.selected_agents == [
@@ -712,6 +784,142 @@ async def test_specialist_guard_allows_approved_plan_matching_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_specialist_guard_allows_approved_dependent_step_upstream_context() -> None:
+    # Arrange
+    registry = AgentRegistry.from_default_config()
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=registry,
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    approved_plan = DraftExecutionPlanner(registry=registry).create_plan(context)
+    approved_step = _step_for(approved_plan, "synthesis")
+    assert approved_step.depends_on
+    context.mark_plan_approved(approved_plan)
+    specialist = _FakeSpecialist()
+    request_context = _approved_context_for_step(approved_plan, approved_step)
+    request_context["upstream"] = {
+        "graph_step_internal_knowledge": {
+            "response": {
+                "agent_id": "internal_knowledge",
+                "content": "Approved predecessor output",
+            }
+        }
+    }
+    request = SpecialistRequest(
+        request_id="request_approved_dependent_step",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=request_context,
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.agent_id == "synthesis"
+    assert specialist.calls == [request]
+
+    tampered_context = _approved_context_for_step(approved_plan, approved_step)
+    tampered_context["expectedOutput"] = "Unapproved changed output."
+    tampered_context["upstream"] = request_context["upstream"]
+    tampered_request = SpecialistRequest(
+        request_id="request_approved_dependent_step_tampered",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=tampered_context,
+    )
+    with pytest.raises(SpecialistPreApprovalError, match="approved context"):
+        await call_specialist_with_guard(context, tampered_request, specialist)
+
+    assert specialist.calls == [request]
+
+
+@pytest.mark.asyncio
+async def test_edited_draft_result_syncs_context_before_approval_execution() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+
+    registry = AgentRegistry.from_default_config()
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=registry,
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    draft_plan = DraftExecutionPlanner(registry=registry).create_plan(context)
+    store = ApprovalStateStore(agent_descriptors=registry.descriptors())
+    store.add_draft(draft_plan)
+    edit_event = {
+        "userAction": {
+            "type": "add_instruction",
+            "surfaceId": draft_plan.approval_surface_id,
+            "payload": {
+                "planId": draft_plan.plan_id,
+                "editedPlanVersion": draft_plan.plan_version,
+                "stepId": "step_internal_knowledge",
+                "instruction": "Prioritize covenant follow-ups.",
+            },
+        }
+    }
+
+    # Act
+    edit_result = store.apply_user_action(edit_event)
+    assert edit_result.draft_plan is not None
+    context.record_draft_plan(edit_result.draft_plan)
+    approve_event = {
+        "userAction": {
+            "type": "approve_plan",
+            "surfaceId": edit_result.draft_plan.approval_surface_id,
+            "payload": {
+                "planId": edit_result.draft_plan.plan_id,
+                "editedPlanVersion": edit_result.draft_plan.plan_version,
+                "approvedStepIds": [
+                    step.step_id for step in edit_result.draft_plan.steps
+                ],
+            },
+        }
+    }
+    approval_result = store.apply_user_action(approve_event)
+    assert approval_result.approved_plan is not None
+    context.mark_plan_approved(approval_result.approved_plan)
+    approved_step = _step_for(approval_result.approved_plan, "internal_knowledge")
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_approved_edited_plan",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approval_result.approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=_approved_context_for_step(
+            approval_result.approved_plan,
+            approved_step,
+        ),
+    )
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert edit_result.status == "draft_updated"
+    assert edit_result.draft_plan.plan_version == draft_plan.plan_version + 1
+    assert approval_result.status == "approved"
+    assert context.approved_plan_id == approval_result.approved_plan.plan_id
+    assert "Additional instruction: Prioritize covenant follow-ups." in (
+        approved_step.instruction
+    )
+    assert response.agent_id == "internal_knowledge"
+    assert specialist.calls == [request]
+
+
+@pytest.mark.asyncio
 async def test_approved_step_payload_context_is_immutable_after_approval() -> None:
     # Arrange
     registry = AgentRegistry.from_default_config()
@@ -1018,6 +1226,498 @@ async def test_specialist_guard_allows_direct_route_specialist_call() -> None:
     # Assert
     assert response.agent_id == "internal_knowledge"
     assert specialist.calls == [request]
+
+
+@pytest.mark.asyncio
+async def test_specialist_guard_rejects_mismatched_response_agent_owner() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Summarize the internal notes for ABC Manufacturing."
+    )
+    calls: list[SpecialistRequest] = []
+
+    async def specialist(request: SpecialistRequest) -> SpecialistResponse:
+        calls.append(request)
+        return SpecialistResponse(
+            response_id="response_mismatched_owner",
+            agent_id="credit_risk",
+            content="mis-bound specialist response",
+            surface_id="surface_mismatched_owner",
+        )
+
+    request = SpecialistRequest(
+        request_id="request_direct_mismatched_owner",
+        user_input=context.user_input,
+        agent_id="internal_knowledge",
+    )
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="agent_id must match requested agent_id"):
+        await call_specialist_with_guard(context, request, specialist)
+
+    assert calls == [request]
+    assert dict(context.specialist_surface_owners) == {}
+
+
+@pytest.mark.asyncio
+async def test_specialist_guard_allows_shipped_direct_route_agent_handler() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Summarize the internal notes for ABC Manufacturing."
+    )
+    specialist = build_default_specialists()["internal_knowledge"]
+    request = SpecialistRequest(
+        request_id="request_direct_shipped_agent",
+        user_input=context.user_input,
+        agent_id="internal_knowledge",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.agent_id == "internal_knowledge"
+    assert specialist.calls == [request]
+
+
+@pytest.mark.asyncio
+async def test_direct_route_records_specialist_a2ui_surface_owner() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Show product opportunity for ABC Manufacturing."
+    )
+    specialist = build_default_specialists()["product_opportunity"]
+    request = SpecialistRequest(
+        request_id="request_direct_product_surface",
+        user_input=context.user_input,
+        agent_id="product_opportunity",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.surface_id is not None
+    assert dict(context.specialist_surface_owners) == {
+        response.surface_id: "product_opportunity"
+    }
+    payload = response.a2ui_payload
+    assert isinstance(payload, list)
+    update_components = payload[1]["updateComponents"]["components"]
+    button_component = next(
+        component for component in update_components if component["component"] == "Button"
+    )
+    user_action = parse_user_action(button_component["action"])
+    assert user_action.surface_id == response.surface_id
+    assert context.specialist_owner_for_surface(user_action.surface_id) == (
+        "product_opportunity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_route_derives_surface_owner_from_validated_a2ui_payload() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Show product opportunity for ABC Manufacturing."
+    )
+    rendered_surface_id = "surface_rendered_product_action"
+    stale_surface_id = "surface_stale_product_action"
+
+    async def specialist(request: SpecialistRequest) -> SpecialistResponse:
+        return SpecialistResponse(
+            response_id="response_stale_product_surface",
+            agent_id=request.agent_id,
+            content="Product opportunity response.",
+            structured_output={"summary": "Treasury fit identified."},
+            a2ui_payload=[
+                {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": rendered_surface_id,
+                        "catalogId": (
+                            "https://a2ui.org/specification/v0_9/"
+                            "basic_catalog.json"
+                        ),
+                    },
+                },
+                {
+                    "version": "v0.9",
+                    "updateComponents": {
+                        "surfaceId": rendered_surface_id,
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": "Card",
+                                "child": "component_product_action_content",
+                            },
+                            {
+                                "id": "component_product_action_content",
+                                "component": "Column",
+                                "children": [
+                                    "component_product_action_summary",
+                                    "component_product_action_button",
+                                ],
+                            },
+                            {
+                                "id": "component_product_action_summary",
+                                "component": "Text",
+                                "text": "Treasury fit identified.",
+                            },
+                            {
+                                "id": "component_product_action_button",
+                                "component": "Button",
+                                "child": "component_product_action_button_label",
+                                "action": {
+                                    "event": {
+                                        "name": "specialist_action",
+                                        "context": {
+                                            "type": "specialist_action",
+                                            "surfaceId": rendered_surface_id,
+                                            "payload": {
+                                                "agentId": request.agent_id,
+                                                "action": "show_detail",
+                                            },
+                                        },
+                                    }
+                                },
+                            },
+                            {
+                                "id": "component_product_action_button_label",
+                                "component": "Text",
+                                "text": "Show more detail",
+                            },
+                        ],
+                    },
+                },
+            ],
+            surface_id=stale_surface_id,
+        )
+
+    request = SpecialistRequest(
+        request_id="request_stale_product_surface",
+        user_input=context.user_input,
+        agent_id="product_opportunity",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.surface_id == rendered_surface_id
+    assert dict(context.specialist_surface_owners) == {
+        rendered_surface_id: "product_opportunity"
+    }
+    assert context.specialist_owner_for_surface(stale_surface_id) is None
+
+    payload = response.a2ui_payload
+    assert isinstance(payload, list)
+    update_components = payload[1]["updateComponents"]["components"]
+    button_component = next(
+        component for component in update_components if component["component"] == "Button"
+    )
+    user_action = parse_user_action(button_component["action"])
+    assert user_action.surface_id == rendered_surface_id
+    assert context.specialist_owner_for_surface(user_action.surface_id) == (
+        "product_opportunity"
+    )
+
+
+@pytest.mark.parametrize(
+    ("message_key", "surface_id"),
+    [
+        ("updateDataModel", "surface_updated_product_model"),
+        ("deleteSurface", "surface_deleted_product_model"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_direct_route_derives_surface_owner_from_supported_a2ui_surface_messages(
+    message_key: str,
+    surface_id: str,
+) -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Show product opportunity for ABC Manufacturing."
+    )
+
+    async def specialist(request: SpecialistRequest) -> SpecialistResponse:
+        return SpecialistResponse(
+            response_id="response_surface_message_product_action",
+            agent_id=request.agent_id,
+            content="Product opportunity response.",
+            structured_output={"summary": "Treasury fit identified."},
+            a2ui_payload={
+                "version": "v0.9",
+                message_key: {"surfaceId": surface_id},
+            },
+        )
+
+    request = SpecialistRequest(
+        request_id="request_surface_message_product_action",
+        user_input=context.user_input,
+        agent_id="product_opportunity",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.surface_id == surface_id
+    assert response.a2ui_payload == {
+        "version": "v0.9",
+        message_key: {"surfaceId": surface_id},
+    }
+    assert dict(context.specialist_surface_owners) == {
+        surface_id: "product_opportunity"
+    }
+
+
+@pytest.mark.asyncio
+async def test_direct_route_falls_back_for_mixed_surface_a2ui_payload() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Show product opportunity for ABC Manufacturing."
+    )
+
+    async def specialist(request: SpecialistRequest) -> SpecialistResponse:
+        return SpecialistResponse(
+            response_id="response_mixed_surface_product_action",
+            agent_id=request.agent_id,
+            content="Product opportunity response.",
+            structured_output={"summary": "Treasury fit identified."},
+            a2ui_payload=[
+                {
+                    "version": "v0.9",
+                    "updateDataModel": {
+                        "surfaceId": "surface_product_action_primary"
+                    },
+                },
+                {
+                    "version": "v0.9",
+                    "deleteSurface": {
+                        "surfaceId": "surface_product_action_secondary"
+                    },
+                },
+            ],
+        )
+
+    request = SpecialistRequest(
+        request_id="request_mixed_surface_product_action",
+        user_input=context.user_input,
+        agent_id="product_opportunity",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.a2ui_payload is None
+    assert response.surface_id is None
+    assert dict(context.specialist_surface_owners) == {}
+    diagnostic = response.structured_output["a2ui_validation"]
+    assert diagnostic["valid"] is False
+    assert "multiple surfaceIds" in repr(diagnostic)
+
+
+@pytest.mark.asyncio
+async def test_direct_route_preserves_structured_specialist_action_surface_owner() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Show product opportunity for ABC Manufacturing."
+    )
+    surface_id = "surface_structured_product_action"
+
+    async def specialist(request: SpecialistRequest) -> SpecialistResponse:
+        return SpecialistResponse(
+            response_id="response_structured_product_action",
+            agent_id=request.agent_id,
+            content="Product opportunity response.",
+            structured_output={"summary": "Treasury fit identified."},
+            a2ui_payload=[
+                {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": surface_id,
+                        "catalogId": (
+                            "https://a2ui.org/specification/v0_9/"
+                            "basic_catalog.json"
+                        ),
+                    },
+                },
+                {
+                    "version": "v0.9",
+                    "updateComponents": {
+                        "surfaceId": surface_id,
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": "Card",
+                                "child": "component_product_action_content",
+                            },
+                            {
+                                "id": "component_product_action_content",
+                                "component": "Column",
+                                "children": [
+                                    "component_product_action_summary",
+                                    "component_product_action_button",
+                                ],
+                            },
+                            {
+                                "id": "component_product_action_summary",
+                                "component": "Text",
+                                "text": "Treasury fit identified.",
+                            },
+                            {
+                                "id": "component_product_action_button",
+                                "component": "Button",
+                                "child": "component_product_action_button_label",
+                                "action": {
+                                    "event": {
+                                        "name": "specialist_action",
+                                        "context": {
+                                            "type": "specialist_action",
+                                            "surfaceId": surface_id,
+                                            "payload": {
+                                                "agentId": request.agent_id,
+                                                "action": "show_detail",
+                                            },
+                                        },
+                                    }
+                                },
+                            },
+                            {
+                                "id": "component_product_action_button_label",
+                                "component": "Text",
+                                "text": "Show more detail",
+                            },
+                        ],
+                    },
+                },
+            ],
+        )
+
+    request = SpecialistRequest(
+        request_id="request_structured_product_surface",
+        user_input=context.user_input,
+        agent_id="product_opportunity",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.a2ui_payload is not None
+    assert response.surface_id == surface_id
+    assert dict(context.specialist_surface_owners) == {
+        surface_id: "product_opportunity"
+    }
+    payload = response.a2ui_payload
+    assert isinstance(payload, list)
+    update_components = payload[1]["updateComponents"]["components"]
+    button_component = next(
+        component for component in update_components if component["component"] == "Button"
+    )
+    user_action = parse_user_action(button_component["action"])
+    assert user_action.type == "specialist_action"
+    assert user_action.surface_id == surface_id
+    assert user_action.payload == {
+        "agentId": "product_opportunity",
+        "action": "show_detail",
+    }
+    assert context.specialist_owner_for_surface(user_action.surface_id) == (
+        "product_opportunity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_route_validates_specialist_a2ui_before_returning_response() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Show product opportunity for ABC Manufacturing."
+    )
+    leaked_value = "OPENROUTER_API_KEY=sk-live-invalid-a2ui-secret-token-123456789"
+
+    async def specialist(request: SpecialistRequest) -> SpecialistResponse:
+        return SpecialistResponse(
+            response_id="response_invalid_product_a2ui",
+            agent_id=request.agent_id,
+            content="Product opportunity response.",
+            structured_output={},
+            a2ui_payload={
+                "version": "v0.9",
+                "updateComponents": {
+                    "surfaceId": "surface_invalid_product_a2ui",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Text",
+                            "text": leaked_value,
+                            "variant": "body",
+                        }
+                    ],
+                },
+            },
+            surface_id="surface_invalid_product_a2ui",
+        )
+
+    request = SpecialistRequest(
+        request_id="request_direct_invalid_product_surface",
+        user_input=context.user_input,
+        agent_id="product_opportunity",
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.a2ui_payload is None
+    assert response.surface_id is None
+    assert dict(context.specialist_surface_owners) == {}
+    diagnostic = response.structured_output["a2ui_validation"]
+    diagnostic_text = repr(diagnostic)
+    assert diagnostic["valid"] is False
+    assert "secret-like value" in diagnostic_text
+    assert "<redacted-secret>" in diagnostic_text
+    assert leaked_value not in diagnostic_text
 
 
 @pytest.mark.asyncio

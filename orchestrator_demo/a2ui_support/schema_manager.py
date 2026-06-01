@@ -128,7 +128,9 @@ class BasicCatalogSchema:
             errors,
             path=f"{UPDATE_COMPONENTS_MESSAGE}.components",
         )
-        if _is_approval_canvas_payload(payload, components):
+        if _is_approval_canvas_payload(payload, components) or _has_root_component(
+            components
+        ):
             _validate_component_graph(
                 components,
                 errors,
@@ -164,6 +166,13 @@ def _is_workflow_canvas_component(component: Any) -> bool:
             component.get("type") == WORKFLOW_CANVAS_TYPE
             or component.get("component") == WORKFLOW_CANVAS_TYPE
         )
+    )
+
+
+def _has_root_component(components: list[Any]) -> bool:
+    return any(
+        isinstance(component, Mapping) and component.get("id") == "root"
+        for component in components
     )
 
 
@@ -474,8 +483,8 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
         return
 
     action_type = context["type"]
-    if action_type not in ALLOWED_CONTROL_ACTIONS:
-        errors.append(f"{path}.event.context.type must be a supported plan action")
+    if not action_type:
+        errors.append(f"{path}.event.context.type must be a non-empty string")
 
     _require_pattern(
         context,
@@ -492,6 +501,9 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
 
     if not str(context.get("surfaceId")).startswith(PLAN_APPROVAL_SURFACE_PREFIX):
         return
+
+    if action_type not in ALLOWED_CONTROL_ACTIONS:
+        errors.append(f"{path}.event.context.type must be a supported plan action")
 
     _require_pattern(
         payload,
@@ -805,6 +817,10 @@ def _validate_steps(value: Any, path: str, errors: list[str]) -> None:
         parallel_group = step.get("parallelGroup")
         if parallel_group is not None and not isinstance(parallel_group, str):
             errors.append(f"{step_path}.parallelGroup must be a string or null")
+
+        condition = step.get("condition")
+        if condition is not None and not isinstance(condition, str):
+            errors.append(f"{step_path}.condition must be a string or null")
 
     for index, step in enumerate(value):
         if not isinstance(step, Mapping) or not isinstance(step.get("dependsOn"), list):

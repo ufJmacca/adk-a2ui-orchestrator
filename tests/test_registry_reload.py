@@ -136,6 +136,48 @@ def test_registry_reload_removes_agent_and_makes_it_unavailable_for_new_plans(
     assert "removed=internal_knowledge" in caplog.text
 
 
+def test_registry_descriptor_accessors_return_defensive_copies(tmp_path: Path) -> None:
+    # Arrange
+    config_path = tmp_path / "agent_config.py"
+    _write_config(
+        config_path,
+        [
+            _descriptor_source("internal_knowledge"),
+            _descriptor_source("synthesis"),
+        ],
+    )
+    registry = _registry_from(config_path)
+
+    # Act
+    fetched_descriptor = registry.get("internal_knowledge")
+    assert fetched_descriptor is not None
+    fetched_descriptor.agent_id = "mutated_agent"
+    fetched_descriptor.capabilities.append("poisoned capability")
+    fetched_descriptor.input_schema["poisoned"] = True
+
+    listed_descriptor = next(
+        descriptor
+        for descriptor in registry.descriptors()
+        if descriptor.agent_id == "internal_knowledge"
+    )
+    listed_descriptor.display_name = "Mutated Display"
+    listed_descriptor.routing_examples.append("poisoned routing")
+    listed_descriptor.output_schema["poisoned"] = True
+
+    # Assert
+    fresh_descriptor = registry.get("internal_knowledge")
+    assert fresh_descriptor is not None
+    assert fresh_descriptor.agent_id == "internal_knowledge"
+    assert fresh_descriptor.display_name == "Internal Knowledge"
+    assert "poisoned capability" not in fresh_descriptor.capabilities
+    assert "poisoned routing" not in fresh_descriptor.routing_examples
+    assert "poisoned" not in fresh_descriptor.input_schema
+    assert "poisoned" not in fresh_descriptor.output_schema
+    assert registry.get("mutated_agent") is None
+    assert registry.is_available_for_new_plan("internal_knowledge") is True
+    assert registry.is_available_for_new_plan("mutated_agent") is False
+
+
 def test_module_registry_reload_reads_source_when_bytecode_cache_is_stale(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
