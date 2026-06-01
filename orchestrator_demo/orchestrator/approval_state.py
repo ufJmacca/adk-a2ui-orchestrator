@@ -9,6 +9,7 @@ from typing import Any, Literal
 from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.approval_canvas import approval_canvas_data_parts
 from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep, UserAction
 from orchestrator_demo.orchestrator.graph_runtime import (
     AdkGraphRuntime,
@@ -187,6 +188,17 @@ class ApprovalStateStore:
         record.status = "approved"
         record.approved_plan = frozen_plan
         record.approved_version = frozen_plan.plan_version
+        log_audit_event(
+            "approval_approved",
+            {
+                "status": "approved",
+                "plan_id": frozen_plan.plan_id,
+                "plan_version": frozen_plan.plan_version,
+                "approved_step_ids": [step.step_id for step in frozen_plan.steps],
+                "graph_created": True,
+                "specialists_called": bool(graph_execution.specialist_requests),
+            },
+        )
 
         return ApprovalActionResult(
             status="approved",
@@ -210,6 +222,17 @@ class ApprovalStateStore:
         reason = _optional_string(action.payload, "reason", empty_as_none=True)
         record.status = "rejected"
         record.rejection_reason = reason
+        log_audit_event(
+            "approval_rejected",
+            {
+                "status": "rejected",
+                "plan_id": record.draft_plan.plan_id,
+                "plan_version": record.draft_plan.plan_version,
+                "rejection_reason": reason,
+                "graph_created": False,
+                "specialists_called": False,
+            },
+        )
 
         return ApprovalActionResult(
             status="rejected",
@@ -249,6 +272,19 @@ class ApprovalStateStore:
             agent_descriptors=self._agent_descriptors,
         )
         record.draft_plan = candidate_plan
+        log_audit_event(
+            "approval_edited",
+            {
+                "status": "draft_updated",
+                "plan_id": candidate_plan.plan_id,
+                "plan_version": candidate_plan.plan_version,
+                "action_type": action.type,
+                "step_count": len(candidate_plan.steps),
+                "selected_agent_ids": list(candidate_plan.selected_agents),
+                "graph_created": False,
+                "specialists_called": False,
+            },
+        )
         return ApprovalActionResult(
             status="draft_updated",
             plan_id=candidate_plan.plan_id,
