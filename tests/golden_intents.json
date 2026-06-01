@@ -1,0 +1,226 @@
+[
+  {
+    "name": "simple_internal_notes",
+    "input": "Summarize the internal notes for ABC Manufacturing.",
+    "slm": {
+      "intent": "internal_knowledge",
+      "confidence": 0.9
+    },
+    "expected_intents": ["internal_knowledge"],
+    "expected_complexity": "simple",
+    "expected_required_agents": ["internal_knowledge"],
+    "expected_confidence": 0.93,
+    "expected_rationale_contains": "internal notes"
+  },
+  {
+    "name": "simple_industry_overview",
+    "input": "Give me a quick overview of the manufacturing industry.",
+    "slm": {
+      "intent": "industry_research",
+      "confidence": 0.88
+    },
+    "expected_intents": ["industry_research"],
+    "expected_complexity": "simple",
+    "expected_required_agents": ["industry_research"],
+    "expected_confidence": 0.9,
+    "expected_rationale_contains": "industry overview"
+  },
+  {
+    "name": "explicit_web_search_industry",
+    "input": "Web search recent public information about the manufacturing industry.",
+    "slm": {
+      "intent": "industry_research",
+      "confidence": 0.88
+    },
+    "expected_intents": ["web_search"],
+    "expected_complexity": "simple",
+    "expected_required_agents": ["web_search"],
+    "expected_confidence": 0.89,
+    "expected_rationale_contains": "public information"
+  },
+  {
+    "name": "simple_product_opportunity",
+    "input": "What product opportunities should I consider for a cafe business?",
+    "slm": {
+      "intent": "product_opportunity",
+      "confidence": 0.87
+    },
+    "expected_intents": ["product_opportunity"],
+    "expected_complexity": "simple",
+    "expected_required_agents": ["product_opportunity"],
+    "expected_confidence": 0.9,
+    "expected_rationale_contains": "single product opportunity"
+  },
+  {
+    "name": "product_opportunity_research",
+    "input": "Research product opportunities for a cafe business.",
+    "slm": {
+      "intent": "product_opportunity",
+      "confidence": 0.87
+    },
+    "expected_intents": ["product_opportunity"],
+    "expected_complexity": "simple",
+    "expected_required_agents": ["product_opportunity"],
+    "expected_confidence": 0.9,
+    "expected_rationale_contains": "single product opportunity"
+  },
+  {
+    "name": "meeting_prep",
+    "input": "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+    "slm": {
+      "intent": "meeting_prep",
+      "confidence": 0.82
+    },
+    "expected_intents": [
+      "meeting_prep",
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research"
+    ],
+    "expected_complexity": "complex",
+    "expected_required_agents": [
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research",
+      "synthesis"
+    ],
+    "expected_confidence": 0.91,
+    "expected_rationale_contains": "meeting preparation"
+  },
+  {
+    "name": "relationship_industry_meeting_priorities",
+    "input": "Compare this customer's relationship history with current industry risks and suggest meeting priorities.",
+    "slm": {
+      "intent": "meeting_prep",
+      "confidence": 0.82
+    },
+    "expected_intents": [
+      "relationship_summary",
+      "industry_research",
+      "credit_risk",
+      "meeting_prep"
+    ],
+    "expected_complexity": "complex",
+    "expected_required_agents": [
+      "relationship_summary",
+      "industry_research",
+      "credit_risk",
+      "synthesis"
+    ],
+    "expected_confidence": 0.88,
+    "expected_rationale_contains": "multiple sources"
+  },
+  {
+    "name": "prospect_research",
+    "input": "Research this prospect and give me risks, opportunities, and talking points.",
+    "slm": {
+      "intent": "prospect_research",
+      "confidence": 0.78
+    },
+    "expected_intents": [
+      "prospect_research",
+      "web_search",
+      "industry_research",
+      "product_opportunity",
+      "credit_risk"
+    ],
+    "expected_complexity": "complex",
+    "expected_required_agents": [
+      "web_search",
+      "industry_research",
+      "product_opportunity",
+      "credit_risk",
+      "synthesis"
+    ],
+    "expected_confidence": 0.9,
+    "expected_rationale_contains": "prospect research"
+  },
+  {
+    "name": "mixed_sensitive_credit_prospect",
+    "input": "Can I tell this prospect they will be approved for a larger credit line?",
+    "slm": {
+      "intent": "prospect_research",
+      "confidence": 0.78
+    },
+    "expected_intents": ["credit_risk", "compliance_policy"],
+    "expected_complexity": "complex",
+    "expected_required_agents": ["credit_risk", "compliance_policy", "synthesis"],
+    "expected_confidence": 0.87,
+    "expected_rationale_contains": "sensitive credit"
+  },
+  {
+    "name": "slm_disagreement_meeting_prep",
+    "input": "Pull together what I need before seeing ABC Manufacturing tomorrow.",
+    "slm": {
+      "intent": "internal_knowledge",
+      "confidence": 0.62
+    },
+    "expected_intents": [
+      "meeting_prep",
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research"
+    ],
+    "expected_complexity": "complex",
+    "expected_required_agents": [
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research",
+      "synthesis"
+    ],
+    "expected_confidence": 0.91,
+    "expected_rationale_contains": "meeting preparation"
+  },
+  {
+    "name": "sensitive_credit_risk",
+    "input": "Can I tell ABC Manufacturing they will be approved for a larger credit line?",
+    "slm": {
+      "intent": "credit_risk",
+      "confidence": 0.8
+    },
+    "expected_intents": ["credit_risk", "compliance_policy"],
+    "expected_complexity": "complex",
+    "expected_required_agents": ["credit_risk", "compliance_policy", "synthesis"],
+    "expected_confidence": 0.87,
+    "expected_rationale_contains": "sensitive credit"
+  },
+  {
+    "name": "sensitive_credit_review_meeting",
+    "input": "Prepare me for a credit review meeting with ABC Manufacturing.",
+    "slm": {
+      "intent": "meeting_prep",
+      "confidence": 0.82
+    },
+    "expected_intents": ["credit_risk", "compliance_policy"],
+    "expected_complexity": "complex",
+    "expected_required_agents": ["credit_risk", "compliance_policy", "synthesis"],
+    "expected_confidence": 0.87,
+    "expected_rationale_contains": "sensitive credit"
+  },
+  {
+    "name": "sensitive_compliance_policy",
+    "input": "Check whether this outreach language complies with policy before I send it to ABC Manufacturing.",
+    "slm": {
+      "intent": "compliance_policy",
+      "confidence": 0.74
+    },
+    "expected_intents": ["credit_risk", "compliance_policy"],
+    "expected_complexity": "complex",
+    "expected_required_agents": ["credit_risk", "compliance_policy", "synthesis"],
+    "expected_confidence": 0.87,
+    "expected_rationale_contains": "compliance language"
+  },
+  {
+    "name": "ambiguous_request",
+    "input": "Help me with ABC.",
+    "slm": {
+      "intent": "unknown",
+      "confidence": 0.35
+    },
+    "expected_intents": ["unknown"],
+    "expected_complexity": "complex",
+    "expected_required_agents": ["data_quality"],
+    "expected_confidence": 0.42,
+    "expected_rationale_contains": "ambiguous"
+  }
+]

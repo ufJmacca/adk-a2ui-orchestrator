@@ -117,7 +117,11 @@ def _find_dependency_cycle(dependencies_by_id: dict[str, list[str]]) -> list[str
 
 
 def _is_plan_scoped_user_action(action_type: Any, surface_id: Any) -> bool:
-    return _is_plan_approval_surface(surface_id) and action_type in PLAN_USER_ACTION_TYPES
+    return (
+        isinstance(action_type, str)
+        and action_type in PLAN_USER_ACTION_TYPES
+        and _is_plan_approval_surface(surface_id)
+    )
 
 
 def _is_plan_approval_surface(surface_id: Any) -> bool:
