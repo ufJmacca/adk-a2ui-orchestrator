@@ -5,3 +5,8 @@ node_modules
 npm-debug.log*
 tests/visual/.artifacts/
 .env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
