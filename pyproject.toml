@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "adk-a2ui-orchestrator-demo"
 version = "0.1.0"
@@ -21,6 +25,10 @@ dev = [
     "ruff",
     "mypy",
 ]
+
+[tool.setuptools.packages.find]
+include = ["orchestrator_demo*"]
+exclude = ["prds*", "tests*"]
 
 [tool.ruff]
 line-length = 88

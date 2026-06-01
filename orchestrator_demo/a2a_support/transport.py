@@ -181,10 +181,93 @@ def _part_discriminator(value: Any) -> str | None:
     return str(part_type)
 
 
+def _dump_sdk_model(value: Any) -> Any:
+    root = getattr(value, "root", None)
+    if root is not None:
+        value = root
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(by_alias=True, mode="json", exclude_none=True)
+
+    return value
+
+
+def _normalize_sdk_message(
+    value: Any,
+    *,
+    task_id: Any,
+    context_id: Any,
+    timestamp: Any,
+) -> Any:
+    value = _dump_sdk_model(value)
+    if not isinstance(value, dict):
+        return value
+
+    normalized = dict(value)
+    kind = normalized.pop("kind", None)
+    if kind is not None and kind != "message":
+        raise ValueError("message kind must be message")
+
+    normalized.pop("extensions", None)
+    normalized.pop("referenceTaskIds", None)
+    normalized.pop("reference_task_ids", None)
+
+    if (
+        task_id is not None
+        and "taskId" not in normalized
+        and "task_id" not in normalized
+    ):
+        normalized["taskId"] = task_id
+    if (
+        context_id is not None
+        and "contextId" not in normalized
+        and "context_id" not in normalized
+    ):
+        normalized["contextId"] = context_id
+    if timestamp is not None:
+        normalized.setdefault("timestamp", timestamp)
+
+    return normalized
+
+
 A2APartPayload = Annotated[
     Annotated[TextPart, Tag("text")] | Annotated[DataPart, Tag("data")],
     Discriminator(_part_discriminator),
 ]
+
+
+class A2AArtifact(TransportModel):
+    artifact_id: str = Field(min_length=1, alias="artifactId")
+    description: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    extensions: list[str] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+    name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    parts: list[A2APartPayload] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_sdk_artifact_model(cls, value: Any) -> Any:
+        value = _dump_sdk_model(value)
+        if not isinstance(value, dict):
+            return value
+
+        normalized = dict(value)
+        if normalized.get("metadata") is None:
+            normalized.pop("metadata", None)
+        return normalized
 
 
 class A2AMessage(TransportModel):
@@ -255,35 +338,88 @@ class A2ATask(TransportModel):
         validation_alias=AliasChoices("history", "messages"),
         serialization_alias="history",
     )
+    artifacts: list[A2AArtifact] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
     def normalize_task_wire_fields(cls, value: Any) -> Any:
         if not isinstance(value, dict):
-            model_dump = getattr(value, "model_dump", None)
-            if callable(model_dump):
-                value = model_dump(by_alias=True, mode="json")
+            value = _dump_sdk_model(value)
 
         if not isinstance(value, dict):
             return value
 
         normalized = dict(value)
+        kind = normalized.pop("kind", None)
+        if kind is not None and kind != "task":
+            raise ValueError("kind must be task")
+        if normalized.get("artifacts") is None:
+            normalized.pop("artifacts", None)
+        if normalized.get("history") is None:
+            normalized.pop("history", None)
+        if normalized.get("messages") is None:
+            normalized.pop("messages", None)
+
         status = normalized.get("status")
         if status is not None and not isinstance(status, dict):
-            model_dump = getattr(status, "model_dump", None)
-            if callable(model_dump):
-                status = model_dump(by_alias=True, mode="json")
+            status = _dump_sdk_model(status)
 
         if isinstance(status, dict):
             normalized_status = dict(status)
-            task_id = normalized.get("id") or normalized.get("taskId")
-            context_id = normalized.get("contextId")
-            if task_id is not None:
-                normalized_status.setdefault("taskId", task_id)
-            if context_id is not None:
-                normalized_status.setdefault("contextId", context_id)
+            task_id = (
+                normalized.get("id")
+                or normalized.get("taskId")
+                or normalized.get("task_id")
+            )
+            context_id = normalized.get("contextId") or normalized.get("context_id")
+            if (
+                task_id is not None
+                and "taskId" not in normalized_status
+                and "task_id" not in normalized_status
+            ):
+                normalized_status["taskId"] = task_id
+            if (
+                context_id is not None
+                and "contextId" not in normalized_status
+                and "context_id" not in normalized_status
+            ):
+                normalized_status["contextId"] = context_id
+            status_timestamp = normalized_status.get("timestamp")
+            if normalized_status.get("message") is not None:
+                normalized_status["message"] = _normalize_sdk_message(
+                    normalized_status["message"],
+                    task_id=task_id,
+                    context_id=context_id,
+                    timestamp=status_timestamp,
+                )
             normalized["status"] = normalized_status
+
+        if isinstance(status, dict):
+            history_timestamp = normalized.get("status", {}).get("timestamp")
+        else:
+            history_timestamp = None
+        task_id = normalized.get("id") or normalized.get("taskId") or normalized.get(
+            "task_id"
+        )
+        context_id = normalized.get("contextId") or normalized.get("context_id")
+        for messages_key in ("history", "messages"):
+            messages = normalized.get(messages_key)
+            if messages is None:
+                continue
+            if isinstance(messages, list):
+                normalized[messages_key] = [
+                    _normalize_sdk_message(
+                        message,
+                        task_id=task_id,
+                        context_id=context_id,
+                        timestamp=history_timestamp,
+                    )
+                    for message in messages
+                ]
 
         return normalized
 
@@ -301,6 +437,8 @@ class A2ATask(TransportModel):
                 by_alias=True,
                 mode="json",
             )
+        if value.metadata:
+            wire_status["metadata"] = value.metadata
 
         return wire_status
 
@@ -331,6 +469,7 @@ class A2uiUserAction(UserAction):
 
 __all__ = [
     "A2UI_MIME_TYPE",
+    "A2AArtifact",
     "A2AMessage",
     "A2APart",
     "A2APartPayload",
