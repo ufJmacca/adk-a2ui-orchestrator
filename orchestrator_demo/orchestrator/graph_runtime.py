@@ -37,6 +37,23 @@ SpecialistStepHandler = Callable[
 class GraphRuntimeError(RuntimeError):
     """Raised when ADK graph construction or execution fails."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        graph: GraphSpec | None = None,
+        status_events: Sequence[StatusEvent] = (),
+        specialist_requests: Sequence[SpecialistRequest] = (),
+        specialist_responses: Sequence[SpecialistResponse] = (),
+        adk_event_outputs: Sequence[Any] = (),
+    ) -> None:
+        super().__init__(message)
+        self.graph = graph
+        self.status_events = tuple(status_events)
+        self.specialist_requests = tuple(specialist_requests)
+        self.specialist_responses = tuple(specialist_responses)
+        self.adk_event_outputs = tuple(adk_event_outputs)
+
 
 class AdkGraphApiError(RuntimeError):
     """Raised when the installed ADK graph API cannot build a workflow."""
@@ -97,7 +114,6 @@ class AdkGraphRuntime:
         """Create an ADK workflow for the approved plan and execute every step."""
 
         graph = build_graph_spec(plan)
-        _require_specialist_handlers(plan, self._specialist_handlers)
         events: list[StatusEvent] = [
             _status_event(
                 graph,
@@ -116,6 +132,14 @@ class AdkGraphRuntime:
         requests: list[SpecialistRequest] = []
         responses: list[SpecialistResponse] = []
         step_outputs: dict[str, dict[str, Any]] = {}
+        _raise_for_missing_specialist_handlers(
+            plan=plan,
+            graph=graph,
+            specialist_handlers=self._specialist_handlers,
+            events=events,
+            requests=requests,
+            responses=responses,
+        )
 
         try:
             workflow = self._build_workflow(
@@ -129,9 +153,20 @@ class AdkGraphRuntime:
             outputs = _run_coroutine_blocking(_collect_adk_outputs(workflow, plan))
         except Exception as exc:
             if isinstance(exc, GraphRuntimeError):
-                raise
+                raise GraphRuntimeError(
+                    _execution_failure_message(exc, events),
+                    graph=exc.graph or graph,
+                    status_events=exc.status_events or events,
+                    specialist_requests=exc.specialist_requests or requests,
+                    specialist_responses=exc.specialist_responses or responses,
+                    adk_event_outputs=exc.adk_event_outputs,
+                ) from exc
             raise GraphRuntimeError(
-                f"ADK graph execution failed: {type(exc).__name__}"
+                f"ADK graph execution failed: {type(exc).__name__}",
+                graph=graph,
+                status_events=events,
+                specialist_requests=requests,
+                specialist_responses=responses,
             ) from exc
 
         events.append(
@@ -339,19 +374,65 @@ def default_specialist_handlers(
     }
 
 
-def _require_specialist_handlers(
+def _missing_specialist_handler_steps(
     plan: ExecutionPlan,
     specialist_handlers: Mapping[str, SpecialistStepHandler],
-) -> None:
-    missing_steps = [
+) -> list[PlanStep]:
+    return [
         step for step in plan.steps if step.agent_id not in specialist_handlers
     ]
+
+
+def _raise_for_missing_specialist_handlers(
+    *,
+    plan: ExecutionPlan,
+    graph: GraphSpec,
+    specialist_handlers: Mapping[str, SpecialistStepHandler],
+    events: list[StatusEvent],
+    requests: list[SpecialistRequest],
+    responses: list[SpecialistResponse],
+) -> None:
+    missing_steps = _missing_specialist_handler_steps(plan, specialist_handlers)
     if not missing_steps:
         return
 
+    for step in missing_steps:
+        graph_step = _graph_step_id(step.step_id)
+        events.append(
+            _status_event(
+                graph,
+                f"{graph_step}_failed",
+                "step_failed",
+                (
+                    f"Approved plan step {step.step_id} failed before execution: "
+                    "no specialist handler registered for agent "
+                    f"{step.agent_id}."
+                ),
+                step_id=graph_step,
+                details={
+                    "agentId": step.agent_id,
+                    "planStepId": step.step_id,
+                    "developerMessage": (
+                        f"Register agent {step.agent_id} before executing "
+                        f"approved plan {plan.plan_id}."
+                    ),
+                },
+            )
+        )
+
+    raise GraphRuntimeError(
+        _missing_specialist_handlers_message(missing_steps),
+        graph=graph,
+        status_events=events,
+        specialist_requests=requests,
+        specialist_responses=responses,
+    )
+
+
+def _missing_specialist_handlers_message(missing_steps: Sequence[PlanStep]) -> str:
     if len(missing_steps) == 1:
         step = missing_steps[0]
-        raise GraphRuntimeError(
+        return (
             "no specialist handler registered for approved plan step "
             f"{step.step_id} agent {step.agent_id}"
         )
@@ -359,7 +440,7 @@ def _require_specialist_handlers(
     missing = ", ".join(
         f"{step.step_id} agent {step.agent_id}" for step in missing_steps
     )
-    raise GraphRuntimeError(
+    return (
         "no specialist handlers registered for approved plan steps: "
         f"{missing}"
     )
@@ -481,11 +562,30 @@ def _step_function(
                 "no specialist handler registered for approved plan step "
                 f"{step.step_id} agent {step.agent_id}"
             )
-        response = handler(request)
-        if inspect.isawaitable(response):
-            response = await response
+        try:
+            response = handler(request)
+            if inspect.isawaitable(response):
+                response = await response
+            output = response.model_dump(mode="json")
+        except Exception as exc:
+            events.append(
+                _step_failed_event(
+                    plan=plan,
+                    step=step,
+                    graph=graph,
+                    graph_step_id=graph_step_id,
+                    exc=exc,
+                )
+            )
+            raise GraphRuntimeError(
+                _handler_failure_message(plan=plan, step=step, exc=exc),
+                graph=graph,
+                status_events=events,
+                specialist_requests=requests,
+                specialist_responses=responses,
+            ) from exc
+
         responses.append(response)
-        output = response.model_dump(mode="json")
         step_outputs[step.step_id] = output
         events.append(
             _status_event(
@@ -601,6 +701,62 @@ def _step_context(
         context["stepResults"] = dependency_outputs
 
     return context
+
+
+def _execution_failure_message(
+    exc: GraphRuntimeError,
+    events: Sequence[StatusEvent],
+) -> str:
+    failed_event = next(
+        (event for event in reversed(events) if event.status == "step_failed"),
+        None,
+    )
+    if failed_event is not None:
+        return failed_event.message
+    return str(exc)
+
+
+def _step_failed_event(
+    *,
+    plan: ExecutionPlan,
+    step: PlanStep,
+    graph: GraphSpec,
+    graph_step_id: str,
+    exc: Exception,
+) -> StatusEvent:
+    return _status_event(
+        graph,
+        f"{graph_step_id}_failed",
+        "step_failed",
+        (
+            f"Approved plan step {step.step_id} failed during execution: "
+            f"{type(exc).__name__}: {exc}."
+        ),
+        step_id=graph_step_id,
+        details={
+            "agentId": step.agent_id,
+            "planStepId": step.step_id,
+            "errorType": type(exc).__name__,
+            "developerMessage": (
+                f"Specialist handler for agent {step.agent_id} raised "
+                f"{type(exc).__name__} while executing approved plan "
+                f"{plan.plan_id} step {step.step_id}."
+            ),
+        },
+    )
+
+
+def _handler_failure_message(
+    *,
+    plan: ExecutionPlan,
+    step: PlanStep,
+    exc: Exception,
+) -> str:
+    return (
+        f"specialist handler for approved plan {plan.plan_id} step "
+        f"{step.step_id} agent {step.agent_id} failed: "
+        f"{type(exc).__name__}: {exc}"
+    )
 
 
 def _graph_pattern(plan: ExecutionPlan) -> GraphPattern:
