@@ -319,6 +319,40 @@ async def test_high_confidence_simple_assessment_with_multiple_intents_or_agents
 
 
 @pytest.mark.asyncio
+async def test_high_confidence_simple_synthesis_only_assessment_requires_plan() -> None:
+    # Arrange
+    user_input = "Summarize the available outputs into a final brief."
+    slm_suggestion = IntentSuggestion(intent="meeting_prep", confidence=0.95)
+    slm_client = _RecordingSlmClient(slm_suggestion)
+    classifier = _RecordingClassifier(
+        LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.96,
+            complexity="simple",
+            required_agents=["synthesis"],
+            rationale="The assessment requires synthesis, which needs approval.",
+        ),
+        slm_client,
+    )
+    router = RequestRouter(
+        slm_client=slm_client,
+        intent_classifier=classifier,
+        registry=AgentRegistry.from_default_config(),
+    )
+
+    # Act
+    context = await router.route_request(user_input)
+
+    # Assert
+    assert context.decision.confidence >= 0.85
+    assert context.llm_assessment.complexity == "simple"
+    assert context.llm_assessment.required_agents == ["synthesis"]
+    assert context.decision.path == "plan_required"
+    assert context.decision.selected_agent is None
+    assert "synthesis" in context.decision.reason.casefold()
+
+
+@pytest.mark.asyncio
 async def test_low_confidence_simple_intent_routes_to_plan() -> None:
     # Arrange
     user_input = "Review data quality for ABC Manufacturing."

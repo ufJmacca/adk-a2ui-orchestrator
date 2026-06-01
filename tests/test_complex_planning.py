@@ -20,6 +20,7 @@ from orchestrator_demo.orchestrator.planner import (
     DraftExecutionPlanner,
     PlanCreationError,
 )
+from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
 from orchestrator_demo.orchestrator.request_context import (
     PlanApprovalStateError,
     RequestContext,
@@ -338,6 +339,46 @@ def test_planner_fails_when_implicit_synthesis_agent_is_unavailable() -> None:
         match="requires synthesis but the synthesis agent is unavailable",
     ):
         planner.create_plan(context)
+
+
+@pytest.mark.asyncio
+async def test_router_requires_implicit_synthesis_before_plan_required() -> None:
+    # Arrange
+    available_descriptors = [
+        descriptor
+        for descriptor in AgentRegistry.from_default_config().descriptors()
+        if descriptor.agent_id != "synthesis"
+    ]
+    user_input = "Help me understand what information is missing for ABC."
+    slm_suggestion = IntentSuggestion(intent="unknown", confidence=0.4)
+    slm_client = _RecordingSlmClient(slm_suggestion)
+    classifier = _RecordingClassifier(
+        LlmIntentAssessment(
+            intents=["unknown"],
+            confidence=0.44,
+            complexity="complex",
+            required_agents=["data_quality"],
+            rationale="Ambiguous requests require a complex data quality review.",
+        ),
+        slm_client,
+    )
+    router = RequestRouter(
+        slm_client=slm_client,
+        intent_classifier=classifier,
+        registry=_StaticRegistry(available_descriptors),
+    )
+
+    # Act
+    context = await router.route_request(user_input)
+
+    # Assert
+    assert slm_client.calls == [user_input]
+    assert classifier.assess_calls == [(user_input, slm_suggestion)]
+    assert context.llm_assessment.required_agents == ["data_quality"]
+    assert context.decision.path == "clarification_required"
+    assert context.decision.selected_agent is None
+    assert "synthesis" in context.decision.reason
+    assert "unavailable" in context.decision.reason.casefold()
 
 
 def test_planner_does_not_require_synthesis_for_duplicate_single_workstream() -> None:
@@ -712,6 +753,124 @@ async def test_specialist_guard_allows_approved_plan_matching_request() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_key", ["dependencyOutputs", "stepResults"])
+async def test_specialist_guard_allows_dependency_outputs_for_approved_step(
+    runtime_key: str,
+) -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    planner = DraftExecutionPlanner(registry=AgentRegistry.from_default_config())
+    approved_plan = planner.create_plan(context)
+    approved_step = approved_plan.steps[-1]
+    dependency_outputs = {
+        dependency_id: {"content": f"completed output for {dependency_id}"}
+        for dependency_id in approved_step.depends_on
+    }
+    runtime_context = _approved_context_for_step(approved_plan, approved_step)
+    runtime_context[runtime_key] = dependency_outputs
+    context.mark_plan_approved(approved_plan)
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_approved_plan_dependency_outputs",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=runtime_context,
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.agent_id == "synthesis"
+    assert specialist.calls == [request]
+    assert specialist.calls[0].context[runtime_key] == dependency_outputs
+
+
+@pytest.mark.asyncio
+async def test_specialist_guard_rejects_missing_dependency_outputs_for_dependent_step() -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    planner = DraftExecutionPlanner(registry=AgentRegistry.from_default_config())
+    approved_plan = planner.create_plan(context)
+    approved_step = approved_plan.steps[-1]
+    runtime_context = _approved_context_for_step(approved_plan, approved_step)
+    context.mark_plan_approved(approved_plan)
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_missing_dependency_outputs",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=runtime_context,
+    )
+
+    # Act / Assert
+    with pytest.raises(SpecialistPreApprovalError, match="approved context"):
+        await call_specialist_with_guard(context, request, specialist)
+
+    assert specialist.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_key", ["dependencyOutputs", "stepResults"])
+async def test_specialist_guard_rejects_partial_dependency_outputs_for_dependent_step(
+    runtime_key: str,
+) -> None:
+    # Arrange
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    planner = DraftExecutionPlanner(registry=AgentRegistry.from_default_config())
+    approved_plan = planner.create_plan(context)
+    approved_step = approved_plan.steps[-1]
+    partial_dependency_outputs = {
+        approved_step.depends_on[0]: {
+            "content": f"completed output for {approved_step.depends_on[0]}"
+        }
+    }
+    runtime_context = _approved_context_for_step(approved_plan, approved_step)
+    runtime_context[runtime_key] = partial_dependency_outputs
+    context.mark_plan_approved(approved_plan)
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_partial_dependency_outputs",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=runtime_context,
+    )
+
+    # Act / Assert
+    with pytest.raises(SpecialistPreApprovalError, match="approved context"):
+        await call_specialist_with_guard(context, request, specialist)
+
+    assert specialist.calls == []
+
+
+@pytest.mark.asyncio
 async def test_approved_step_payload_context_is_immutable_after_approval() -> None:
     # Arrange
     registry = AgentRegistry.from_default_config()
@@ -815,6 +974,179 @@ async def test_mark_plan_approved_rejects_plan_that_differs_from_current_draft()
     # Act / Assert
     with pytest.raises(PlanApprovalStateError, match="current draft"):
         context.mark_plan_approved(tampered_plan)
+
+    assert context.approved_plan_id is None
+
+
+@pytest.mark.asyncio
+async def test_store_edited_plan_can_be_approved_without_rerecording_draft() -> None:
+    # Arrange
+    registry = AgentRegistry.from_default_config()
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=registry,
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    draft_plan = DraftExecutionPlanner(registry=registry).create_plan(context)
+    store = ApprovalStateStore(agent_descriptors=registry.descriptors())
+    store.add_draft(draft_plan)
+
+    edit_result = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "add_instruction",
+                "surfaceId": draft_plan.approval_surface_id,
+                "payload": {
+                    "planId": draft_plan.plan_id,
+                    "editedPlanVersion": draft_plan.plan_version,
+                    "stepId": "step_internal_knowledge",
+                    "instruction": "Prepare risk-focused notes.",
+                },
+            }
+        }
+    )
+    edited_record = store.get(draft_plan.plan_id)
+    approval_result = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "approve_plan",
+                "surfaceId": draft_plan.approval_surface_id,
+                "payload": {
+                    "planId": draft_plan.plan_id,
+                    "editedPlanVersion": edit_result.plan_version,
+                    "approvedStepIds": [
+                        step.step_id for step in edited_record.draft_plan.steps
+                    ],
+                },
+            }
+        }
+    )
+    assert approval_result.approved_plan is not None
+    approved_plan = approval_result.approved_plan
+    approved_step = _step_for(approved_plan, "internal_knowledge")
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_edited_approved_plan",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=_approved_context_for_step(approved_plan, approved_step),
+    )
+
+    # Act
+    context.mark_plan_approved(
+        approved_plan,
+        approval_record=store.get(approved_plan.plan_id),
+    )
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert approval_result.status == "approved"
+    assert response.agent_id == "internal_knowledge"
+    assert specialist.calls == [request]
+    assert approved_plan.plan_version == 2
+    assert "Additional instruction: Prepare risk-focused notes." in request.user_input
+
+
+@pytest.mark.asyncio
+async def test_mark_plan_approved_rejects_version_bump_without_store_approval() -> None:
+    # Arrange
+    registry = AgentRegistry.from_default_config()
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=registry,
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    draft_plan = DraftExecutionPlanner(registry=registry).create_plan(context)
+    draft_step = _step_for(draft_plan, "internal_knowledge")
+    tampered_steps = [
+        step.model_copy(
+            update={"instruction": "Research an unapproved different customer."}
+        )
+        if step.step_id == draft_step.step_id
+        else step
+        for step in draft_plan.steps
+    ]
+    tampered_plan = ExecutionPlan(
+        **{
+            **draft_plan.model_dump(),
+            "plan_version": draft_plan.plan_version + 1,
+            "steps": [step.model_dump() for step in tampered_steps],
+        }
+    )
+
+    # Act / Assert
+    with pytest.raises(PlanApprovalStateError, match="current draft"):
+        context.mark_plan_approved(tampered_plan)
+
+    assert context.approved_plan_id is None
+
+
+@pytest.mark.asyncio
+async def test_mark_plan_approved_rejects_mutated_store_approved_copy() -> None:
+    # Arrange
+    registry = AgentRegistry.from_default_config()
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=registry,
+    )
+    context = await router.route_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    draft_plan = DraftExecutionPlanner(registry=registry).create_plan(context)
+    store = ApprovalStateStore(agent_descriptors=registry.descriptors())
+    store.add_draft(draft_plan)
+
+    edit_result = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "add_instruction",
+                "surfaceId": draft_plan.approval_surface_id,
+                "payload": {
+                    "planId": draft_plan.plan_id,
+                    "editedPlanVersion": draft_plan.plan_version,
+                    "stepId": "step_internal_knowledge",
+                    "instruction": "Prepare risk-focused notes.",
+                },
+            }
+        }
+    )
+    approval_result = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "approve_plan",
+                "surfaceId": draft_plan.approval_surface_id,
+                "payload": {
+                    "planId": draft_plan.plan_id,
+                    "editedPlanVersion": edit_result.plan_version,
+                    "approvedStepIds": [
+                        step.step_id
+                        for step in store.get(draft_plan.plan_id).draft_plan.steps
+                    ],
+                },
+            }
+        }
+    )
+    assert approval_result.approved_plan is not None
+    tampered_plan = approval_result.approved_plan
+    _step_for(tampered_plan, "internal_knowledge").instruction = (
+        "Research an unapproved different customer."
+    )
+
+    # Act / Assert
+    with pytest.raises(PlanApprovalStateError, match="current draft"):
+        context.mark_plan_approved(
+            tampered_plan,
+            approval_record=store.get(draft_plan.plan_id),
+        )
 
     assert context.approved_plan_id is None
 

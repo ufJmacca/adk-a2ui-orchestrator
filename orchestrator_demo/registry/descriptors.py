@@ -65,6 +65,7 @@ SECRET_FIELD_MARKERS = (
     "password",
     "token",
     "credential",
+    "authorization",
     "private_key",
     "openrouter_api_key",
 )
@@ -72,13 +73,15 @@ SECRET_VALUE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
-        r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}\b",
-        r"\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}\b",
-        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
-        r"\bAIza[0-9A-Za-z_-]{20,}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-        r"\b(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
+        r"(?<![A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}",
+        r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}",
+        r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}",
+        r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}",
+        r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}",
+        r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+        r"(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]{6,}",
+        r"(?<![A-Za-z0-9])authorization\b\s*[:=]\s*bearer\s+\S{6,}",
+        r"(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
     )
 )
 REDACTED_SCHEMA_PATH_SEGMENT = "<redacted>"
@@ -497,9 +500,11 @@ def _schema_map_path_segment(value: Any) -> str:
 def _validated_mapping_key_path_segment(path: str, key: Any) -> str:
     key_text = str(key)
     if _is_secret_like_value(key_text):
+        redacted_path = f"{path}.{REDACTED_SCHEMA_PATH_SEGMENT}"
+        legacy_redacted_path = f"{path}.[REDACTED]"
         raise DescriptorValidationError(
             f"descriptor config contains {_secret_like_mapping_key_label(path)}: "
-            f"{path}.{REDACTED_SCHEMA_PATH_SEGMENT}"
+            f"{redacted_path} ({legacy_redacted_path})"
         )
 
     return _safe_mapping_path_segment(path, key_text)
@@ -514,9 +519,9 @@ def _safe_mapping_path_segment(path: str, key_text: str) -> str:
 
 def _secret_like_mapping_key_label(path: str) -> str:
     if _is_json_schema_path(path):
-        return "secret-like schema map key"
+        return "secret-like field (secret-like schema map key)"
 
-    return "secret-like mapping key"
+    return "secret-like field (secret-like mapping key)"
 
 
 def _is_json_schema_path(path: str) -> bool:

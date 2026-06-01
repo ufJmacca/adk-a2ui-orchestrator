@@ -6,7 +6,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from orchestrator_demo.contracts import (
@@ -19,6 +19,9 @@ from orchestrator_demo.contracts import (
     SpecialistResponse,
 )
 
+if TYPE_CHECKING:
+    from orchestrator_demo.orchestrator.approval_state import ApprovalRecord
+
 
 SpecialistCallable = Callable[[SpecialistRequest], Awaitable[SpecialistResponse]]
 
@@ -29,6 +32,9 @@ class SpecialistPreApprovalError(RuntimeError):
 
 class PlanApprovalStateError(RuntimeError):
     """Raised when approval state would be mutated after being frozen."""
+
+
+_RUNTIME_DEPENDENCY_CONTEXT_KEYS = frozenset({"dependencyOutputs", "stepResults"})
 
 
 @dataclass(frozen=True)
@@ -111,7 +117,12 @@ class RequestContext:
         self.draft_approval_surface_id = plan.approval_surface_id
         self._draft_plan_snapshot = _plan_snapshot(plan)
 
-    def mark_plan_approved(self, plan: ExecutionPlan) -> None:
+    def mark_plan_approved(
+        self,
+        plan: ExecutionPlan,
+        *,
+        approval_record: ApprovalRecord | None = None,
+    ) -> None:
         approved_step_agents = MappingProxyType(
             {step.step_id: step.agent_id for step in plan.steps}
         )
@@ -141,21 +152,38 @@ class RequestContext:
                 "approved plan state is immutable after structured approval"
             )
 
-        self._require_plan_matches_current_draft(plan)
+        self._require_plan_matches_current_draft(
+            plan,
+            approval_record=approval_record,
+        )
         self.approved_plan_id = plan.plan_id
         self._approved_plan_step_agents[plan.plan_id] = approved_step_agents
         self._approved_plan_step_payloads[plan.plan_id] = approved_step_payloads
 
-    def _require_plan_matches_current_draft(self, plan: ExecutionPlan) -> None:
+    def _require_plan_matches_current_draft(
+        self,
+        plan: ExecutionPlan,
+        *,
+        approval_record: ApprovalRecord | None,
+    ) -> None:
         self._require_plan_matches_request_scope(plan)
         if (
             self.draft_plan_id != plan.plan_id
             or self.draft_approval_surface_id != plan.approval_surface_id
-            or self._draft_plan_snapshot != _plan_snapshot(plan)
         ):
             raise PlanApprovalStateError(
                 "approved plan must match the current draft for this request"
             )
+
+        if self._draft_plan_snapshot == _plan_snapshot(plan):
+            return
+
+        if _approval_record_matches_approved_plan(approval_record, plan):
+            return
+
+        raise PlanApprovalStateError(
+            "approved plan must match the current draft for this request"
+        )
 
     def _require_plan_matches_request_scope(self, plan: ExecutionPlan) -> None:
         if self.decision.path != "plan_required":
@@ -245,7 +273,10 @@ class RequestContext:
                     "complex route specialist call user_input must match the "
                     f"approved instruction for step {request.step_id!r}"
                 )
-            if _freeze_approval_value(request.context) != approved_payload.context:
+            if not _approved_context_allows_request_context(
+                request.context,
+                approved_payload.context,
+            ):
                 raise SpecialistPreApprovalError(
                     "complex route specialist call context must match the approved "
                     f"context for step {request.step_id!r}"
@@ -272,6 +303,77 @@ def _approved_step_context(
         context["parallelGroup"] = step.parallel_group
 
     return context
+
+
+def _approval_record_matches_approved_plan(
+    approval_record: ApprovalRecord | None,
+    plan: ExecutionPlan,
+) -> bool:
+    if approval_record is None or approval_record.status != "approved":
+        return False
+    if approval_record.approved_version != plan.plan_version:
+        return False
+
+    approved_plan = approval_record.approved_plan
+    if approved_plan is None:
+        return False
+
+    return _plan_snapshot(approved_plan) == _plan_snapshot(plan)
+
+
+def _approved_context_allows_request_context(
+    request_context: Mapping[str, Any],
+    approved_context: Mapping[str, Any],
+) -> bool:
+    approved_keys = set(approved_context)
+    request_keys = set(request_context)
+    runtime_keys = request_keys - approved_keys
+    if not runtime_keys.issubset(_RUNTIME_DEPENDENCY_CONTEXT_KEYS):
+        return False
+    if not approved_keys.issubset(request_keys):
+        return False
+
+    static_request_context = {
+        key: request_context[key]
+        for key in approved_keys
+    }
+    if _freeze_approval_value(static_request_context) != approved_context:
+        return False
+
+    depends_on = approved_context.get("dependsOn", ())
+    if not isinstance(depends_on, tuple) or any(
+        not isinstance(step_id, str) for step_id in depends_on
+    ):
+        return False
+
+    allowed_dependency_ids = set(depends_on)
+    if allowed_dependency_ids and not runtime_keys:
+        return False
+
+    for key in runtime_keys:
+        if not _runtime_dependency_outputs_allowed(
+            request_context[key],
+            allowed_dependency_ids,
+        ):
+            return False
+
+    return True
+
+
+def _runtime_dependency_outputs_allowed(
+    value: Any,
+    allowed_dependency_ids: set[str],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+
+    dependency_ids: set[str] = set()
+    for step_id in value:
+        if not isinstance(step_id, str):
+            return False
+        dependency_ids.add(step_id)
+
+    return dependency_ids == allowed_dependency_ids
 
 
 def _freeze_approval_value(value: Any) -> Any:

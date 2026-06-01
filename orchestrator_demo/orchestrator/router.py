@@ -19,6 +19,7 @@ from orchestrator_demo.intent.merge import (
     merge_intent_confidence,
 )
 from orchestrator_demo.intent.slm_mock_client import SlmIntentClient
+from orchestrator_demo.orchestrator.planner import SYNTHESIS_AGENT_ID
 from orchestrator_demo.orchestrator.request_context import RequestContext
 from orchestrator_demo.registry.agent_registry import AgentRegistry
 
@@ -121,6 +122,7 @@ def _is_direct_route_candidate(
         and len(assessment.intents) == 1
         and assessment.intents[0] != "unknown"
         and len(assessment.required_agents) == 1
+        and SYNTHESIS_AGENT_ID not in assessment.required_agents
         and confidence >= direct_route_threshold
         and not _is_sensitive(assessment)
     )
@@ -138,11 +140,47 @@ def _unavailable_required_agents(
     available_agents: Sequence[AgentDescriptor],
 ) -> list[str]:
     available_agent_ids = {descriptor.agent_id for descriptor in available_agents}
+    required_agent_ids = _required_agent_ids_for_availability(
+        assessment,
+        available_agent_ids=available_agent_ids,
+    )
     return [
         agent_id
-        for agent_id in assessment.required_agents
+        for agent_id in required_agent_ids
         if agent_id not in available_agent_ids
     ]
+
+
+def _required_agent_ids_for_availability(
+    assessment: LlmIntentAssessment,
+    *,
+    available_agent_ids: set[str],
+) -> list[str]:
+    required_agent_ids = _dedupe(assessment.required_agents)
+    selected_workstreams = [
+        agent_id
+        for agent_id in required_agent_ids
+        if agent_id in available_agent_ids and agent_id != SYNTHESIS_AGENT_ID
+    ]
+    requires_synthesis = (
+        assessment.complexity == "complex"
+        or len(selected_workstreams) > 1
+        or SYNTHESIS_AGENT_ID in required_agent_ids
+    )
+
+    if requires_synthesis and SYNTHESIS_AGENT_ID not in required_agent_ids:
+        required_agent_ids.append(SYNTHESIS_AGENT_ID)
+
+    return required_agent_ids
+
+
+def _dedupe(values: Sequence[str]) -> list[str]:
+    deduped: list[str] = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+
+    return deduped
 
 
 def _plan_required_reason(
@@ -157,6 +195,8 @@ def _plan_required_reason(
         reasons.append("complex or multi-step")
     if len(assessment.intents) > 1 or len(assessment.required_agents) > 1:
         reasons.append("multi-intent or multi-agent")
+    if SYNTHESIS_AGENT_ID in assessment.required_agents:
+        reasons.append("requires synthesis")
     if confidence < direct_route_threshold:
         reasons.append("below direct-route confidence threshold")
     if _is_sensitive(assessment):
