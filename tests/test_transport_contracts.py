@@ -479,6 +479,243 @@ def test_a2a_task_accepts_sdk_envelope_with_null_metadata() -> None:
     assert serialized_task["history"] == []
 
 
+def test_a2a_task_serializes_non_empty_status_metadata() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.transport import A2ATask, TaskStatusUpdate
+
+    status = TaskStatusUpdate(
+        task_id="task_meeting_prep",
+        context_id="ctx_abc_manufacturing",
+        status="auth-required",
+        timestamp=datetime(2026, 5, 30, 12, 3, tzinfo=UTC),
+        metadata={"retryAfterSeconds": 30, "diagnostic": "reauth required"},
+    )
+    task = A2ATask(
+        task_id="task_meeting_prep",
+        context_id="ctx_abc_manufacturing",
+        status=status,
+    )
+
+    # Act
+    serialized_task = task.model_dump(by_alias=True, mode="json")
+
+    # Assert
+    assert serialized_task["status"] == {
+        "state": "auth-required",
+        "timestamp": "2026-05-30T12:03:00Z",
+        "metadata": {
+            "retryAfterSeconds": 30,
+            "diagnostic": "reauth required",
+        },
+    }
+
+
+def test_a2a_task_accepts_sdk_task_model_without_sdk_only_fields() -> None:
+    # Arrange
+    from a2a.types import Task, TaskStatus
+
+    from orchestrator_demo.a2a_support.transport import A2ATask
+
+    sdk_task = Task(
+        id="task_meeting_prep",
+        contextId="ctx_abc_manufacturing",
+        status=TaskStatus(
+            state="working",
+            timestamp="2026-05-30T12:03:00Z",
+        ),
+    )
+
+    # Act
+    task = A2ATask.model_validate(sdk_task)
+    serialized_task = task.model_dump(by_alias=True, mode="json")
+
+    # Assert
+    assert task.task_id == "task_meeting_prep"
+    assert task.context_id == "ctx_abc_manufacturing"
+    assert task.status.task_id == "task_meeting_prep"
+    assert task.status.context_id == "ctx_abc_manufacturing"
+    assert serialized_task["status"] == {
+        "state": "working",
+        "timestamp": "2026-05-30T12:03:00Z",
+    }
+    assert "artifacts" not in serialized_task
+    assert "kind" not in serialized_task
+
+
+def test_a2a_task_preserves_non_empty_sdk_artifacts() -> None:
+    # Arrange
+    from a2a.types import Artifact, Part, Task, TaskStatus
+    from a2a.types import DataPart as SdkDataPart
+    from a2a.types import TextPart as SdkTextPart
+
+    from orchestrator_demo.a2a_support.transport import A2ATask, A2UI_MIME_TYPE
+
+    sdk_task = Task(
+        id="task_meeting_prep",
+        contextId="ctx_abc_manufacturing",
+        status=TaskStatus(
+            state="completed",
+            timestamp="2026-05-30T12:03:00Z",
+        ),
+        artifacts=[
+            Artifact(
+                artifactId="artifact_final_output",
+                name="Final output",
+                parts=[
+                    Part(root=SdkTextPart(text="Final brief ready.")),
+                    Part(
+                        root=SdkDataPart(
+                            data={"kind": "text", "text": "A2UI final output"},
+                            metadata={"mimeType": A2UI_MIME_TYPE},
+                        )
+                    ),
+                ],
+            )
+        ],
+    )
+
+    # Act
+    task = A2ATask.model_validate(sdk_task)
+    serialized_task = task.model_dump(by_alias=True, mode="json")
+
+    # Assert
+    assert task.artifacts is not None
+    assert serialized_task["artifacts"] == [
+        {
+            "artifactId": "artifact_final_output",
+            "name": "Final output",
+            "parts": [
+                {"type": "text", "text": "Final brief ready."},
+                {
+                    "type": "data",
+                    "data": {"kind": "text", "text": "A2UI final output"},
+                    "metadata": {"mimeType": A2UI_MIME_TYPE},
+                },
+            ],
+        }
+    ]
+    assert "kind" not in serialized_task["artifacts"][0]["parts"][0]
+
+
+def test_a2a_task_accepts_sdk_task_with_nested_messages() -> None:
+    # Arrange
+    from a2a.types import Message, Part, Task, TaskStatus
+    from a2a.types import TextPart as SdkTextPart
+
+    from orchestrator_demo.a2a_support.transport import A2ATask
+
+    sdk_message = Message(
+        messageId="msg_agent_status",
+        contextId="ctx_abc_manufacturing",
+        taskId="task_meeting_prep",
+        role="agent",
+        parts=[Part(root=SdkTextPart(text="Plan approval is pending."))],
+        extensions=["urn:example:extension"],
+        referenceTaskIds=["task_previous"],
+    )
+    sdk_task = Task(
+        id="task_meeting_prep",
+        contextId="ctx_abc_manufacturing",
+        status=TaskStatus(
+            state="working",
+            timestamp="2026-05-30T12:03:00Z",
+            message=sdk_message,
+        ),
+        history=[sdk_message],
+    )
+
+    # Act
+    task = A2ATask.model_validate(sdk_task)
+    serialized_task = task.model_dump(by_alias=True, mode="json")
+
+    # Assert
+    assert task.status.message is not None
+    assert task.status.message.timestamp == datetime(2026, 5, 30, 12, 3, tzinfo=UTC)
+    assert task.messages[0].timestamp == datetime(2026, 5, 30, 12, 3, tzinfo=UTC)
+    assert serialized_task["status"]["message"] == {
+        "messageId": "msg_agent_status",
+        "contextId": "ctx_abc_manufacturing",
+        "taskId": "task_meeting_prep",
+        "role": "agent",
+        "timestamp": "2026-05-30T12:03:00Z",
+        "parts": [
+            {
+                "type": "text",
+                "text": "Plan approval is pending.",
+            }
+        ],
+        "metadata": {},
+    }
+    assert serialized_task["history"][0]["timestamp"] == "2026-05-30T12:03:00Z"
+    assert "kind" not in serialized_task["status"]["message"]
+    assert "extensions" not in serialized_task["status"]["message"]
+    assert "referenceTaskIds" not in serialized_task["status"]["message"]
+
+
+def test_a2a_task_copies_python_name_ids_into_nested_status() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.transport import A2ATask
+
+    task_payload = {
+        "task_id": "task_meeting_prep",
+        "context_id": "ctx_abc_manufacturing",
+        "status": {
+            "state": "working",
+            "timestamp": "2026-05-30T12:03:00Z",
+        },
+    }
+
+    # Act
+    task = A2ATask.model_validate(task_payload)
+
+    # Assert
+    assert task.task_id == "task_meeting_prep"
+    assert task.context_id == "ctx_abc_manufacturing"
+    assert task.status.task_id == "task_meeting_prep"
+    assert task.status.context_id == "ctx_abc_manufacturing"
+
+
+def test_a2a_task_round_trips_python_name_dump_with_nested_child_ids() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.transport import (
+        A2AMessage,
+        A2ATask,
+        TaskStatusUpdate,
+        TextPart,
+    )
+
+    status_message = A2AMessage(
+        message_id="msg_agent_status",
+        context_id="ctx_abc_manufacturing",
+        task_id="task_meeting_prep",
+        role="agent",
+        timestamp=datetime(2026, 5, 30, 12, 3, tzinfo=UTC),
+        parts=[TextPart(text="Plan approval is pending.")],
+    )
+    task = A2ATask(
+        task_id="task_meeting_prep",
+        context_id="ctx_abc_manufacturing",
+        status=TaskStatusUpdate(
+            task_id="task_meeting_prep",
+            context_id="ctx_abc_manufacturing",
+            status="working",
+            timestamp=datetime(2026, 5, 30, 12, 3, tzinfo=UTC),
+            message=status_message,
+        ),
+        messages=[status_message],
+    )
+
+    # Act
+    round_tripped = A2ATask.model_validate(task.model_dump())
+
+    # Assert
+    assert round_tripped.task_id == "task_meeting_prep"
+    assert round_tripped.status.task_id == "task_meeting_prep"
+    assert round_tripped.status.message is not None
+    assert round_tripped.status.message.task_id == "task_meeting_prep"
+    assert round_tripped.messages[0].context_id == "ctx_abc_manufacturing"
+
+
 def test_a2a_message_enforces_a2ui_mime_type_for_sdk_kind_data_part() -> None:
     # Arrange
     from orchestrator_demo.a2a_support.transport import A2AMessage

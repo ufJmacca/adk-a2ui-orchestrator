@@ -23,6 +23,9 @@ from orchestrator_demo.contracts import (
 
 
 CompletionCallable = Callable[[str], Awaitable[str | Mapping[str, Any]]]
+_ASSESSMENT_PAYLOAD_KEYS = frozenset(
+    {"intents", "confidence", "complexity", "required_agents", "rationale"}
+)
 
 
 class ClassifierUnavailableAgentsError(ValueError):
@@ -125,6 +128,17 @@ class DeterministicIntentClassifier:
                     "multiple sources and synthesis."
                 ),
             )
+        elif _is_standalone_risk_request(text):
+            assessment = _assessment(
+                intents=["credit_risk"],
+                confidence=0.89,
+                complexity="simple",
+                required_agents=["credit_risk"],
+                rationale=(
+                    "Standalone customer risk language requires guarded "
+                    "credit-risk review before producing an RM-facing answer."
+                ),
+            )
         elif _is_meeting_prep(text):
             assessment = _assessment(
                 intents=[
@@ -179,7 +193,7 @@ class DeterministicIntentClassifier:
                     "to one web search specialist."
                 ),
             )
-        elif _contains_any(text, ("industry", "sector")):
+        elif _is_industry_research(text):
             assessment = _assessment(
                 intents=["industry_research"],
                 confidence=0.90,
@@ -341,8 +355,38 @@ def _is_product_opportunity(text: str) -> bool:
     return _contains_any(text, ("product opportunities", "product opportunity"))
 
 
+def _is_industry_research(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "industry",
+            "sector",
+            "market risk",
+            "market risks",
+            "retail trade",
+            "retail risk",
+            "retail risks",
+        ),
+    )
+
+
+def _is_standalone_risk_request(text: str) -> bool:
+    if _is_industry_research(text):
+        return False
+
+    return _contains_word(text, {"risk", "risks"})
+
+
 def _contains_any(text: str, needles: Sequence[str]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _contains_word(text: str, words: set[str]) -> bool:
+    tokens = {
+        token.strip(".,;:!?()[]{}")
+        for token in text.split()
+    }
+    return bool(tokens.intersection(words))
 
 
 def _require_available_agents(
@@ -546,6 +590,8 @@ def _choice_content(choices: Any) -> Any:
 def _extract_json_object(text: str) -> Mapping[str, Any]:
     decoder = json.JSONDecoder()
     start = text.find("{")
+    last_candidate: Mapping[str, Any] | None = None
+    last_object: Mapping[str, Any] | None = None
     while start != -1:
         try:
             payload, _ = decoder.raw_decode(text[start:])
@@ -553,10 +599,18 @@ def _extract_json_object(text: str) -> Mapping[str, Any]:
             start = text.find("{", start + 1)
             continue
 
-        if not isinstance(payload, Mapping):
-            raise TypeError("model response JSON must be an object")
+        if isinstance(payload, Mapping):
+            last_object = payload
+            if _ASSESSMENT_PAYLOAD_KEYS.issubset(payload.keys()):
+                last_candidate = payload
 
-        return payload
+        start = text.find("{", start + 1)
+
+    if last_candidate is not None:
+        return last_candidate
+
+    if last_object is not None:
+        return last_object
 
     raise ValueError("model response did not include a JSON object")
 

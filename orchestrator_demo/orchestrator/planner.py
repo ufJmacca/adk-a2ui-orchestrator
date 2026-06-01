@@ -51,13 +51,28 @@ class DraftExecutionPlanner:
             for agent_id in requested_agent_ids
             if agent_id not in available_agent_ids
         ]
+        if not selected_agent_ids:
+            raise PlanRequiredError(
+                "draft execution plan cannot be created because requested agents "
+                f"are unavailable: {', '.join(omitted_agent_ids)}"
+            )
 
-        if (
-            _requires_synthesis(context)
-            and SYNTHESIS_AGENT_ID not in selected_agent_ids
-            and SYNTHESIS_AGENT_ID in available_agent_ids
-        ):
+        if _requires_synthesis(context) and SYNTHESIS_AGENT_ID not in selected_agent_ids:
+            if SYNTHESIS_AGENT_ID not in available_agent_ids:
+                raise PlanRequiredError(
+                    "draft execution plan requires unavailable synthesis agent"
+                )
             selected_agent_ids.append(SYNTHESIS_AGENT_ID)
+        selected_agent_ids = _move_synthesis_to_end(selected_agent_ids)
+
+        if not _non_synthesis_agent_ids(selected_agent_ids):
+            unavailable_detail = (
+                f": {', '.join(omitted_agent_ids)}" if omitted_agent_ids else ""
+            )
+            raise PlanRequiredError(
+                "draft execution plan requires at least one non-synthesis "
+                f"workstream agent{unavailable_detail}"
+            )
 
         plan_id = _plan_id_for(context)
         steps = _build_steps(
@@ -71,7 +86,7 @@ class DraftExecutionPlanner:
                 f"Unavailable agents omitted: {', '.join(omitted_agent_ids)}."
             )
 
-        return ExecutionPlan(
+        plan = ExecutionPlan(
             plan_id=plan_id,
             objective=context.user_input,
             detected_intents=context.llm_assessment.intents,
@@ -81,6 +96,8 @@ class DraftExecutionPlanner:
             risk_notes=risk_notes,
             approval_surface_id=f"surface_{plan_id}",
         )
+        context.record_draft_plan(plan)
+        return plan
 
 
 def _build_steps(
@@ -89,9 +106,10 @@ def _build_steps(
     selected_agent_ids: Sequence[str],
     primary_parallel_group: str,
 ) -> list[PlanStep]:
+    step_ids_by_agent_id = _step_ids_by_agent_id(selected_agent_ids)
     non_synthesis_step_ids = [
-        _step_id_for(agent_id)
-        for agent_id in selected_agent_ids
+        step_id
+        for agent_id, step_id in step_ids_by_agent_id.items()
         if agent_id != SYNTHESIS_AGENT_ID
     ]
     steps: list[PlanStep] = []
@@ -104,7 +122,7 @@ def _build_steps(
 
         steps.append(
             PlanStep(
-                step_id=_step_id_for(agent_id),
+                step_id=step_ids_by_agent_id[agent_id],
                 agent_id=agent_id,
                 instruction=metadata.instruction,
                 depends_on=depends_on,
@@ -115,6 +133,24 @@ def _build_steps(
         )
 
     return steps
+
+
+def _step_ids_by_agent_id(selected_agent_ids: Sequence[str]) -> dict[str, str]:
+    step_ids_by_agent_id: dict[str, str] = {}
+    used_step_ids: set[str] = set()
+
+    for agent_id in selected_agent_ids:
+        base_step_id = _step_id_for(agent_id)
+        step_id = base_step_id
+        suffix = 2
+        while step_id in used_step_ids:
+            step_id = f"{base_step_id}_{suffix}"
+            suffix += 1
+
+        step_ids_by_agent_id[agent_id] = step_id
+        used_step_ids.add(step_id)
+
+    return step_ids_by_agent_id
 
 
 class _StepMetadata:
@@ -236,6 +272,18 @@ def _plan_data_source_categories(steps: Sequence[PlanStep]) -> list[str]:
     return categories
 
 
+def _non_synthesis_agent_ids(agent_ids: Sequence[str]) -> list[str]:
+    return [agent_id for agent_id in agent_ids if agent_id != SYNTHESIS_AGENT_ID]
+
+
+def _move_synthesis_to_end(agent_ids: Sequence[str]) -> list[str]:
+    non_synthesis_agent_ids = _non_synthesis_agent_ids(agent_ids)
+    synthesis_agent_ids = [
+        agent_id for agent_id in agent_ids if agent_id == SYNTHESIS_AGENT_ID
+    ]
+    return [*non_synthesis_agent_ids, *synthesis_agent_ids]
+
+
 def _requires_synthesis(context: RequestContext) -> bool:
     return (
         context.llm_assessment.complexity == "complex"
@@ -257,11 +305,15 @@ def _parallel_group_for(context: RequestContext) -> str:
 
 
 def _plan_id_for(context: RequestContext) -> str:
-    for candidate in [*context.llm_assessment.intents, *context.llm_assessment.required_agents]:
+    plan_id_candidates = [
+        *context.llm_assessment.intents,
+        *context.llm_assessment.required_agents,
+    ]
+    for candidate in plan_id_candidates:
         if candidate != "unknown":
-            return f"plan_{_slug(candidate)}"
+            return f"plan_{_slug(candidate)}_{_slug(context.plan_scope_id)}"
 
-    return "plan_data_quality"
+    return f"plan_data_quality_{_slug(context.plan_scope_id)}"
 
 
 def _step_id_for(agent_id: str) -> str:

@@ -166,7 +166,7 @@ def _validate_json_schema(
         for property_name, property_schema in properties.items():
             _validate_json_schema(
                 property_schema,
-                f"{location}.properties.{property_name}",
+                f"{location}.properties.{_safe_path_component(property_name)}",
                 allow_boolean=True,
             )
 
@@ -224,6 +224,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
             )
 
         for property_name, field_names in dependent_required.items():
+            safe_property_name = _safe_path_component(property_name)
             if not isinstance(property_name, str):
                 raise DescriptorValidationError(
                     f"{location}.dependentRequired must map strings to string lists"
@@ -231,7 +232,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
             if _is_secret_like_field_name(property_name):
                 raise DescriptorValidationError(
                     f"descriptor config contains secret-like field: "
-                    f"{location}.dependentRequired.{property_name}"
+                    f"{location}.dependentRequired.{safe_property_name}"
                 )
             if (
                 not isinstance(field_names, Sequence)
@@ -239,7 +240,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
                 or any(not isinstance(field_name, str) for field_name in field_names)
             ):
                 raise DescriptorValidationError(
-                    f"{location}.dependentRequired.{property_name} "
+                    f"{location}.dependentRequired.{safe_property_name} "
                     "must be a string list"
                 )
 
@@ -247,7 +248,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
                 if _is_secret_like_field_name(field_name):
                     raise DescriptorValidationError(
                         f"descriptor config contains secret-like field: "
-                        f"{location}.dependentRequired.{property_name}[{index}]"
+                        f"{location}.dependentRequired.{safe_property_name}[{index}]"
                     )
 
 
@@ -346,7 +347,7 @@ def _validate_schema_map_container(
     for nested_name, nested_schema in nested_schemas.items():
         _validate_json_schema(
             nested_schema,
-            f"{location}.{container_name}.{nested_name}",
+            f"{location}.{container_name}.{_safe_path_component(nested_name)}",
             allow_boolean=True,
         )
 
@@ -376,7 +377,11 @@ def _reject_secret_like_fields(value: Any, path: str) -> None:
     if isinstance(value, Mapping):
         for key, child_value in value.items():
             key_text = str(key)
-            child_path = f"{path}.{key_text}"
+            child_path = f"{path}.{_safe_path_component(key)}"
+            if _is_secret_like_value(key_text):
+                raise DescriptorValidationError(
+                    f"descriptor config contains secret-like key: {child_path}"
+                )
             if _is_secret_like_field_name(key_text):
                 raise DescriptorValidationError(
                     f"descriptor config contains secret-like field: {child_path}"
@@ -412,10 +417,23 @@ def _is_secret_like_field_name(field_name: str) -> bool:
     )
 
 
+def _safe_path_component(value: Any) -> str:
+    if isinstance(value, int):
+        return str(value)
+
+    if not isinstance(value, str):
+        return type(value).__name__
+
+    if _is_secret_like_value(value):
+        return "<redacted-key>"
+
+    return value
+
+
 def _redacted_validation_message(exc: ValidationError) -> str:
     messages: list[str] = []
     for error in exc.errors(include_url=False, include_input=False):
-        location = ".".join(str(part) for part in error["loc"])
+        location = ".".join(_safe_path_component(part) for part in error["loc"])
         messages.append(f"{location}: {error['msg']}")
     return "; ".join(messages)
 
