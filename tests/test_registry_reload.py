@@ -148,6 +148,39 @@ def test_registry_reload_removes_agent_and_makes_it_unavailable_for_new_plans(
     assert "removed=internal_knowledge" in caplog.text
 
 
+def test_registry_descriptor_accessors_return_defensive_deep_copies(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+
+    # Act
+    descriptor = registry.get("internal_knowledge")
+    descriptors = registry.descriptors()
+    assert descriptor is not None
+    descriptor.agent_id = "tampered_agent"
+    descriptor.capabilities.append("unvalidated capability")
+    descriptor.input_schema["additionalProperties"] = False
+    descriptors[0].display_name = "Tampered Display Name"
+    descriptors[0].routing_examples.append("Unvalidated route.")
+
+    # Assert
+    fresh_descriptor = registry.get("internal_knowledge")
+    assert fresh_descriptor is not None
+    assert fresh_descriptor.agent_id == "internal_knowledge"
+    assert fresh_descriptor.display_name == "Internal Knowledge"
+    assert fresh_descriptor.capabilities == ["business banking support"]
+    assert fresh_descriptor.input_schema == {"type": "object"}
+    assert fresh_descriptor.routing_examples == [
+        "Handle a internal_knowledge request."
+    ]
+    assert registry.agent_ids() == ["internal_knowledge"]
+    assert registry.is_available_for_new_plan("internal_knowledge") is True
+    assert registry.is_available_for_new_plan("tampered_agent") is False
+
+
 def test_module_registry_reload_reads_source_when_bytecode_cache_is_stale(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

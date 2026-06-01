@@ -7,11 +7,14 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 import re
 
-from pydantic import ValidationError
-
 from orchestrator_demo.agents import build_default_specialists
 from orchestrator_demo.agents.base import SpecialistAgent
 from orchestrator_demo.a2a_support.remote_agent_adapter import UserActionPayload
+from orchestrator_demo.a2ui_support.event_parser import (
+    PlanUserActionParseError,
+    StructuredUserActionRequiredError,
+    parse_user_action,
+)
 from orchestrator_demo.contracts import SpecialistRequest, SpecialistResponse, UserAction
 from orchestrator_demo.registry.descriptors import (
     SECRET_VALUE_PATTERNS as DESCRIPTOR_SECRET_VALUE_PATTERNS,
@@ -169,33 +172,11 @@ def _jsonable_payload(user_action: UserActionPayload) -> dict[str, Any]:
 
 def _validated_user_action(user_action: UserActionPayload) -> UserAction:
     try:
-        return UserAction.model_validate(user_action)
-    except ValidationError as exc:
-        fields = _validation_error_fields(exc)
-        suffix = f": {', '.join(fields)}" if fields else ""
+        return parse_user_action(user_action)
+    except (PlanUserActionParseError, StructuredUserActionRequiredError) as exc:
+        safe_error = _redact_secrets(str(exc))
+        suffix = f": {safe_error}" if safe_error else ""
         raise ValueError(f"invalid A2UI userAction payload{suffix}") from None
-
-
-def _validation_error_fields(exc: ValidationError) -> list[str]:
-    fields: list[str] = []
-    for error in exc.errors(include_input=False, include_context=False, include_url=False):
-        location = error.get("loc", ())
-        if location:
-            fields.append(
-                ".".join(_redact_validation_location_part(part) for part in location)
-            )
-        else:
-            fields.append(str(error.get("type", "validation_error")))
-
-    return fields
-
-
-def _redact_validation_location_part(part: object) -> str:
-    value = str(part)
-    if _is_secret_key(value) or _looks_like_secret_value(value):
-        return REDACTED_SECRET_VALUE
-
-    return value
 
 
 def _stable_id(prefix: str, suffix: str) -> str:

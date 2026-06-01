@@ -1237,6 +1237,43 @@ def test_part_converters_preserve_a2ui_payload_and_parse_user_action() -> None:
     assert action.plan_id == "plan_meeting_prep"
 
 
+def test_part_converter_normalizes_basic_catalog_key_value_user_action() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.part_converters import a2ui_user_action_from_part
+    from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE, DataPart
+
+    part = DataPart(
+        data={
+            "event": {
+                "name": "specialist_action",
+                "context": {
+                    "type": "specialist_action",
+                    "surfaceId": "surface_product_recommendation",
+                    "payload": [
+                        {"key": "buttonId", "value": "show_more_detail"},
+                        {
+                            "key": "filters",
+                            "value": ["treasury", "merchant_services"],
+                        },
+                    ],
+                },
+            }
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    )
+
+    # Act
+    action = a2ui_user_action_from_part(part)
+
+    # Assert
+    assert action.type == "specialist_action"
+    assert action.surface_id == "surface_product_recommendation"
+    assert action.payload == {
+        "buttonId": "show_more_detail",
+        "filters": ["treasury", "merchant_services"],
+    }
+
+
 def test_part_converter_splits_a2ui_message_lists_into_top_level_data_parts() -> None:
     # Arrange
     from a2a.types import DataPart as SdkDataPart

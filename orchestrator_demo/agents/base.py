@@ -202,8 +202,19 @@ class SyntheticSpecialistAgent:
                                 "event": {
                                     "name": "specialist_action",
                                     "context": {
+                                        "type": "specialist_action",
                                         "surfaceId": surface_id,
-                                        "agentId": self.agent_id,
+                                        "payload": [
+                                            {"key": "agentId", "value": self.agent_id},
+                                            {
+                                                "key": "action",
+                                                "value": "show_more_detail",
+                                            },
+                                            {
+                                                "key": "componentId",
+                                                "value": details_button_id,
+                                            },
+                                        ],
                                     },
                                 }
                             },

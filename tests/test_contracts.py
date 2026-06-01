@@ -479,6 +479,43 @@ def test_execution_plan_rejects_duplicate_step_ids() -> None:
     assert "step_research" in error_message
 
 
+def test_execution_plan_rejects_duplicate_dependencies_per_step() -> None:
+    # Arrange
+    from orchestrator_demo.contracts import ExecutionPlan, PlanStep
+
+    # Act / Assert
+    with pytest.raises(ValidationError) as exc_info:
+        ExecutionPlan(
+            plan_id="plan_duplicate_dependency",
+            objective="Prepare for a customer meeting.",
+            detected_intents=["meeting_prep"],
+            selected_agents=["internal_knowledge", "synthesis"],
+            steps=[
+                PlanStep(
+                    step_id="step_internal_notes",
+                    agent_id="internal_knowledge",
+                    instruction="Summarize internal notes.",
+                    expected_output="Internal context.",
+                ),
+                PlanStep(
+                    step_id="step_synthesis",
+                    agent_id="synthesis",
+                    instruction="Synthesize the meeting brief.",
+                    depends_on=[
+                        "step_internal_notes",
+                        "step_internal_notes",
+                    ],
+                    expected_output="Meeting preparation brief.",
+                ),
+            ],
+        )
+
+    error_message = str(exc_info.value)
+    assert "dependencies entries must be unique" in error_message
+    assert "step_synthesis" in error_message
+    assert "step_internal_notes" in error_message
+
+
 def test_execution_plan_rejects_self_dependencies() -> None:
     # Arrange
     from orchestrator_demo.contracts import ExecutionPlan, PlanStep

@@ -124,7 +124,7 @@ def _build_steps(
     steps: list[PlanStep] = []
 
     for agent_id in selected_agent_ids:
-        metadata = _step_metadata(agent_id, objective)
+        metadata = step_metadata_for_agent(agent_id, objective)
         is_synthesis = agent_id == SYNTHESIS_AGENT_ID
         depends_on = non_synthesis_step_ids if is_synthesis else []
         parallel_group = None if is_synthesis else primary_parallel_group
@@ -175,7 +175,9 @@ class _StepMetadata:
         self.data_source_categories = data_source_categories
 
 
-def _step_metadata(agent_id: str, objective: str) -> _StepMetadata:
+def step_metadata_for_agent(agent_id: str, objective: str) -> _StepMetadata:
+    """Return the same per-agent step metadata used for initial draft plans."""
+
     templates = {
         "relationship_summary": _StepMetadata(
             instruction=(
