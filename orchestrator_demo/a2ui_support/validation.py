@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import json
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -20,6 +22,34 @@ from orchestrator_demo.a2ui_support.schema_manager import (
 
 RepairCallback = Callable[[dict[str, Any], list[str]], dict[str, Any]]
 
+_REDACTED_SECRET = "<redacted-secret>"
+_REDACTED_KEY = "<redacted-key>"
+_QUOTED_TOKEN_PATTERN = re.compile(r"(['\"])([^'\"]{1,120})(\1)")
+_SECRET_FIELD_MARKERS = (
+    "api_key",
+    "apikey",
+    "access_key",
+    "secret",
+    "password",
+    "token",
+    "credential",
+    "private_key",
+    "openrouter_api_key",
+)
+_SECRET_VALUE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+        r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}\b",
+        r"\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}\b",
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        r"\bAIza[0-9A-Za-z_-]{20,}\b",
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        r"\b(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
+    )
+)
+
 
 @dataclass(frozen=True)
 class A2UIValidationResult:
@@ -32,7 +62,7 @@ class A2UIValidationResult:
 
 
 def validate_outbound_a2ui(
-    candidate: DataPart | Mapping[str, Any],
+    candidate: Any,
     *,
     repair: RepairCallback | None = None,
 ) -> A2UIValidationResult:
@@ -45,6 +75,10 @@ def validate_outbound_a2ui(
     assert parsed.payload is not None
     validation_errors = validate_basic_catalog_payload(parsed.payload)
     if not validation_errors:
+        secret_errors = _secret_safety_errors(parsed.payload, parsed.part.metadata)
+        if secret_errors:
+            return _fallback_result(secret_errors, repair_attempted=False)
+
         return A2UIValidationResult(
             valid=True,
             renderer_part=parsed.part,
@@ -52,11 +86,21 @@ def validate_outbound_a2ui(
             repaired=False,
         )
 
+    secret_errors = _secret_safety_errors(parsed.payload, parsed.part.metadata)
+    if secret_errors:
+        return _fallback_result(
+            [*validation_errors, *secret_errors],
+            repair_attempted=False,
+        )
+
     if repair is None:
         return _fallback_result(validation_errors, repair_attempted=False)
 
     try:
-        repaired_payload = repair(dict(parsed.payload), list(validation_errors))
+        repaired_payload = repair(
+            dict(parsed.payload),
+            _sanitize_validation_errors(validation_errors),
+        )
     except Exception as exc:
         return _fallback_result(
             [
@@ -75,6 +119,10 @@ def validate_outbound_a2ui(
     if repaired_errors:
         return _fallback_result(repaired_errors, repair_attempted=True)
 
+    secret_errors = _secret_safety_errors(repaired.payload, repaired.part.metadata)
+    if secret_errors:
+        return _fallback_result(secret_errors, repair_attempted=True)
+
     return A2UIValidationResult(
         valid=True,
         renderer_part=repaired.part,
@@ -90,12 +138,30 @@ class _ParsedCandidate:
     errors: list[str]
 
 
-def _parse_candidate(candidate: DataPart | Mapping[str, Any]) -> _ParsedCandidate:
+def _parse_candidate(candidate: Any) -> _ParsedCandidate:
+    if isinstance(candidate, str | bytes | bytearray):
+        try:
+            candidate = json.loads(candidate)
+        except UnicodeDecodeError:
+            return _invalid_parse("A2UI payload bytes must be valid UTF-8 JSON")
+        except json.JSONDecodeError as exc:
+            return _invalid_parse(f"A2UI payload must be valid JSON: {exc.msg}")
+
     if isinstance(candidate, DataPart):
-        return _ParsedCandidate(part=candidate, payload=dict(candidate.data), errors=[])
+        try:
+            part = DataPart.model_validate(
+                candidate.model_dump(by_alias=True, mode="python")
+            )
+        except ValidationError as exc:
+            return _invalid_parse(_validation_error_summary(exc))
+        return _ParsedCandidate(part=part, payload=dict(part.data), errors=[])
 
     if not isinstance(candidate, Mapping):
-        return _invalid_parse("A2UI candidate must be a data part or object")
+        try:
+            part = DataPart.model_validate(candidate)
+        except ValidationError as exc:
+            return _invalid_parse(_validation_error_summary(exc))
+        return _ParsedCandidate(part=part, payload=dict(part.data), errors=[])
 
     candidate_dict = dict(candidate)
     if _looks_like_data_part(candidate_dict):
@@ -117,7 +183,7 @@ def _parse_candidate(candidate: DataPart | Mapping[str, Any]) -> _ParsedCandidat
 
 
 def _looks_like_data_part(candidate: Mapping[str, Any]) -> bool:
-    return candidate.get("type") == "data" or (
+    return candidate.get("type") == "data" or candidate.get("kind") == "data" or (
         "data" in candidate and "metadata" in candidate
     )
 
@@ -135,9 +201,10 @@ def _fallback_result(
     *,
     repair_attempted: bool,
 ) -> A2UIValidationResult:
+    safe_validation_errors = _sanitize_validation_errors(validation_errors)
     diagnostic = {
         "fallback": "text",
-        "validationErrors": validation_errors,
+        "validationErrors": safe_validation_errors,
         "repairAttempted": repair_attempted,
     }
     return A2UIValidationResult(
@@ -149,7 +216,7 @@ def _fallback_result(
             ),
             metadata={"developerDiagnostic": diagnostic},
         ),
-        validation_errors=validation_errors,
+        validation_errors=safe_validation_errors,
         repaired=False,
     )
 
@@ -165,6 +232,105 @@ def _validation_error_summary(exc: ValidationError) -> str:
     if location:
         return f"{location}: {message}"
     return str(message)
+
+
+def _sanitize_validation_errors(validation_errors: list[str]) -> list[str]:
+    return [_redact_secret_like_values(error) for error in validation_errors]
+
+
+def _secret_safety_errors(
+    payload: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    _collect_secret_safety_errors(payload, "payload", "A2UI payload", errors)
+    _collect_secret_safety_errors(metadata, "metadata", "A2UI metadata", errors)
+    return errors
+
+
+def _collect_secret_safety_errors(
+    value: Any,
+    path: str,
+    subject: str,
+    errors: list[str],
+) -> None:
+    if isinstance(value, str):
+        if _is_secret_like_value(value):
+            errors.append(
+                f"{subject} contains secret-like value at {path}: {_REDACTED_SECRET}"
+            )
+        return
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value_text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        if _is_secret_like_value(value_text):
+            errors.append(
+                f"{subject} contains secret-like value at {path}: {_REDACTED_SECRET}"
+            )
+        return
+
+    if isinstance(value, Mapping):
+        for key, child_value in value.items():
+            key_text = str(key)
+            child_path = f"{path}.{_safe_path_component(key_text)}"
+            if _is_secret_like_key(key_text):
+                errors.append(f"{subject} contains secret-like key at {child_path}")
+            _collect_secret_safety_errors(child_value, child_path, subject, errors)
+        return
+
+    if isinstance(value, list | tuple):
+        for index, child_value in enumerate(value):
+            _collect_secret_safety_errors(
+                child_value,
+                f"{path}[{index}]",
+                subject,
+                errors,
+            )
+
+
+def _is_secret_like_key(key: str) -> bool:
+    return _is_secret_like_field_name(key) or _is_secret_like_value(key)
+
+
+def _is_secret_like_field_name(field_name: str) -> bool:
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", field_name)
+    normalized = normalized.lower().replace("-", "_")
+    compact_normalized = normalized.replace("_", "")
+    return any(
+        marker in normalized or marker.replace("_", "") in compact_normalized
+        for marker in _SECRET_FIELD_MARKERS
+    )
+
+
+def _is_secret_like_value(value: str) -> bool:
+    stripped_value = value.strip()
+    return bool(stripped_value) and any(
+        pattern.search(stripped_value) for pattern in _SECRET_VALUE_PATTERNS
+    )
+
+
+def _safe_path_component(value: str) -> str:
+    if _is_secret_like_key(value):
+        return _REDACTED_KEY
+    return value
+
+
+def _redact_secret_like_values(message: str) -> str:
+    redacted = str(message)
+    for pattern in _SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub(_REDACTED_SECRET, redacted)
+    return _QUOTED_TOKEN_PATTERN.sub(_redact_quoted_secret_key, redacted)
+
+
+def _redact_quoted_secret_key(match: re.Match[str]) -> str:
+    quote = match.group(1)
+    token = match.group(2)
+    if _is_secret_like_key(token):
+        return f"{quote}{_REDACTED_KEY}{quote}"
+    return match.group(0)
 
 
 __all__ = [
