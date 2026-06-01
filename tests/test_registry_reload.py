@@ -655,7 +655,9 @@ def test_invalid_reload_keeps_previous_registry_and_redacts_secret_like_values(
         for descriptor in registry.descriptors()
     } == previous_descriptors
     assert "secret-like" in str(exc_info.value)
-    assert "api_key" in str(exc_info.value)
+    assert "api_key" not in str(exc_info.value)
+    assert "api_key" not in caplog.text
+    assert "AVAILABLE_AGENTS[0].<redacted>" in str(exc_info.value)
     assert "agent registry reload rejected" in caplog.text
     assert "secret-like" in caplog.text
     assert leaked_value not in str(exc_info.value)
@@ -710,8 +712,12 @@ def test_invalid_reload_keeps_previous_registry_and_redacts_secret_like_values(
     [
         _openai_style_key("live-string-value-should-not-appear"),
         _authorization_bearer("or-live-token-should-not-appear"),
+        (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"
+        ),
     ],
-    ids=["api-key", "authorization-bearer"],
+    ids=["api-key", "authorization-bearer", "truncated-pem"],
 )
 def test_invalid_reload_rejects_secret_like_string_values_without_leaking_them(
     tmp_path: Path,
@@ -841,7 +847,7 @@ def test_invalid_reload_rejects_secret_like_schema_property_keys_without_leaking
                 "'properties': {'authorization': {'type': 'string'}},"
                 "}"
             ),
-            "properties.authorization",
+            "properties.<redacted>",
             id="property",
         ),
         pytest.param(
@@ -904,6 +910,8 @@ def test_invalid_reload_rejects_authorization_schema_fields(
     assert "secret-like field" in str(exc_info.value)
     assert f"{schema_field}.{expected_path}" in str(exc_info.value)
     assert "agent registry reload rejected" in caplog.text
+    assert "authorization" not in str(exc_info.value)
+    assert "authorization" not in caplog.text
 
 
 def test_invalid_reload_redacts_embedded_secret_like_schema_keys(
@@ -1403,7 +1411,9 @@ def test_registry_rejects_camel_case_secret_fields_in_schema_metadata(
             _registry_from(config_path)
 
     assert "secret-like" in str(exc_info.value)
-    assert secret_field in str(exc_info.value)
+    assert secret_field not in str(exc_info.value)
+    assert secret_field not in caplog.text
+    assert "input_schema.properties.account.<redacted>" in str(exc_info.value)
     assert leaked_value not in str(exc_info.value)
     assert leaked_value not in caplog.text
 

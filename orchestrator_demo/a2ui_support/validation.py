@@ -40,7 +40,7 @@ _SECRET_FIELD_MARKERS = (
 _SECRET_VALUE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
         r"(?<![A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}",
         r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}",
         r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}",
@@ -265,10 +265,7 @@ def _collect_secret_safety_errors(
         return
 
     if isinstance(value, (bytes, bytearray)):
-        try:
-            value_text = bytes(value).decode("utf-8")
-        except UnicodeDecodeError:
-            return
+        value_text = bytes(value).decode("utf-8", errors="replace")
         if _is_secret_like_value(value_text):
             errors.append(
                 f"{subject} contains secret-like value at {path}: {_REDACTED_SECRET}"

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol
 
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import (
     ExecutionPlan,
     GraphEdge,
@@ -60,6 +61,14 @@ class AdkGraphApiError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class OwnedSpecialistResponse:
+    """Specialist response with the agent id the graph actually invoked."""
+
+    owner_agent_id: str
+    response: SpecialistResponse
+
+
+@dataclass(frozen=True)
 class GraphExecutionResult:
     """Observable output from executing an approved plan graph."""
 
@@ -68,6 +77,7 @@ class GraphExecutionResult:
     status_events: tuple[StatusEvent, ...]
     specialist_requests: tuple[SpecialistRequest, ...]
     specialist_responses: tuple[SpecialistResponse, ...]
+    owned_specialist_responses: tuple[OwnedSpecialistResponse, ...]
     adk_event_outputs: tuple[Any, ...]
 
 
@@ -114,6 +124,25 @@ class AdkGraphRuntime:
         """Create an ADK workflow for the approved plan and execute every step."""
 
         graph = build_graph_spec(plan)
+        log_audit_event(
+            "graph_execution_started",
+            {
+                "graph_id": graph.graph_id,
+                "plan_id": graph.plan_id,
+                "pattern": graph.pattern,
+                "step_count": len(graph.steps),
+            },
+        )
+        log_audit_event(
+            "graph_created",
+            {
+                "graph_id": graph.graph_id,
+                "plan_id": graph.plan_id,
+                "pattern": graph.pattern,
+                "step_count": len(graph.steps),
+                "edge_count": len(graph.edges),
+            },
+        )
         events: list[StatusEvent] = [
             _status_event(
                 graph,
@@ -131,6 +160,7 @@ class AdkGraphRuntime:
         ]
         requests: list[SpecialistRequest] = []
         responses: list[SpecialistResponse] = []
+        owned_responses: list[OwnedSpecialistResponse] = []
         step_outputs: dict[str, dict[str, Any]] = {}
         _raise_for_missing_specialist_handlers(
             plan=plan,
@@ -148,11 +178,23 @@ class AdkGraphRuntime:
                 events=events,
                 requests=requests,
                 responses=responses,
+                owned_responses=owned_responses,
                 step_outputs=step_outputs,
             )
             outputs = _run_coroutine_blocking(_collect_adk_outputs(workflow, plan))
         except Exception as exc:
             if isinstance(exc, GraphRuntimeError):
+                log_audit_event(
+                    "graph_execution_failed",
+                    {
+                        "graph_id": graph.graph_id,
+                        "plan_id": graph.plan_id,
+                        "error_type": type(exc).__name__,
+                        "status_event_count": len(events),
+                        "request_count": len(requests),
+                        "response_count": len(responses),
+                    },
+                )
                 raise GraphRuntimeError(
                     _execution_failure_message(exc, events),
                     graph=exc.graph or graph,
@@ -161,6 +203,17 @@ class AdkGraphRuntime:
                     specialist_responses=exc.specialist_responses or responses,
                     adk_event_outputs=exc.adk_event_outputs,
                 ) from exc
+            log_audit_event(
+                "graph_execution_failed",
+                {
+                    "graph_id": graph.graph_id,
+                    "plan_id": graph.plan_id,
+                    "error_type": type(exc).__name__,
+                    "status_event_count": len(events),
+                    "request_count": len(requests),
+                    "response_count": len(responses),
+                },
+            )
             raise GraphRuntimeError(
                 f"ADK graph execution failed: {type(exc).__name__}",
                 graph=graph,
@@ -178,12 +231,23 @@ class AdkGraphRuntime:
                 details={"responseCount": len(responses)},
             )
         )
+        log_audit_event(
+            "graph_execution_completed",
+            {
+                "graph_id": graph.graph_id,
+                "plan_id": graph.plan_id,
+                "status_event_count": len(events),
+                "request_count": len(requests),
+                "response_count": len(responses),
+            },
+        )
         return GraphExecutionResult(
             graph=graph,
             workflow=workflow,
             status_events=tuple(events),
             specialist_requests=tuple(requests),
             specialist_responses=tuple(responses),
+            owned_specialist_responses=tuple(owned_responses),
             adk_event_outputs=tuple(outputs),
         )
 
@@ -195,6 +259,7 @@ class AdkGraphRuntime:
         events: list[StatusEvent],
         requests: list[SpecialistRequest],
         responses: list[SpecialistResponse],
+        owned_responses: list[OwnedSpecialistResponse],
         step_outputs: dict[str, dict[str, Any]],
     ) -> Any:
         workflow_api = _adk_workflow_api()
@@ -211,6 +276,7 @@ class AdkGraphRuntime:
                     events=events,
                     requests=requests,
                     responses=responses,
+                    owned_responses=owned_responses,
                     step_outputs=step_outputs,
                     specialist_handlers=self._specialist_handlers,
                 ),
@@ -512,6 +578,7 @@ def _step_function(
     events: list[StatusEvent],
     requests: list[SpecialistRequest],
     responses: list[SpecialistResponse],
+    owned_responses: list[OwnedSpecialistResponse],
     step_outputs: dict[str, dict[str, Any]],
     specialist_handlers: Mapping[str, SpecialistStepHandler],
 ) -> Callable[[], Awaitable[dict[str, Any]]]:
@@ -586,6 +653,12 @@ def _step_function(
             ) from exc
 
         responses.append(response)
+        owned_responses.append(
+            OwnedSpecialistResponse(
+                owner_agent_id=step.agent_id,
+                response=response,
+            )
+        )
         step_outputs[step.step_id] = output
         events.append(
             _status_event(
@@ -821,6 +894,7 @@ __all__ = [
     "GraphExecutionResult",
     "GraphRuntime",
     "GraphRuntimeError",
+    "OwnedSpecialistResponse",
     "build_graph_spec",
     "default_specialist_handlers",
 ]

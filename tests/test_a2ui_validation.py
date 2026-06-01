@@ -779,6 +779,43 @@ def test_a2ui_validation_rejects_schema_valid_secret_bearing_payload() -> None:
     assert "secret-like value" in exposed_diagnostic_text
 
 
+def test_a2ui_validation_rejects_truncated_pem_private_key_before_renderer() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    leaked_value = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"
+    )
+    payload = _a2ui_update(
+        components=[
+            {
+                "component": "Text",
+                "id": "root",
+                "text": f"Copied diagnostic: {leaked_value}",
+            }
+        ]
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+            "renderer_part": result.renderer_part.model_dump(mode="json"),
+        }
+    )
+    assert "-----BEGIN PRIVATE KEY-----" not in exposed_diagnostic_text
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" not in exposed_diagnostic_text
+    assert "<redacted-secret>" in exposed_diagnostic_text
+    assert "secret-like value" in exposed_diagnostic_text
+
+
 @pytest.mark.parametrize(
     ("surface_id", "component_id", "leaked_fragment"),
     [

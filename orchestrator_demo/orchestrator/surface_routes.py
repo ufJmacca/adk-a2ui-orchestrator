@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from inspect import isawaitable
 from typing import Any, Literal
 
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.a2ui_support.event_parser import (
     PlanUserActionParseError,
     StructuredUserActionRequiredError,
@@ -161,7 +162,7 @@ class SurfaceRouteRegistry:
         try:
             action = parse_user_action(candidate)
         except (PlanUserActionParseError, StructuredUserActionRequiredError) as exc:
-            return SurfaceRouteResult(
+            result = SurfaceRouteResult(
                 status="error",
                 surface_id=None,
                 error=_routing_error(
@@ -171,10 +172,12 @@ class SurfaceRouteRegistry:
                 ),
                 original_payload=candidate,
             )
+            _log_ui_event_routed(result)
+            return result
 
         owner = self.owner_for(action.surface_id)
         if owner is None:
-            return SurfaceRouteResult(
+            result = SurfaceRouteResult(
                 status="error",
                 surface_id=None,
                 error=_routing_error(
@@ -184,19 +187,23 @@ class SurfaceRouteRegistry:
                 ),
                 original_payload=candidate,
             )
+            _log_ui_event_routed(result)
+            return result
 
         if owner.owner_type == "orchestrator":
-            return SurfaceRouteResult(
+            result = SurfaceRouteResult(
                 status="orchestrator_owned",
                 surface_id=action.surface_id,
                 owner=owner,
                 original_payload=candidate,
             )
+            _log_ui_event_routed(result)
+            return result
 
         adapter = specialist_adapters.get(owner.owner_id)
         handler = getattr(adapter, "handle_user_action", None)
         if adapter is None or not callable(handler):
-            return SurfaceRouteResult(
+            result = SurfaceRouteResult(
                 status="error",
                 surface_id=action.surface_id,
                 owner=owner,
@@ -210,6 +217,8 @@ class SurfaceRouteRegistry:
                 ),
                 original_payload=candidate,
             )
+            _log_ui_event_routed(result)
+            return result
 
         response = handler(candidate)
         if isawaitable(response):
@@ -218,7 +227,7 @@ class SurfaceRouteRegistry:
         try:
             self._register_specialist_response_surfaces(response, owner=owner)
         except SurfaceOwnershipError as exc:
-            return SurfaceRouteResult(
+            result = SurfaceRouteResult(
                 status="error",
                 surface_id=action.surface_id,
                 owner=owner,
@@ -229,14 +238,18 @@ class SurfaceRouteRegistry:
                 ),
                 original_payload=candidate,
             )
+            _log_ui_event_routed(result)
+            return result
 
-        return SurfaceRouteResult(
+        result = SurfaceRouteResult(
             status="forwarded",
             surface_id=action.surface_id,
             owner=owner,
             response=response,
             original_payload=candidate,
         )
+        _log_ui_event_routed(result)
+        return result
 
     def _register(self, owner: SurfaceOwner) -> SurfaceOwner:
         return self._register_owner(self._owners_by_surface_id, owner)
@@ -355,6 +368,23 @@ def _routing_error(
         "message": message,
         "ownerInferenceAttempted": False,
     }
+
+
+def _log_ui_event_routed(result: SurfaceRouteResult) -> None:
+    owner = result.owner
+    error = result.error or {}
+    log_audit_event(
+        "ui_event_routed",
+        {
+            "status": result.status,
+            "surface_id": result.surface_id,
+            "owner_type": owner.owner_type if owner is not None else None,
+            "owner_id": owner.owner_id if owner is not None else None,
+            "plan_id": owner.plan_id if owner is not None else None,
+            "error_code": error.get("code"),
+            "owner_inference_attempted": False,
+        },
+    )
 
 
 def _response_a2ui_payload(response: Any) -> Any | None:

@@ -1469,10 +1469,12 @@ def test_approval_freezes_referenced_plan_version_and_rejects_future_mutation() 
         )
 
 
-def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
+def test_approval_rejects_unregistered_step_agent_before_graph_runtime() -> None:
     # Arrange
-    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
-    from orchestrator_demo.orchestrator.graph_runtime import GraphRuntimeError
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanMutationError,
+    )
 
     plan = ExecutionPlan(
         plan_id="plan_typo_agent",
@@ -1494,11 +1496,8 @@ def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
 
     # Act / Assert
     with pytest.raises(
-        GraphRuntimeError,
-        match=(
-            "no specialist handler registered for approved plan step "
-            "step_typo_agent agent relationship_summarry"
-        ),
+        PlanMutationError,
+        match="approved plan references unavailable agents: relationship_summarry",
     ):
         store.apply_user_action(
             {
