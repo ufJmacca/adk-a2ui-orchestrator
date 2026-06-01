@@ -1,0 +1,42 @@
+[
+  {
+    "name": "simple_internal_notes",
+    "input": "Summarize the internal notes for ABC Manufacturing.",
+    "expected_path": "direct",
+    "expected_agent": "internal_knowledge"
+  },
+  {
+    "name": "meeting_prep",
+    "input": "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+    "expected_path": "plan_required",
+    "expected_agents": [
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research",
+      "synthesis"
+    ],
+    "expected_data_source_categories": [
+      "relationship_history",
+      "internal_crm",
+      "industry_research"
+    ]
+  },
+  {
+    "name": "prospect_research",
+    "input": "Research this prospect and give me risks, opportunities, and talking points.",
+    "expected_path": "plan_required",
+    "expected_agents": [
+      "web_search",
+      "industry_research",
+      "product_opportunity",
+      "credit_risk",
+      "synthesis"
+    ],
+    "expected_data_source_categories": [
+      "public_web",
+      "industry_research",
+      "product_fit",
+      "credit_risk"
+    ]
+  }
+]
