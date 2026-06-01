@@ -44,6 +44,7 @@ UserActionType = Literal[
     "add_instructions",
     "specialist_action",
 ]
+A2uiPayload = dict[str, Any] | list[dict[str, Any]]
 PLAN_USER_ACTION_TYPES: set[str] = {
     "approve_plan",
     "reject_plan",
@@ -144,6 +145,23 @@ def _validate_dependency_topology(
         duplicates = ", ".join(duplicate_ids)
         raise ValueError(
             f"{contract_name} {id_field_name} values must be unique: {duplicates}"
+        )
+
+    duplicate_dependencies_by_id = {
+        node_id: duplicate_dependencies
+        for node_id, dependency_ids in dependencies_by_id.items()
+        if (duplicate_dependencies := _duplicate_values(dependency_ids))
+    }
+    if duplicate_dependencies_by_id:
+        duplicates = "; ".join(
+            f"{node_id}: {', '.join(duplicate_dependencies)}"
+            for node_id, duplicate_dependencies in sorted(
+                duplicate_dependencies_by_id.items()
+            )
+        )
+        raise ValueError(
+            f"{contract_name} {reference_source_label} entries must be unique "
+            f"per {id_field_name}: {duplicates}"
         )
 
     declared_id_set = set(declared_ids)
@@ -295,7 +313,7 @@ class SpecialistResponse(ContractModel):
     agent_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
     structured_output: dict[str, Any] = Field(default_factory=dict)
-    a2ui_payload: dict[str, Any] | None = None
+    a2ui_payload: A2uiPayload | None = None
     surface_id: str | None = Field(
         default=None,
         pattern=r"^surface_[A-Za-z0-9][A-Za-z0-9_-]*$",
@@ -329,10 +347,20 @@ class GraphSpec(ContractModel):
         dependencies_by_step_id = {
             step.graph_step_id: list(step.depends_on) for step in self.steps
         }
+        duplicate_edges = _duplicate_values(
+            [
+                f"{edge.from_step_id}->{edge.to_step_id}"
+                for edge in self.edges
+            ]
+        )
+        if duplicate_edges:
+            duplicates = ", ".join(duplicate_edges)
+            raise ValueError(f"GraphSpec edges must be unique: {duplicates}")
+
         for edge in self.edges:
-            dependencies_by_step_id.setdefault(edge.to_step_id, []).append(
-                edge.from_step_id
-            )
+            dependencies = dependencies_by_step_id.setdefault(edge.to_step_id, [])
+            if edge.from_step_id not in dependencies:
+                dependencies.append(edge.from_step_id)
 
         _validate_dependency_topology(
             contract_name="GraphSpec",
@@ -403,6 +431,9 @@ class UserAction(ContractModel):
             for top_level_plan_id in top_level_plan_ids[1:]
         ):
             raise ValueError("top-level planId aliases must match")
+        if top_level_plan_ids:
+            normalized["planId"] = top_level_plan_ids[0]
+        normalized.pop("plan_id", None)
 
         payload_plan_ids = [
             value
@@ -426,7 +457,22 @@ class UserAction(ContractModel):
         if top_level_plan_id is None and payload_plan_id is not None:
             normalized["planId"] = payload_plan_id
 
-        top_level_plan_version = normalized.get("planVersion", normalized.get("plan_version"))
+        top_level_plan_versions = [
+            value
+            for value in (normalized.get("planVersion"), normalized.get("plan_version"))
+            if value is not None
+        ]
+        if top_level_plan_versions and any(
+            top_level_plan_version != top_level_plan_versions[0]
+            for top_level_plan_version in top_level_plan_versions[1:]
+        ):
+            raise ValueError("top-level planVersion aliases must match")
+        top_level_plan_version = (
+            top_level_plan_versions[0] if top_level_plan_versions else None
+        )
+        if top_level_plan_version is not None:
+            normalized["planVersion"] = top_level_plan_version
+        normalized.pop("plan_version", None)
         payload_plan_versions = [
             value
             for value in (
@@ -492,6 +538,7 @@ class StatusEvent(ContractModel):
 
 
 __all__ = [
+    "A2uiPayload",
     "AgentDescriptor",
     "Complexity",
     "ContractModel",

@@ -14,10 +14,10 @@ def main() -> int:
     try:
         build_litellm_model()
     except ConfigurationError as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
 
-    print("orchestrator_demo.app runtime configuration loaded.")
+    print("orchestrator_demo.app runtime configuration validated.")
     return 0
 
 
