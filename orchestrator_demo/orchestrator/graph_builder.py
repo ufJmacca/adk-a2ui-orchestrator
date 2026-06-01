@@ -25,6 +25,9 @@ from orchestrator_demo.orchestrator.graph_runtime import (
     AdkRuntimeEdge,
     AdkWorkflowRuntimeFactory,
     START_NODE_NAME,
+    _conditional_merge_groups,
+    _edge_key,
+    _join_targets,
 )
 
 
@@ -85,7 +88,7 @@ class GraphBuilder:
             graph_step_ids_by_plan_step_id=graph_step_ids_by_plan_step_id,
             conditional_branch=conditional_branch,
         )
-        runtime_edges, join_node_names = _runtime_edges_for(
+        runtime_edges, join_node_names, merge_node_names = _runtime_edges_for(
             spec,
             root_graph_step_ids=_root_graph_step_ids(
                 plan.steps,
@@ -94,7 +97,9 @@ class GraphBuilder:
         )
         runtime = self._runtime_factory.build(
             graph_id=spec.graph_id,
-            step_node_names=[step.graph_step_id for step in spec.steps],
+            step_node_names=[
+                step.graph_step_id for step in spec.steps
+            ] + merge_node_names,
             join_node_names=join_node_names,
             edges=runtime_edges,
         )
@@ -239,17 +244,19 @@ def _runtime_edges_for(
     spec: GraphSpec,
     *,
     root_graph_step_ids: Sequence[str],
-) -> tuple[list[AdkRuntimeEdge], list[str]]:
+) -> tuple[list[AdkRuntimeEdge], list[str], list[str]]:
     graph_edges = list(spec.edges)
     incoming_edges_by_target = _incoming_edges_by_target(graph_edges)
-    join_targets = {
-        target_id
-        for target_id, incoming_edges in incoming_edges_by_target.items()
-        if len(incoming_edges) > 1
-        and all(edge.condition is None for edge in incoming_edges)
-    }
+    conditional_merge_groups = _conditional_merge_groups(graph_edges)
+    join_targets = _join_targets(incoming_edges_by_target, conditional_merge_groups)
     join_node_names = [f"join_{target_id}" for target_id in _ordered_ids(join_targets)]
     join_node_by_target = dict(zip(_ordered_ids(join_targets), join_node_names))
+    merge_node_names = [group.merge_node_name for group in conditional_merge_groups]
+    conditional_merge_by_edge = {
+        edge_key: group
+        for group in conditional_merge_groups
+        for edge_key in group.edge_keys
+    }
 
     runtime_edges: list[AdkRuntimeEdge] = []
     for graph_step_id in root_graph_step_ids:
@@ -262,6 +269,18 @@ def _runtime_edges_for(
         )
 
     for edge in graph_edges:
+        conditional_merge = conditional_merge_by_edge.get(_edge_key(edge))
+        if conditional_merge is not None:
+            _append_runtime_edge(
+                runtime_edges,
+                AdkRuntimeEdge(
+                    from_node_name=edge.from_step_id,
+                    to_node_name=conditional_merge.merge_node_name,
+                    route=edge.condition,
+                ),
+            )
+            continue
+
         target_join = join_node_by_target.get(edge.to_step_id)
         if target_join is not None:
             _append_runtime_edge(
@@ -282,6 +301,15 @@ def _runtime_edges_for(
             ),
         )
 
+    for group in conditional_merge_groups:
+        _append_runtime_edge(
+            runtime_edges,
+            AdkRuntimeEdge(
+                from_node_name=group.merge_node_name,
+                to_node_name=join_node_by_target[group.target_id],
+            ),
+        )
+
     for target_id in _ordered_ids(join_targets):
         _append_runtime_edge(
             runtime_edges,
@@ -291,7 +319,7 @@ def _runtime_edges_for(
             ),
         )
 
-    return runtime_edges, join_node_names
+    return runtime_edges, join_node_names, merge_node_names
 
 
 def _append_runtime_edge(

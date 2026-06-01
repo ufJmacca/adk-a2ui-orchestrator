@@ -1,7 +1,10 @@
 import pytest
 
 from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep
-from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+from orchestrator_demo.orchestrator.approval_state import (
+    ApprovalRecord,
+    ApprovalStateStore,
+)
 from orchestrator_demo.orchestrator.graph_builder import (
     GraphBuilder,
     GraphPlanApprovalError,
@@ -267,6 +270,45 @@ def _conditional_data_quality_plan() -> ExecutionPlan:
     )
 
 
+def _mixed_conditional_data_quality_plan() -> ExecutionPlan:
+    return _plan(
+        plan_id="plan_mixed_conditional_data_quality",
+        selected_agents=["internal_knowledge", "web_search", "data_quality", "synthesis"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_web_search",
+                agent_id="web_search",
+                instruction="Gather public context.",
+                expected_output="Public context.",
+                data_source_categories=["public_web"],
+            ),
+            PlanStep(
+                step_id="step_data_quality",
+                agent_id="data_quality",
+                instruction="Check missing or stale internal data if needed.",
+                depends_on=["step_internal_knowledge"],
+                expected_output="Data quality gaps.",
+                data_source_categories=["data_quality"],
+            ),
+            PlanStep(
+                step_id="step_synthesis",
+                agent_id="synthesis",
+                instruction="Synthesize the available context.",
+                depends_on=["step_data_quality", "step_web_search"],
+                expected_output="Final briefing or clarification need.",
+                data_source_categories=["specialist_outputs"],
+            ),
+        ],
+    )
+
+
 def _runtime_edges(result) -> set[tuple[str, str, str | None]]:
     return set(result.runtime.edge_routes)
 
@@ -301,7 +343,12 @@ def test_graph_builder_rejects_approved_plan_that_is_not_immutable() -> None:
             )
         ],
     )
-    record = _approval_record_for(plan)
+    record = ApprovalRecord(
+        draft_plan=plan,
+        status="approved",
+        approved_version=plan.plan_version,
+    )
+    record.approved_plan = plan
     builder = GraphBuilder(registry=_registry_for(plan))
 
     # Act / Assert
@@ -432,6 +479,52 @@ def test_graph_builder_builds_conditional_data_quality_branch() -> None:
         ),
         ("graph_step_data_quality", "graph_step_synthesis", None),
         ("graph_step_internal_knowledge", "graph_step_synthesis", "__DEFAULT__"),
+    }
+
+
+def test_graph_builder_merges_mixed_conditional_fan_in_before_join() -> None:
+    # Arrange
+    plan = _mixed_conditional_data_quality_plan()
+    builder = GraphBuilder(registry=_registry_for(plan))
+
+    # Act
+    result = builder.build(_approval_record_for(plan))
+
+    # Assert
+    merge_node = "merge_graph_step_synthesis_graph_step_internal_knowledge"
+    assert result.spec.pattern == "conditional"
+    assert merge_node in result.runtime.node_names
+    assert "join_graph_step_synthesis" in result.runtime.node_names
+    assert {
+        (edge.from_step_id, edge.to_step_id, edge.condition)
+        for edge in result.spec.edges
+    } == {
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_data_quality",
+            "missing_internal_data",
+        ),
+        ("graph_step_web_search", "graph_step_synthesis", None),
+        ("graph_step_data_quality", "graph_step_synthesis", None),
+        ("graph_step_internal_knowledge", "graph_step_synthesis", "__DEFAULT__"),
+    }
+    assert _runtime_edges(result) == {
+        ("__START__", "graph_step_internal_knowledge", None),
+        ("__START__", "graph_step_web_search", None),
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_data_quality",
+            "missing_internal_data",
+        ),
+        (
+            "graph_step_internal_knowledge",
+            merge_node,
+            "__DEFAULT__",
+        ),
+        ("graph_step_data_quality", merge_node, None),
+        ("graph_step_web_search", "join_graph_step_synthesis", None),
+        (merge_node, "join_graph_step_synthesis", None),
+        ("join_graph_step_synthesis", "graph_step_synthesis", None),
     }
 
 

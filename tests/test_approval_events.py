@@ -1198,10 +1198,59 @@ def test_approve_plan_rejects_malformed_approved_step_ids_before_freezing(
     assert record_after_failed_approval.draft_plan == draft_snapshot
 
 
-def test_failed_graph_execution_keeps_plan_recoverable() -> None:
+def test_approve_plan_rejects_mutable_plan_before_freezing_or_graph_execution() -> None:
     # Arrange
     from orchestrator_demo.orchestrator.approval_state import (
         ApprovalStateStore,
+        PlanMutationError,
+    )
+
+    class RecordingGraphRuntime:
+        def __init__(self) -> None:
+            self.executed_plan_ids: list[str] = []
+
+        def execute(self, plan: ExecutionPlan) -> object:
+            self.executed_plan_ids.append(plan.plan_id)
+            raise AssertionError("mutable plans must not reach graph execution")
+
+    graph_runtime = RecordingGraphRuntime()
+    store = ApprovalStateStore(
+        agent_descriptors=_agent_descriptors(),
+        graph_runtime=graph_runtime,
+    )
+    mutable_plan = _meeting_plan().model_copy(
+        update={"immutable_after_approval": False}
+    )
+    store.add_draft(mutable_plan)
+    draft_snapshot = store.get("plan_meeting_prep").draft_plan.model_copy(deep=True)
+    approve_event = _action(
+        "approve_plan",
+        {
+            "approvedStepIds": [
+                "step_relationship_summary",
+                "step_internal_knowledge",
+                "step_industry_research",
+                "step_synthesis",
+            ]
+        },
+    )
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError, match="immutable_after_approval=True"):
+        store.apply_user_action(approve_event)
+
+    record_after_failed_approval = store.get("plan_meeting_prep")
+    assert graph_runtime.executed_plan_ids == []
+    assert record_after_failed_approval.status == "draft"
+    assert record_after_failed_approval.approved_plan is None
+    assert record_after_failed_approval.draft_plan == draft_snapshot
+
+
+def test_failed_graph_execution_freezes_approved_plan_state() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanAlreadyFinalError,
     )
 
     class FailingGraphRuntime:
@@ -1238,27 +1287,32 @@ def test_failed_graph_execution_keeps_plan_recoverable() -> None:
     assert graph_runtime.specialist_calls == [
         ("plan_meeting_prep", "step_relationship_summary")
     ]
-    assert record_after_failed_execution.status == "draft"
-    assert record_after_failed_execution.approved_plan is None
-    assert record_after_failed_execution.approved_version is None
+    assert record_after_failed_execution.status == "approved_execution_failed"
+    assert record_after_failed_execution.approved_plan is not None
+    assert record_after_failed_execution.approved_version == 1
+    assert record_after_failed_execution.execution_failure_reason == (
+        "RuntimeError: graph failed for plan_meeting_prep"
+    )
 
-    recovery_result = store.apply_user_action(
-        _action(
-            "add_instruction",
-            {
-                "stepId": "step_internal_knowledge",
-                "instruction": "Retry after graph recovery.",
-            },
+    with pytest.raises(
+        PlanAlreadyFinalError,
+        match="already approved_execution_failed",
+    ):
+        store.apply_user_action(
+            _action(
+                "add_instruction",
+                {
+                    "stepId": "step_internal_knowledge",
+                    "instruction": "Retry after graph recovery.",
+                },
+            )
         )
-    )
-    recovered_record = store.get("plan_meeting_prep")
-    assert recovery_result.status == "draft_updated"
-    assert recovery_result.plan_version == 2
-    assert recovered_record.status == "draft"
-    assert recovered_record.approved_plan is None
-    assert recovered_record.draft_plan.steps[1].instruction.endswith(
-        "Additional instruction: Retry after graph recovery."
-    )
+
+    with pytest.raises(
+        PlanAlreadyFinalError,
+        match="already approved_execution_failed",
+    ):
+        store.apply_user_action(approve_event)
 
 
 def test_draft_update_commits_only_after_refreshed_canvas_validation() -> None:
@@ -1515,9 +1569,13 @@ def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
         )
 
     record_after_failed_execution = store.get("plan_typo_agent")
-    assert record_after_failed_execution.status == "draft"
-    assert record_after_failed_execution.approved_plan is None
-    assert record_after_failed_execution.approved_version is None
+    assert record_after_failed_execution.status == "approved_execution_failed"
+    assert record_after_failed_execution.approved_plan is not None
+    assert record_after_failed_execution.approved_version == 1
+    assert record_after_failed_execution.execution_failure_reason == (
+        "GraphRuntimeError: no specialist handler registered for approved plan "
+        "step step_typo_agent agent relationship_summarry"
+    )
 
 
 def test_graph_runtime_awaits_async_specialist_handlers() -> None:
