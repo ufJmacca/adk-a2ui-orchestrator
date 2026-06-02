@@ -80,17 +80,60 @@ def _renderer_behavior_response() -> dict[str, object]:
                 "surfaceId": "surface_product_opportunity_1",
                 "components": [
                     {
-                        "component": "Card",
+                        "type": "column",
                         "id": "root",
-                        "child": "downstream_text",
+                        "children": [
+                            "downstream_text",
+                            {
+                                "type": "text",
+                                "id": "downstream_inline_detail",
+                                "text": "Inline specialist detail",
+                            },
+                            "downstream_falsey_table",
+                            "downstream_card_title_body",
+                            "downstream_foreign_route",
+                        ],
                     },
                     {
-                        "component": "Text",
+                        "type": "text",
                         "id": "downstream_text",
                         "text": (
                             "Product recommendation "
                             "<script>globalThis.__executed = true</script>"
                         ),
+                    },
+                    {
+                        "type": "button",
+                        "id": "downstream_foreign_route",
+                        "label": "Foreign route",
+                        "action": {
+                            "event": {
+                                "name": "show_more_detail",
+                                "context": {
+                                    "type": "show_more_detail",
+                                    "surfaceId": "surface_plan_renderer_behavior",
+                                    "payload": {"cardId": "product_opportunity"},
+                                },
+                            }
+                        },
+                    },
+                    {
+                        "type": "table",
+                        "id": "downstream_falsey_table",
+                        "columns": [
+                            {"key": "name", "label": "Name"},
+                            {"key": "count", "label": "Count"},
+                            {"key": "active", "label": "Active"},
+                        ],
+                        "rows": [
+                            {"name": "Zero balance", "count": 0, "active": False},
+                        ],
+                    },
+                    {
+                        "type": "card",
+                        "id": "downstream_card_title_body",
+                        "title": "Card title from specialist",
+                        "body": "Card body from specialist",
                     },
                 ],
             },
@@ -100,6 +143,27 @@ def _renderer_behavior_response() -> dict[str, object]:
         "a2uiParts": [
             {"data": message}
             for message in [*approval_messages, *downstream_messages]
+        ]
+        + [
+            {
+                "type": "text",
+                "text": (
+                    "A2UI rendering unavailable. The generated UI payload failed "
+                    "validation and was not emitted to the renderer."
+                ),
+                "metadata": {
+                    "developerDiagnostic": {
+                        "fallback": "text",
+                        "validationErrors": [
+                            (
+                                "A2UI payload contains secret-like value "
+                                "<redacted-secret>."
+                            )
+                        ],
+                        "repairAttempted": False,
+                    }
+                },
+            }
         ],
         "statusEvents": [
             {
@@ -425,9 +489,21 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
               assert.match(approvalText, /Selected agents: relationship_summary/);
               assert.match(approvalText, /step_relationship_summary/);
               assert.match(downstreamText, /Product recommendation/);
+              assert.match(downstreamText, /Inline specialist detail/);
+              assert.match(downstreamText, /Card title from specialist/);
+              assert.match(downstreamText, /Card body from specialist/);
               assert.match(downstreamText, /<script>globalThis.__executed = true<\\/script>/);
+              assert.match(downstreamText, /A2UI rendering unavailable/);
+              assert.match(downstreamText, /secret-like value/);
+              assert.match(downstreamText, /<redacted-secret>/);
+              assert.doesNotMatch(downstreamText, /sk-live/);
               assert.equal(document.querySelector('script'), null);
               assert.equal(context.__executed, undefined);
+              const tableCells = document
+                .getElementById('downstream-surfaces')
+                .querySelectorAll('td')
+                .map((cell) => cell.textContent);
+              assert.deepEqual(tableCells, ['Zero balance', '0', 'false']);
               assert.match(statusText, /approval_required: Plan approval is pending/);
               assert.match(statusText, /step_completed: Relationship summary completed/);
               assert.match(artifactText, /Draft meeting brief ready/);
@@ -466,6 +542,52 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
                   }},
                 }},
               }});
+
+              context.__rendererApi.handleTransportResponse(response);
+              const refreshedInstructionInput = approvalRoot
+                .querySelectorAll('textarea')
+                .find((element) => (
+                  element.parentNode.textContent.includes(
+                    'Instruction for step_relationship_summary',
+                  )
+                ));
+              assert.ok(refreshedInstructionInput);
+              assert.equal(refreshedInstructionInput.value, '');
+              const refreshedAddInstruction = byVisibleText(
+                approvalRoot,
+                'button',
+                'Add instruction to step_relationship_summary',
+              );
+              assert.ok(refreshedAddInstruction);
+              refreshedAddInstruction.click();
+              await new Promise((resolve) => setImmediate(resolve));
+
+              assert.equal(userActions.length, 2);
+              assert.deepEqual(userActions[1], {{
+                userAction: {{
+                  type: 'add_instruction',
+                  surfaceId: 'surface_plan_renderer_behavior',
+                  payload: {{
+                    planId: 'plan_renderer_behavior',
+                    planVersion: 3,
+                    editedPlanVersion: 3,
+                    stepId: 'step_relationship_summary',
+                  }},
+                }},
+              }});
+
+              const foreignRouteButton = byVisibleText(
+                document.getElementById('downstream-surfaces'),
+                'button',
+                'Foreign route',
+              );
+              assert.ok(foreignRouteButton);
+              assert.throws(
+                () => foreignRouteButton.click(),
+                /surfaceId does not match rendered surface/,
+              );
+              await new Promise((resolve) => setImmediate(resolve));
+              assert.equal(userActions.length, 2);
             }}
 
             main().catch((error) => {{
@@ -524,7 +646,9 @@ def test_renderer_emits_structured_user_actions_with_surface_and_plan_metadata()
     # Act / Assert
     assert "function buildUserAction" in script
     assert "type: context.type" in script
-    assert "surfaceId: context.surfaceId" in script
+    assert "requireActionSurfaceContextMatchesRenderedSurface(context, surfaceId)" in script
+    assert "context.surfaceId !== surfaceId" in script
+    assert "surfaceId," in script
     assert "payload: resolvePayload(context.payload || {})" in script
     assert "planId" in script
     assert "planVersion" in script

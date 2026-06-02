@@ -241,8 +241,9 @@ def test_registered_specialist_failure_preserves_prior_events_and_step_failed_st
     assert failed_event.step_id == "graph_step_credit_risk"
     assert failed_event.message == (
         "Approved plan step step_credit_risk failed during execution: "
-        "RuntimeError: credit service timed out."
+        "RuntimeError."
     )
+    assert "credit service timed out" not in str(failure)
     assert failed_event.details == {
         "agentId": "credit_risk",
         "planStepId": "step_credit_risk",

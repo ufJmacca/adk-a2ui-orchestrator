@@ -21,7 +21,7 @@ from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel
 
-from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2a_support.transport import A2APart
 from orchestrator_demo.contracts import SpecialistResponse, StatusEvent
 from orchestrator_demo.orchestrator.service import (
     OrchestratorRequestResult,
@@ -39,6 +39,7 @@ class LocalOrchestratorApp:
     def __init__(self, service: OrchestratorService | None = None) -> None:
         self._service = service or OrchestratorService()
         self._counter = 0
+        self._counter_lock = threading.Lock()
         self._latest_a2ui_parts: list[dict[str, Any]] = []
         self._latest_artifacts: dict[str, Any] = {}
         self._status_events: list[dict[str, Any]] = []
@@ -102,8 +103,7 @@ class LocalOrchestratorApp:
 
         result = asyncio.run(self._service.handle_user_action(payload))
         response = self._user_action_response_payload(result)
-        if response["a2uiParts"]:
-            self._remember_result_a2ui(response["a2uiParts"])
+        self._remember_result_a2ui(response["a2uiParts"])
         if response["artifacts"]:
             self._latest_artifacts = response["artifacts"]
         self._record_user_action_status(result)
@@ -133,8 +133,10 @@ class LocalOrchestratorApp:
         }
 
     def _next_transport_ids(self) -> tuple[str, str]:
-        self._counter += 1
-        return f"task_local_{self._counter}", f"ctx_local_{self._counter}"
+        with self._counter_lock:
+            self._counter += 1
+            next_id = self._counter
+        return f"task_local_{next_id}", f"ctx_local_{next_id}"
 
     def _request_response_payload(
         self,
@@ -210,10 +212,11 @@ class LocalOrchestratorApp:
             if result.approval_result is not None
             else None
         )
-        message = _user_action_status_message(result.status)
+        status = _public_user_action_status(result.status)
+        message = _user_action_status_message(status)
         self._status_events.append(
             {
-                "status": result.status,
+                "status": status,
                 "message": message,
                 "taskId": None,
                 "planId": plan_id,
@@ -221,8 +224,7 @@ class LocalOrchestratorApp:
         )
 
     def _remember_result_a2ui(self, a2ui_parts: list[dict[str, Any]]) -> None:
-        if a2ui_parts:
-            self._latest_a2ui_parts = list(a2ui_parts)
+        self._latest_a2ui_parts = list(a2ui_parts)
 
 
 class LocalHttpServer:
@@ -235,6 +237,8 @@ class LocalHttpServer:
     @property
     def base_url(self) -> str:
         host, port = self._httpd.server_address[:2]
+        if isinstance(host, bytes):
+            host = host.decode("utf-8")
         return f"http://{host}:{port}"
 
     def start_in_thread(self) -> None:
@@ -251,11 +255,11 @@ class LocalHttpServer:
         self._httpd.serve_forever()
 
     def stop(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
+            self._httpd.shutdown()
             self._thread.join(timeout=10)
-            self._thread = None
+        self._thread = None
+        self._httpd.server_close()
 
 
 class _LocalHttpServer(ThreadingHTTPServer):
@@ -338,6 +342,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
         if STATIC_ROOT not in resolved_path.parents and resolved_path != STATIC_ROOT:
             self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
+        if not resolved_path.is_file():
+            self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+            return
         content_type = _content_type_for(resolved_path)
         body = resolved_path.read_bytes()
         self.send_response(HTTPStatus.OK)
@@ -410,7 +417,7 @@ def _content_type_for(path: Path) -> str:
     return "application/octet-stream"
 
 
-def _data_parts_payload(parts: tuple[DataPart, ...]) -> list[dict[str, Any]]:
+def _data_parts_payload(parts: tuple[A2APart, ...]) -> list[dict[str, Any]]:
     return [part.model_dump(by_alias=True, mode="json") for part in parts]
 
 
@@ -427,6 +434,7 @@ def _approval_result_payload(result: Any) -> dict[str, Any] | None:
         "planVersion": result.plan_version,
         "approvedPlan": _jsonable(result.approved_plan),
         "reason": result.rejection_reason,
+        "failureReason": result.failure_reason,
         "graphCreated": result.graph_created,
         "specialistsCalled": result.specialists_called,
     }
@@ -438,7 +446,7 @@ def _surface_route_payload(result: OrchestratorUserActionResult) -> dict[str, An
         return None
     owner = route_result.owner
     return {
-        "status": route_result.status,
+        "status": _public_user_action_status(route_result.status),
         "owner": None
         if owner is None
         else {
@@ -447,6 +455,7 @@ def _surface_route_payload(result: OrchestratorUserActionResult) -> dict[str, An
             "ownerId": owner.owner_id,
             "planId": owner.plan_id,
         },
+        "error": _jsonable(route_result.error),
     }
 
 
@@ -455,6 +464,7 @@ def _user_action_status_message(status: str) -> str:
         "draft_updated": "Plan draft updated.",
         "rejected": "Plan rejected.",
         "approved": "Plan approved.",
+        "failed": "Plan approval failed.",
         "routed": "A2UI event routed to surface owner.",
     }.get(status, "User action handled.")
 

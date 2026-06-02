@@ -264,6 +264,35 @@ def test_a2ui_validation_accepts_sdk_kind_data_part_payload() -> None:
     assert result.renderer_part.metadata["mimeType"] == A2UI_MIME_TYPE
 
 
+def test_a2ui_validation_redacts_secret_like_sdk_data_part_error_locations() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    sdk_data_part = {
+        "kind": "data",
+        "mimeType": A2UI_MIME_TYPE,
+        "data": _valid_canvas_payload(),
+        "OPENROUTER_API_KEY": "accidentally copied envelope key",
+        "Authorization": "accidentally copied header key",
+    }
+
+    # Act
+    result = validate_outbound_a2ui(sdk_data_part)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+        }
+    )
+    assert "OPENROUTER_API_KEY" not in exposed_diagnostic_text
+    assert "Authorization" not in exposed_diagnostic_text
+    assert "<redacted-key>" in exposed_diagnostic_text
+
+
 def test_a2ui_validation_accepts_sdk_created_a2ui_part_instance() -> None:
     # Arrange
     from a2ui.a2a.parts import create_a2ui_part
@@ -310,6 +339,53 @@ def test_a2ui_validation_preserves_non_plan_specialist_a2ui_payload() -> None:
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
 
     payload = _a2ui_update()
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_accepts_renderer_mapped_downstream_components() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_product_downstream",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "product", "label": "Product"}],
+                "rows": [{"product": "Treasury services"}],
+            },
+            {
+                "component": "Accordion",
+                "id": "component_accordion",
+                "title": "Rationale",
+                "children": ["component_status"],
+            },
+            {
+                "component": "Timeline",
+                "id": "component_timeline",
+                "items": [
+                    {
+                        "label": "Review",
+                        "detail": "RM validates synthetic demo findings.",
+                    }
+                ],
+            },
+            {
+                "component": "Status",
+                "id": "component_status",
+                "message": "Ready for RM review.",
+            },
+        ],
+    )
 
     # Act
     result = validate_outbound_a2ui(payload)

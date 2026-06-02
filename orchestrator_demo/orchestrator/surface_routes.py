@@ -332,10 +332,9 @@ class SurfaceRouteRegistry:
             if not isinstance(data, Mapping):
                 continue
             for surface_id in _deleted_surface_ids_from_validated_a2ui(data):
-                self._clear_surface_from(
+                self._clear_specialist_owned_surface_or_raise(
                     staged_owners,
                     surface_id,
-                    owner_type="specialist",
                     owner_id=owner.owner_id,
                 )
             for surface_id in _surface_ids_from_validated_a2ui(data):
@@ -348,6 +347,31 @@ class SurfaceRouteRegistry:
                 )
 
         self._owners_by_surface_id = staged_owners
+
+    def _clear_specialist_owned_surface_or_raise(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        owner_id: str,
+    ) -> None:
+        existing = owners_by_surface_id.get(surface_id)
+        if existing is None:
+            raise SurfaceOwnershipError(
+                f"deleteSurface target {surface_id} is not registered to "
+                f"specialist:{owner_id}"
+            )
+        if existing.owner_type != "specialist" or existing.owner_id != owner_id:
+            raise SurfaceOwnershipError(
+                f"deleteSurface target {surface_id} is owned by "
+                f"{existing.owner_type}:{existing.owner_id}, not specialist:{owner_id}"
+            )
+        self._clear_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            owner_type="specialist",
+            owner_id=owner_id,
+        )
 
 
 def _validated_surface_id(surface_id: str) -> str:

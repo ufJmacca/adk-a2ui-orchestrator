@@ -2,26 +2,40 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Literal
 
 from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.approval_canvas import approval_canvas_data_parts
 from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
 from orchestrator_demo.app.logging import log_audit_event
-from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep, UserAction
+from orchestrator_demo.contracts import (
+    AgentDescriptor,
+    ExecutionPlan,
+    PlanStep,
+    StatusEvent,
+    UserAction,
+)
 from orchestrator_demo.orchestrator.graph_runtime import (
     AdkGraphRuntime,
     GraphExecutionResult,
     GraphRuntime,
+    GraphRuntimeError,
     default_specialist_handlers,
 )
 from orchestrator_demo.orchestrator.planner import step_metadata_for_agent
 
 
-PlanState = Literal["draft", "approved", "rejected"]
-ApprovalActionStatus = Literal["ignored", "draft_updated", "approved", "rejected"]
+PlanState = Literal["draft", "approving", "approved", "rejected"]
+ApprovalActionStatus = Literal[
+    "ignored",
+    "draft_updated",
+    "approved",
+    "rejected",
+    "failed",
+]
 
 
 class ApprovalStateError(ValueError):
@@ -33,7 +47,7 @@ class PlanNotFoundError(ApprovalStateError):
 
 
 class PlanAlreadyFinalError(ApprovalStateError):
-    """Raised when a mutation targets an approved or rejected plan."""
+    """Raised when a mutation targets a non-draft plan."""
 
 
 class PlanVersionConflictError(ApprovalStateError):
@@ -92,7 +106,9 @@ class ApprovalActionResult:
     refreshed_a2ui_parts: list[DataPart] = field(default_factory=list)
     approved_plan: ExecutionPlan | None = None
     rejection_reason: str | None = None
+    failure_reason: str | None = None
     graph_execution: GraphExecutionResult | None = None
+    graph_status_events: tuple[StatusEvent, ...] = ()
     graph_created: bool = False
     specialists_called: bool = False
 
@@ -111,18 +127,27 @@ class ApprovalStateStore:
     def __init__(
         self,
         *,
-        agent_descriptors: Sequence[AgentDescriptor],
+        agent_descriptors: Sequence[AgentDescriptor] | Callable[
+            [],
+            Sequence[AgentDescriptor],
+        ],
         graph_runtime: GraphRuntime | None = None,
     ) -> None:
-        self._agent_descriptors = [
-            descriptor.model_copy(deep=True) for descriptor in agent_descriptors
-        ]
-        self._agent_descriptors_by_id = {
-            descriptor.agent_id: descriptor for descriptor in self._agent_descriptors
-        }
-        self._agent_ids = {
-            descriptor.agent_id for descriptor in self._agent_descriptors
-        }
+        self._lock = RLock()
+        if callable(agent_descriptors):
+            self._agent_descriptor_source = agent_descriptors
+        else:
+            static_agent_descriptors = tuple(agent_descriptors)
+
+            def static_agent_descriptor_source() -> Sequence[AgentDescriptor]:
+                return static_agent_descriptors
+
+            self._agent_descriptor_source = static_agent_descriptor_source
+
+        self._agent_descriptors: list[AgentDescriptor] = []
+        self._agent_descriptors_by_id: dict[str, AgentDescriptor] = {}
+        self._agent_ids: set[str] = set()
+        self._refresh_agent_descriptors()
         self._records: dict[str, ApprovalRecord] = {}
         self._graph_runtime = graph_runtime or AdkGraphRuntime(
             specialist_handlers=default_specialist_handlers(self._agent_ids)
@@ -132,20 +157,22 @@ class ApprovalStateStore:
         """Store a deep copy of a draft plan without owning the caller's object."""
 
         draft = plan.model_copy(deep=True)
-        existing = self._records.get(draft.plan_id)
-        if existing is not None and existing.status != "draft":
-            raise PlanAlreadyFinalError(
-                f"plan {draft.plan_id} is already {existing.status}"
-            )
+        with self._lock:
+            existing = self._records.get(draft.plan_id)
+            if existing is not None and existing.status != "draft":
+                raise PlanAlreadyFinalError(
+                    f"plan {draft.plan_id} is already {existing.status}"
+                )
 
-        record = ApprovalRecord(draft_plan=draft)
-        self._records[draft.plan_id] = record
-        return _record_snapshot(record)
+            record = ApprovalRecord(draft_plan=draft)
+            self._records[draft.plan_id] = record
+            return _record_snapshot(record)
 
     def get(self, plan_id: str) -> ApprovalRecord:
         """Return a defensive snapshot of a plan record for inspection."""
 
-        return _record_snapshot(self._get_live_record(plan_id))
+        with self._lock:
+            return _record_snapshot(self._get_live_record(plan_id))
 
     def _get_live_record(self, plan_id: str) -> ApprovalRecord:
         try:
@@ -163,31 +190,70 @@ class ApprovalStateStore:
 
         action = parse_plan_user_action(candidate)
         assert action.plan_id is not None
-        record = self._get_live_record(action.plan_id)
-        self._require_matching_surface(record, action)
 
         if action.type == "approve_plan":
-            return self._approve(record, action)
-        if action.type == "reject_plan":
-            return self._reject(record, action)
+            return self._approve(action)
 
-        return self._mutate_draft(record, action)
+        with self._lock:
+            record = self._get_live_record(action.plan_id)
+            self._require_matching_surface(record, action)
+
+            if action.type == "reject_plan":
+                return self._reject(record, action)
+
+            return self._mutate_draft(record, action)
 
     def _approve(
         self,
-        record: ApprovalRecord,
         action: UserAction,
     ) -> ApprovalActionResult:
-        self._require_draft(record)
-        self._require_current_version(record, action)
-        _require_approved_step_ids(record.draft_plan, action.payload)
+        assert action.plan_id is not None
+        with self._lock:
+            record = self._get_live_record(action.plan_id)
+            self._require_matching_surface(record, action)
+            self._require_draft(record)
+            self._require_current_version(record, action)
+            _require_approved_step_ids(record.draft_plan, action.payload)
 
-        frozen_plan = record.draft_plan.model_copy(deep=True)
-        graph_execution = self._graph_runtime.execute(frozen_plan)
+            frozen_plan = record.draft_plan.model_copy(deep=True)
+            record.status = "approving"
 
-        record.status = "approved"
-        record.approved_plan = frozen_plan
-        record.approved_version = frozen_plan.plan_version
+        try:
+            graph_execution = self._graph_runtime.execute(frozen_plan)
+        except GraphRuntimeError as exc:
+            self._rollback_approval_attempt(frozen_plan)
+            log_audit_event(
+                "approval_failed",
+                {
+                    "status": "failed",
+                    "plan_id": frozen_plan.plan_id,
+                    "plan_version": frozen_plan.plan_version,
+                    "graph_created": exc.graph is not None,
+                    "specialists_called": bool(exc.specialist_requests),
+                    "status_event_count": len(exc.status_events),
+                    "request_count": len(exc.specialist_requests),
+                    "response_count": len(exc.specialist_responses),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return ApprovalActionResult(
+                status="failed",
+                plan_id=frozen_plan.plan_id,
+                plan_version=frozen_plan.plan_version,
+                failure_reason=str(exc),
+                graph_status_events=tuple(exc.status_events),
+                graph_created=exc.graph is not None,
+                specialists_called=bool(exc.specialist_requests),
+            )
+        except Exception:
+            self._rollback_approval_attempt(frozen_plan)
+            raise
+
+        with self._lock:
+            record = self._get_live_record(frozen_plan.plan_id)
+            record.status = "approved"
+            record.approved_plan = frozen_plan
+            record.approved_version = frozen_plan.plan_version
         log_audit_event(
             "approval_approved",
             {
@@ -209,6 +275,17 @@ class ApprovalStateStore:
             graph_created=True,
             specialists_called=bool(graph_execution.specialist_requests),
         )
+
+    def _rollback_approval_attempt(self, frozen_plan: ExecutionPlan) -> None:
+        with self._lock:
+            record = self._get_live_record(frozen_plan.plan_id)
+            if (
+                record.status == "approving"
+                and record.draft_plan.plan_version == frozen_plan.plan_version
+            ):
+                record.status = "draft"
+                record.approved_plan = None
+                record.approved_version = None
 
     def _reject(
         self,
@@ -250,6 +327,7 @@ class ApprovalStateStore:
     ) -> ApprovalActionResult:
         self._require_draft(record)
         self._require_current_version(record, action)
+        self._refresh_agent_descriptors()
 
         plan = record.draft_plan
         if action.type == "edit_plan":
@@ -349,6 +427,18 @@ class ApprovalStateStore:
             selected_agents=_selected_agents(steps),
             data_source_categories=_data_source_categories(steps),
         )
+
+    def _refresh_agent_descriptors(self) -> None:
+        self._agent_descriptors = [
+            descriptor.model_copy(deep=True)
+            for descriptor in self._agent_descriptor_source()
+        ]
+        self._agent_descriptors_by_id = {
+            descriptor.agent_id: descriptor for descriptor in self._agent_descriptors
+        }
+        self._agent_ids = {
+            descriptor.agent_id for descriptor in self._agent_descriptors
+        }
 
     def _require_draft(self, record: ApprovalRecord) -> None:
         if record.status == "draft":

@@ -6,12 +6,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2a_support.local_remote_wrapper import (
+    build_default_local_remote_wrappers,
+)
+from orchestrator_demo.a2a_support.transport import A2APart, TextPart
 from orchestrator_demo.a2ui_support.approval_canvas import build_approval_canvas
 from orchestrator_demo.a2ui_support.renderer_contract import (
     prepare_approval_a2ui_for_renderer,
     prepare_specialist_a2ui_for_renderer,
 )
+from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
 from orchestrator_demo.agents import SpecialistAgent, build_default_specialists
 from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import (
@@ -59,7 +63,7 @@ class OrchestratorRequestResult:
     decision: RoutingDecision
     context: RequestContext
     specialist_responses: tuple[SpecialistResponse, ...] = ()
-    a2ui_parts: tuple[DataPart, ...] = ()
+    a2ui_parts: tuple[A2APart, ...] = ()
     approval_plan: ExecutionPlan | None = None
     approval_result: ApprovalActionResult | None = None
     graph_execution: GraphExecutionResult | None = None
@@ -75,7 +79,7 @@ class OrchestratorUserActionResult:
     approval_result: ApprovalActionResult | None = None
     surface_route_result: SurfaceRouteResult | None = None
     specialist_responses: tuple[SpecialistResponse, ...] = ()
-    a2ui_parts: tuple[DataPart, ...] = ()
+    a2ui_parts: tuple[A2APart, ...] = ()
     graph_execution: GraphExecutionResult | None = None
     status_events: tuple[StatusEvent, ...] = ()
     final_artifacts: dict[str, Any] = field(default_factory=dict)
@@ -95,7 +99,11 @@ class OrchestratorService:
         surface_registry: SurfaceRouteRegistry | None = None,
     ) -> None:
         self._registry = registry or AgentRegistry.from_default_config()
-        self._specialists = dict(specialists or build_default_specialists())
+        self._specialists = dict(
+            specialists
+            if specialists is not None
+            else _default_specialists(self._registry)
+        )
         self._specialist_user_action_adapters = _default_user_action_adapters(
             self._specialists
         )
@@ -112,8 +120,9 @@ class OrchestratorService:
         )
         self._planner = DraftExecutionPlanner(registry=self._registry)
         self._approval_store = ApprovalStateStore(
-            agent_descriptors=self._registry.descriptors(),
+            agent_descriptors=self._registry.descriptors,
             graph_runtime=_GuardedGraphRuntime(
+                registry=self._registry,
                 specialists=self._specialists,
                 contexts_by_plan_id=self._contexts_by_plan_id,
             ),
@@ -145,7 +154,10 @@ class OrchestratorService:
             return self._handle_orchestrator_owned_user_action(user_action)
 
         specialist_response = _coerce_specialist_response(route_result.response)
-        a2ui_parts = self._prepare_specialist_response_a2ui(specialist_response)
+        specialist_response, a2ui_parts = self._prepare_specialist_response_for_result(
+            specialist_response,
+            register_surfaces=False,
+        )
         return OrchestratorUserActionResult(
             status=route_result.status,
             surface_route_result=route_result,
@@ -183,7 +195,24 @@ class OrchestratorService:
         if selected_agent is None:
             raise SpecialistPreApprovalError("direct route is missing selected_agent")
 
-        specialist = self._specialists[selected_agent]
+        specialist = self._specialists.get(selected_agent)
+        if specialist is None:
+            decision = RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=context.decision.confidence,
+                reason=(
+                    "The selected direct-route agent is unavailable because no "
+                    f"specialist handler is registered: {selected_agent}."
+                ),
+            )
+            context.decision = decision
+            return OrchestratorRequestResult(
+                path=decision.path,
+                decision=decision,
+                context=context,
+            )
+
         request = SpecialistRequest(
             request_id=f"request_direct_{selected_agent}",
             user_input=context.user_input,
@@ -194,15 +223,19 @@ class OrchestratorService:
             request,
             specialist.handle,
         )
-        a2ui_parts = self._prepare_specialist_response_a2ui(response)
+        safe_response, a2ui_parts = self._prepare_specialist_response_for_result(
+            response,
+            register_surfaces=True,
+        )
+        assert safe_response is not None
 
         return OrchestratorRequestResult(
             path="direct",
             decision=context.decision,
             context=context,
-            specialist_responses=(response,),
+            specialist_responses=(safe_response,),
             a2ui_parts=a2ui_parts,
-            final_artifacts=_final_artifacts_for_response(response),
+            final_artifacts=_final_artifacts_for_response(safe_response),
         )
 
     def _handle_plan_required_request(
@@ -253,8 +286,8 @@ class OrchestratorService:
             if graph_execution is not None
             else ()
         )
-        specialist_a2ui_parts = self._prepare_graph_response_a2ui(
-            specialist_responses,
+        specialist_responses, specialist_a2ui_parts = (
+            self._prepare_graph_responses_for_result(specialist_responses)
         )
 
         return OrchestratorUserActionResult(
@@ -264,15 +297,20 @@ class OrchestratorService:
             a2ui_parts=(*a2ui_parts, *specialist_a2ui_parts),
             graph_execution=graph_execution,
             status_events=(
-                graph_execution.status_events if graph_execution is not None else ()
+                graph_execution.status_events
+                if graph_execution is not None
+                else approval_result.graph_status_events
             ),
-            final_artifacts=_final_artifacts_for_graph(graph_execution),
+            final_artifacts=_final_artifacts_for_graph(
+                graph_execution,
+                specialist_responses=specialist_responses,
+            ),
         )
 
     def _prepare_approval_result_a2ui(
         self,
         approval_result: ApprovalActionResult,
-    ) -> tuple[DataPart, ...]:
+    ) -> tuple[A2APart, ...]:
         if approval_result.status == "draft_updated":
             assert approval_result.plan_id is not None
             self._sync_context_draft(approval_result.plan_id)
@@ -286,19 +324,42 @@ class OrchestratorService:
 
         return ()
 
-    def _prepare_graph_response_a2ui(
+    def _prepare_graph_responses_for_result(
         self,
         responses: tuple[SpecialistResponse, ...],
-    ) -> tuple[DataPart, ...]:
-        parts: list[DataPart] = []
+    ) -> tuple[tuple[SpecialistResponse, ...], tuple[A2APart, ...]]:
+        safe_responses: list[SpecialistResponse] = []
+        parts: list[A2APart] = []
         for response in responses:
-            parts.extend(self._prepare_specialist_response_a2ui(response))
-        return tuple(parts)
+            safe_response, response_parts = self._prepare_specialist_response_for_result(
+                response,
+                register_surfaces=True,
+            )
+            if safe_response is not None:
+                safe_responses.append(safe_response)
+            parts.extend(response_parts)
+        return tuple(safe_responses), tuple(parts)
+
+    def _prepare_specialist_response_for_result(
+        self,
+        response: SpecialistResponse | None,
+        *,
+        register_surfaces: bool,
+    ) -> tuple[SpecialistResponse | None, tuple[A2APart, ...]]:
+        if response is None:
+            return None, ()
+
+        if register_surfaces:
+            a2ui_parts = self._prepare_specialist_response_a2ui(response)
+        else:
+            a2ui_parts = _validated_specialist_response_a2ui(response)
+
+        return _redact_rejected_a2ui_payload(response, a2ui_parts), a2ui_parts
 
     def _prepare_specialist_response_a2ui(
         self,
         response: SpecialistResponse | None,
-    ) -> tuple[DataPart, ...]:
+    ) -> tuple[A2APart, ...]:
         if response is None or response.a2ui_payload is None:
             return ()
 
@@ -325,9 +386,11 @@ class _GuardedGraphRuntime:
     def __init__(
         self,
         *,
+        registry: AgentRegistry,
         specialists: Mapping[str, SpecialistAgent],
         contexts_by_plan_id: Mapping[str, RequestContext],
     ) -> None:
+        self._registry = registry
         self._specialists = dict(specialists)
         self._contexts_by_plan_id = contexts_by_plan_id
 
@@ -337,14 +400,34 @@ class _GuardedGraphRuntime:
             raise GraphRuntimeError(
                 f"no routed request context is registered for approved plan {plan.plan_id}"
             )
+        unavailable_agent_ids = set(self._registry.find_unavailable_plan_agents(plan))
+        if unavailable_agent_ids:
+            runtime = AdkGraphRuntime(
+                specialist_handlers=self._guarded_handlers(
+                    exclude_agent_ids=unavailable_agent_ids
+                )
+            )
+            return runtime.execute(plan)
+        was_approved_plan_id = context.approved_plan_id
         context.mark_plan_approved(plan)
         runtime = AdkGraphRuntime(specialist_handlers=self._guarded_handlers())
-        return runtime.execute(plan)
+        try:
+            return runtime.execute(plan)
+        except Exception:
+            if was_approved_plan_id is None:
+                context.roll_back_failed_plan_approval(plan)
+            raise
 
-    def _guarded_handlers(self) -> dict[str, Any]:
+    def _guarded_handlers(
+        self,
+        *,
+        exclude_agent_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        excluded = exclude_agent_ids or set()
         return {
             agent_id: self._guarded_handler(agent_id, specialist)
             for agent_id, specialist in self._specialists.items()
+            if agent_id not in excluded
         }
 
     def _guarded_handler(self, agent_id: str, specialist: SpecialistAgent) -> Any:
@@ -385,13 +468,36 @@ class _LocalSpecialistUserActionAdapter:
         )
 
 
+def _default_specialists(registry: AgentRegistry) -> dict[str, SpecialistAgent]:
+    specialists = build_default_specialists()
+    wrappers = build_default_local_remote_wrappers(specialists)
+    for agent_id, wrapper in wrappers.items():
+        descriptor = registry.get(agent_id)
+        if (
+            descriptor is not None
+            and descriptor.execution_mode == "local_a2a_compatible"
+        ):
+            specialists[agent_id] = wrapper
+    return specialists
+
+
 def _default_user_action_adapters(
     specialists: Mapping[str, SpecialistAgent],
-) -> dict[str, _LocalSpecialistUserActionAdapter]:
+) -> dict[str, Any]:
     return {
-        agent_id: _LocalSpecialistUserActionAdapter(agent_id=agent_id)
-        for agent_id in specialists
+        agent_id: _default_user_action_adapter(agent_id, specialist)
+        for agent_id, specialist in specialists.items()
     }
+
+
+def _default_user_action_adapter(
+    agent_id: str,
+    specialist: SpecialistAgent,
+) -> Any:
+    handler = getattr(specialist, "handle_user_action", None)
+    if callable(handler):
+        return specialist
+    return _LocalSpecialistUserActionAdapter(agent_id=agent_id)
 
 
 def _coerce_specialist_response(value: Any) -> SpecialistResponse | None:
@@ -417,20 +523,53 @@ def _final_artifacts_for_response(
 
 def _final_artifacts_for_graph(
     graph_execution: GraphExecutionResult | None,
+    *,
+    specialist_responses: tuple[SpecialistResponse, ...] | None = None,
 ) -> dict[str, Any]:
     if graph_execution is None:
         return {}
 
-    final_response = (
-        graph_execution.specialist_responses[-1]
-        if graph_execution.specialist_responses
-        else None
+    responses = (
+        specialist_responses
+        if specialist_responses is not None
+        else graph_execution.specialist_responses
     )
+    final_response = responses[-1] if responses else None
     return {
         "final_response": final_response,
-        "specialist_responses": graph_execution.specialist_responses,
+        "specialist_responses": responses,
         "status_events": graph_execution.status_events,
     }
+
+
+def _validated_specialist_response_a2ui(
+    response: SpecialistResponse | None,
+) -> tuple[A2APart, ...]:
+    if response is None or response.a2ui_payload is None:
+        return ()
+
+    return tuple(
+        validate_outbound_a2ui(candidate).renderer_part
+        for candidate in _iter_a2ui_payload_messages(response.a2ui_payload)
+    )
+
+
+def _redact_rejected_a2ui_payload(
+    response: SpecialistResponse,
+    a2ui_parts: tuple[A2APart, ...],
+) -> SpecialistResponse:
+    if response.a2ui_payload is None:
+        return response
+    if not any(isinstance(part, TextPart) for part in a2ui_parts):
+        return response
+
+    return response.model_copy(update={"a2ui_payload": None})
+
+
+def _iter_a2ui_payload_messages(payload: Any) -> list[Any]:
+    if isinstance(payload, Mapping):
+        return [payload]
+    return list(payload)
 
 
 __all__ = [

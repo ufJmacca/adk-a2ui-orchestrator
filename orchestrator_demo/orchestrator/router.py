@@ -127,6 +127,17 @@ class RequestRouter:
                 ),
             )
 
+        if _has_only_synthesis_workstream(llm_assessment):
+            return RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=confidence,
+                reason=(
+                    "A safe route or plan cannot be formed because the assessment "
+                    "selected synthesis without any upstream specialist workstream."
+                ),
+            )
+
         if _is_direct_route_candidate(
             llm_assessment,
             confidence,
@@ -157,12 +168,14 @@ def _is_direct_route_candidate(
     *,
     direct_route_threshold: float,
 ) -> bool:
+    unique_intents = _dedupe(assessment.intents)
+    unique_required_agents = _dedupe(assessment.required_agents)
     return (
         assessment.complexity == "simple"
-        and len(assessment.intents) == 1
-        and assessment.intents[0] != "unknown"
-        and len(assessment.required_agents) == 1
-        and SYNTHESIS_AGENT_ID not in assessment.required_agents
+        and len(unique_intents) == 1
+        and unique_intents[0] != "unknown"
+        and len(unique_required_agents) == 1
+        and SYNTHESIS_AGENT_ID not in unique_required_agents
         and confidence >= direct_route_threshold
         and not _is_sensitive(assessment)
     )
@@ -172,6 +185,12 @@ def _is_sensitive(assessment: LlmIntentAssessment) -> bool:
     return bool(
         SENSITIVE_INTENTS.intersection(assessment.intents)
         or SENSITIVE_AGENTS.intersection(assessment.required_agents)
+    )
+
+
+def _has_only_synthesis_workstream(assessment: LlmIntentAssessment) -> bool:
+    return not any(
+        agent_id != SYNTHESIS_AGENT_ID for agent_id in assessment.required_agents
     )
 
 
@@ -230,10 +249,12 @@ def _plan_required_reason(
     direct_route_threshold: float,
 ) -> str:
     reasons: list[str] = []
+    unique_intents = _dedupe(assessment.intents)
+    unique_required_agents = _dedupe(assessment.required_agents)
 
     if assessment.complexity == "complex":
         reasons.append("complex or multi-step")
-    if len(assessment.intents) > 1 or len(assessment.required_agents) > 1:
+    if len(unique_intents) > 1 or len(unique_required_agents) > 1:
         reasons.append("multi-intent or multi-agent")
     if SYNTHESIS_AGENT_ID in assessment.required_agents:
         reasons.append("requires synthesis")

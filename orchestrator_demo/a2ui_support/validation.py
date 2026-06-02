@@ -230,7 +230,9 @@ def _validation_error_summary(exc: ValidationError) -> str:
         return str(exc)
 
     first_error = errors[0]
-    location = ".".join(str(part) for part in first_error.get("loc", ()))
+    location = ".".join(
+        _safe_path_component(str(part)) for part in first_error.get("loc", ())
+    )
     message = first_error.get("msg", str(exc))
     if location:
         return f"{location}: {message}"

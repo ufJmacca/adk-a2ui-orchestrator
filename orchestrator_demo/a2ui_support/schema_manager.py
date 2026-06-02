@@ -30,6 +30,7 @@ A2UI_SERVER_TO_CLIENT_MESSAGES = {
     DELETE_SURFACE_MESSAGE,
 }
 SUPPORTED_BASIC_COMPONENT_TYPES = {
+    "Accordion",
     "AudioPlayer",
     "Button",
     "Card",
@@ -44,10 +45,14 @@ SUPPORTED_BASIC_COMPONENT_TYPES = {
     "Modal",
     "Row",
     "Slider",
+    "Status",
     "Tabs",
+    "Table",
     "Text",
     "TextField",
+    "Timeline",
     "Video",
+    "accordion",
     "audioPlayer",
     "button",
     "card",
@@ -62,10 +67,23 @@ SUPPORTED_BASIC_COMPONENT_TYPES = {
     "modal",
     "row",
     "slider",
+    "status",
     "tabs",
+    "table",
     "text",
     "textField",
+    "timeline",
     "video",
+}
+RENDERER_EXTENSION_COMPONENT_TYPES = {
+    "Accordion",
+    "Status",
+    "Table",
+    "Timeline",
+    "accordion",
+    "status",
+    "table",
+    "timeline",
 }
 ALLOWED_CONTROL_ACTIONS = {
     "approve_plan",
@@ -127,7 +145,8 @@ class BasicCatalogSchema:
             _validate_approval_canvas_payload(update_components, components, errors)
             return errors
 
-        _validate_with_a2ui_sdk(payload, errors)
+        if not _has_renderer_extension_components(components):
+            _validate_with_a2ui_sdk(payload, errors)
         _validate_generic_components(
             components,
             errors,
@@ -374,6 +393,15 @@ def _validate_generic_components(
         _validate_generic_component(component, f"{path}[{index}]", errors)
 
 
+def _has_renderer_extension_components(components: list[Any]) -> bool:
+    return any(
+        isinstance(component, Mapping)
+        and component.get("type", component.get("component"))
+        in RENDERER_EXTENSION_COMPONENT_TYPES
+        for component in components
+    )
+
+
 def _validate_generic_component(
     component: Any,
     path: str,
@@ -421,7 +449,12 @@ def _validate_generic_component_shape(
 ) -> None:
     _require_string(component, "id", errors, path=path)
 
-    if component_type == "audioplayer":
+    if component_type == "accordion":
+        _validate_optional_string(component, "title", errors, path=path)
+        children = component.get("children")
+        if children is not None:
+            _validate_child_components(children, f"{path}.children", errors)
+    elif component_type == "audioplayer":
         _require_non_empty_field(component, "url", errors, path=path)
     elif component_type == "button":
         _require_label_or_child(component, path, errors)
@@ -448,12 +481,20 @@ def _validate_generic_component_shape(
     elif component_type == "slider":
         _require_present_field(component, "value", errors, path=path)
         _require_present_field(component, "max", errors, path=path)
+    elif component_type == "status":
+        _validate_optional_string(component, "text", errors, path=path)
+        _validate_optional_string(component, "message", errors, path=path)
+        _validate_optional_string(component, "status", errors, path=path)
     elif component_type == "tabs":
         _validate_tabs(component.get("tabs"), f"{path}.tabs", errors)
+    elif component_type == "table":
+        _validate_table(component, path, errors)
     elif component_type == "text":
         _require_non_empty_field(component, "text", errors, path=path)
     elif component_type == "textfield":
         _require_non_empty_field(component, "label", errors, path=path)
+    elif component_type == "timeline":
+        _validate_timeline_items(component.get("items"), f"{path}.items", errors)
     elif component_type == "video":
         _require_non_empty_field(component, "url", errors, path=path)
 
@@ -774,6 +815,51 @@ def _validate_tabs(value: Any, path: str, errors: list[str]) -> None:
         _require_non_empty_field(tab, "child", errors, path=tab_path)
 
 
+def _validate_table(
+    component: Mapping[str, Any],
+    path: str,
+    errors: list[str],
+) -> None:
+    columns = component.get("columns")
+    if columns is not None:
+        if not isinstance(columns, list):
+            errors.append(f"{path}.columns must be a list")
+        else:
+            for index, column in enumerate(columns):
+                column_path = f"{path}.columns[{index}]"
+                if not isinstance(column, Mapping):
+                    errors.append(f"{column_path} must be an object")
+                    continue
+                _require_string(column, "key", errors, path=column_path)
+                _validate_optional_string(column, "label", errors, path=column_path)
+
+    rows = component.get("rows")
+    if rows is not None:
+        if not isinstance(rows, list):
+            errors.append(f"{path}.rows must be a list")
+        else:
+            for index, row in enumerate(rows):
+                if not isinstance(row, Mapping):
+                    errors.append(f"{path}.rows[{index}] must be an object")
+
+
+def _validate_timeline_items(value: Any, path: str, errors: list[str]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list):
+        errors.append(f"{path} must be a list")
+        return
+
+    for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
+        if not isinstance(item, Mapping):
+            errors.append(f"{item_path} must be an object")
+            continue
+        _validate_optional_string(item, "label", errors, path=item_path)
+        _validate_optional_string(item, "title", errors, path=item_path)
+        _validate_optional_string(item, "detail", errors, path=item_path)
+
+
 def _validate_workflow_canvas_component(
     component: Mapping[str, Any],
     path: str,
@@ -961,6 +1047,18 @@ def _require_string(
         return
     if expected_value is not None and value != expected_value:
         errors.append(f"{field_path} must be {expected_value!r}")
+
+
+def _validate_optional_string(
+    payload: Mapping[str, Any],
+    field_name: str,
+    errors: list[str],
+    *,
+    path: str,
+) -> None:
+    value = payload.get(field_name)
+    if value is not None and not isinstance(value, str):
+        errors.append(f"{path}.{field_name} must be a string")
 
 
 def _require_non_empty_field(

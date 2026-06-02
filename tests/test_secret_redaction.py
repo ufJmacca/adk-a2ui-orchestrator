@@ -133,3 +133,68 @@ def test_a2ui_payload_and_transport_envelope_secret_diagnostics_are_redacted() -
         "A2UI rendering unavailable. The generated UI payload failed "
         "validation and was not emitted to the renderer."
     )
+
+
+def test_graph_specialist_failure_omits_secret_bearing_exception_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.contracts import ExecutionPlan, PlanStep
+    from orchestrator_demo.orchestrator.graph_runtime import (
+        AdkGraphRuntime,
+        GraphRuntimeError,
+    )
+
+    plan = ExecutionPlan(
+        plan_id="plan_secret_failure",
+        objective="Run a step that raises provider headers.",
+        detected_intents=["credit_risk"],
+        selected_agents=["credit_risk"],
+        steps=[
+            PlanStep(
+                step_id="step_credit_risk",
+                agent_id="credit_risk",
+                instruction="Assess credit risk.",
+                expected_output="Credit risk themes.",
+            )
+        ],
+        approval_surface_id="surface_plan_secret_failure",
+    )
+
+    def failing_handler(_request: object) -> None:
+        raise RuntimeError(f"Authorization: Bearer {OPENROUTER_SECRET}")
+
+    runtime = AdkGraphRuntime(specialist_handlers={"credit_risk": failing_handler})
+
+    # Act
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(GraphRuntimeError) as exc_info:
+            runtime.execute(plan)
+
+    failure = exc_info.value
+    rendered_failure = repr(
+        {
+            "message": str(failure),
+            "cause": str(failure.__cause__) if failure.__cause__ else None,
+            "cause_context": (
+                repr(failure.__cause__.__context__)
+                if failure.__cause__ and failure.__cause__.__context__
+                else None
+            ),
+            "events": [
+                event.model_dump(mode="json") for event in failure.status_events
+            ],
+        }
+    )
+
+    # Assert
+    assert failure.__cause__ is not None
+    assert OPENROUTER_SECRET not in rendered_failure
+    assert OPENROUTER_SECRET not in caplog.text
+    assert "Authorization" not in rendered_failure
+    assert "Authorization" not in caplog.text
+    assert "Bearer" not in rendered_failure
+    assert "Bearer" not in caplog.text
+    assert failure.status_events[-1].message == (
+        "Approved plan step step_credit_risk failed during execution: RuntimeError."
+    )

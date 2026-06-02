@@ -160,6 +160,15 @@ class RequestContext:
         self._approved_plan_step_agents[plan.plan_id] = approved_step_agents
         self._approved_plan_step_payloads[plan.plan_id] = approved_step_payloads
 
+    def roll_back_failed_plan_approval(self, plan: ExecutionPlan) -> None:
+        """Clear the transient approval guard state after graph execution fails."""
+
+        if self.approved_plan_id != plan.plan_id:
+            return
+        self.approved_plan_id = None
+        self._approved_plan_step_agents.pop(plan.plan_id, None)
+        self._approved_plan_step_payloads.pop(plan.plan_id, None)
+
     def _require_plan_matches_current_draft(
         self,
         plan: ExecutionPlan,

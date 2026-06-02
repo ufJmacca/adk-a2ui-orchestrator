@@ -620,47 +620,49 @@ def _step_function(
                 response = await response
             output = response.model_dump(mode="json")
         except Exception as exc:
-            events.append(
-                _step_failed_event(
-                    plan=plan,
-                    step=step,
-                    graph=graph,
-                    graph_step_id=graph_step_id,
-                    exc=exc,
-                )
-            )
-            raise GraphRuntimeError(
-                _handler_failure_message(plan=plan, step=step, exc=exc),
-                graph=graph,
-                status_events=events,
-                specialist_requests=requests,
-                specialist_responses=responses,
-            ) from exc
-
-        responses.append(response)
-        step_outputs[step.step_id] = output
-        events.append(
-            _status_event(
-                graph,
-                f"{graph_step_id}_completed",
-                "step_completed",
-                f"Step {step.step_id} completed.",
-                step_id=graph_step_id,
-                details={"agentId": step.agent_id},
-            )
-        )
-        if step.parallel_group is not None:
+            error_type = type(exc).__name__
+        else:
+            responses.append(response)
+            step_outputs[step.step_id] = output
             events.append(
                 _status_event(
                     graph,
-                    f"{graph_step_id}_parallel_completed",
-                    "parallel_branch_completed",
-                    f"Parallel branch {step.parallel_group} completed.",
+                    f"{graph_step_id}_completed",
+                    "step_completed",
+                    f"Step {step.step_id} completed.",
                     step_id=graph_step_id,
-                    details={"parallelGroup": step.parallel_group},
+                    details={"agentId": step.agent_id},
                 )
             )
-        return output
+            if step.parallel_group is not None:
+                events.append(
+                    _status_event(
+                        graph,
+                        f"{graph_step_id}_parallel_completed",
+                        "parallel_branch_completed",
+                        f"Parallel branch {step.parallel_group} completed.",
+                        step_id=graph_step_id,
+                        details={"parallelGroup": step.parallel_group},
+                    )
+                )
+            return output
+
+        events.append(
+            _step_failed_event(
+                plan=plan,
+                step=step,
+                graph=graph,
+                graph_step_id=graph_step_id,
+                error_type=error_type,
+            )
+        )
+        raise GraphRuntimeError(
+            _handler_failure_message(plan=plan, step=step, error_type=error_type),
+            graph=graph,
+            status_events=events,
+            specialist_requests=requests,
+            specialist_responses=responses,
+        )
 
     return run_step
 
@@ -774,7 +776,7 @@ def _step_failed_event(
     step: PlanStep,
     graph: GraphSpec,
     graph_step_id: str,
-    exc: Exception,
+    error_type: str,
 ) -> StatusEvent:
     return _status_event(
         graph,
@@ -782,16 +784,16 @@ def _step_failed_event(
         "step_failed",
         (
             f"Approved plan step {step.step_id} failed during execution: "
-            f"{type(exc).__name__}: {exc}."
+            f"{error_type}."
         ),
         step_id=graph_step_id,
         details={
             "agentId": step.agent_id,
             "planStepId": step.step_id,
-            "errorType": type(exc).__name__,
+            "errorType": error_type,
             "developerMessage": (
-                f"Specialist handler for agent {step.agent_id} raised "
-                f"{type(exc).__name__} while executing approved plan "
+                f"Specialist handler for agent {step.agent_id} raised {error_type} "
+                f"while executing approved plan "
                 f"{plan.plan_id} step {step.step_id}."
             ),
         },
@@ -802,12 +804,12 @@ def _handler_failure_message(
     *,
     plan: ExecutionPlan,
     step: PlanStep,
-    exc: Exception,
+    error_type: str,
 ) -> str:
     return (
         f"specialist handler for approved plan {plan.plan_id} step "
         f"{step.step_id} agent {step.agent_id} failed: "
-        f"{type(exc).__name__}: {exc}"
+        f"{error_type}"
     )
 
 

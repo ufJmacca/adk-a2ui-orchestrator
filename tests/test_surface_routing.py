@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE, DataPart
+from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE, DataPart, TextPart
 from orchestrator_demo.a2ui_support.schema_manager import (
     A2UI_VERSION,
     BASIC_CATALOG_ID,
@@ -328,6 +328,64 @@ def test_validated_specialist_a2ui_is_preserved_unchanged_and_registered() -> No
     assert owner is not None
     assert owner.owner_type == "specialist"
     assert owner.owner_id == "product_opportunity"
+
+
+def test_invalid_specialist_a2ui_returns_text_fallback_without_registering() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    payload = {
+        "version": A2UI_VERSION,
+        "updateComponents": {
+            "surfaceId": "surface_product_recommendation",
+            "components": [],
+        },
+    }
+
+    # Act
+    parts = prepare_specialist_a2ui_for_renderer(
+        payload,
+        owner_agent_id="product_opportunity",
+        surface_registry=registry,
+    )
+
+    # Assert
+    assert len(parts) == 1
+    assert isinstance(parts[0], TextPart)
+    assert parts[0].metadata["developerDiagnostic"]["fallback"] == "text"
+    assert registry.owner_for("surface_product_recommendation") is None
+
+
+def test_specialist_delete_surface_rejects_surfaces_owned_by_orchestrator() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import (
+        SurfaceOwnershipError,
+        SurfaceRouteRegistry,
+    )
+
+    registry = SurfaceRouteRegistry()
+    approval_owner = registry.register_approval_surface(
+        "surface_plan_meeting_prep",
+        plan_id="plan_meeting_prep",
+    )
+    payload = _delete_surface_a2ui("surface_plan_meeting_prep")
+
+    # Act / Assert
+    with pytest.raises(SurfaceOwnershipError, match="owned by orchestrator"):
+        prepare_specialist_a2ui_for_renderer(
+            payload,
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+
+    assert registry.owner_for("surface_plan_meeting_prep") == approval_owner
 
 
 def test_failed_specialist_renderer_preparation_leaves_registry_unchanged() -> None:
@@ -803,6 +861,46 @@ async def test_forwarded_specialist_delete_surface_clears_ownership() -> None:
     assert late_result.status == "error"
     assert late_result.error is not None
     assert late_result.error["code"] == "unknown_surface"
+    assert adapter.received_user_actions == [user_action]
+
+
+@pytest.mark.asyncio
+async def test_forwarded_specialist_delete_surface_rejects_other_owner() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    specialist_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    approval_owner = registry.register_approval_surface(
+        "surface_plan_meeting_prep",
+        plan_id="plan_meeting_prep",
+    )
+    adapter = SurfaceDeletingSpecialistAdapter("surface_plan_meeting_prep")
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"buttonId": "close"},
+        }
+    }
+
+    # Act
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": adapter},
+    )
+
+    # Assert
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error["code"] == "surface_registration_rejected"
+    assert result.error["ownerInferenceAttempted"] is False
+    assert "owned by orchestrator:orchestrator" in result.error["message"]
+    assert registry.owner_for("surface_product_recommendation") == specialist_owner
+    assert registry.owner_for("surface_plan_meeting_prep") == approval_owner
     assert adapter.received_user_actions == [user_action]
 
 

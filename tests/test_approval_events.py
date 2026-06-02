@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from orchestrator_demo.a2a_support.transport import DataPart
@@ -1261,6 +1263,81 @@ def test_failed_graph_execution_keeps_plan_recoverable() -> None:
     )
 
 
+def test_concurrent_approve_plan_submissions_execute_graph_once() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanAlreadyFinalError,
+    )
+    from orchestrator_demo.orchestrator.graph_runtime import (
+        GraphExecutionResult,
+        build_graph_spec,
+    )
+
+    class BlockingGraphRuntime:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def execute(self, plan: ExecutionPlan) -> GraphExecutionResult:
+            self.calls += 1
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return GraphExecutionResult(
+                graph=build_graph_spec(plan),
+                workflow=object(),
+                status_events=(),
+                specialist_requests=(),
+                specialist_responses=(),
+                adk_event_outputs=(),
+            )
+
+    graph_runtime = BlockingGraphRuntime()
+    store = ApprovalStateStore(
+        agent_descriptors=_agent_descriptors(),
+        graph_runtime=graph_runtime,
+    )
+    store.add_draft(_meeting_plan())
+    approve_event = _action(
+        "approve_plan",
+        {
+            "approvedStepIds": [
+                "step_relationship_summary",
+                "step_internal_knowledge",
+                "step_industry_research",
+                "step_synthesis",
+            ]
+        },
+    )
+    first_result = []
+    first_errors = []
+
+    def approve_first() -> None:
+        try:
+            first_result.append(store.apply_user_action(approve_event))
+        except Exception as exc:  # pragma: no cover - asserted by thread join result
+            first_errors.append(exc)
+
+    approval_thread = threading.Thread(target=approve_first)
+
+    # Act / Assert
+    approval_thread.start()
+    assert graph_runtime.started.wait(timeout=5)
+    try:
+        with pytest.raises(PlanAlreadyFinalError, match="already approving"):
+            store.apply_user_action(approve_event)
+    finally:
+        graph_runtime.release.set()
+        approval_thread.join(timeout=5)
+
+    assert not approval_thread.is_alive()
+    assert first_errors == []
+    assert graph_runtime.calls == 1
+    assert first_result[0].status == "approved"
+    assert store.get("plan_meeting_prep").status == "approved"
+
+
 def test_draft_update_commits_only_after_refreshed_canvas_validation() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.approval_canvas import A2UIEmissionError
@@ -1472,7 +1549,6 @@ def test_approval_freezes_referenced_plan_version_and_rejects_future_mutation() 
 def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
     # Arrange
     from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
-    from orchestrator_demo.orchestrator.graph_runtime import GraphRuntimeError
 
     plan = ExecutionPlan(
         plan_id="plan_typo_agent",
@@ -1492,28 +1568,32 @@ def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
     store = ApprovalStateStore(agent_descriptors=_agent_descriptors())
     store.add_draft(plan)
 
-    # Act / Assert
-    with pytest.raises(
-        GraphRuntimeError,
-        match=(
-            "no specialist handler registered for approved plan step "
-            "step_typo_agent agent relationship_summarry"
-        ),
-    ):
-        store.apply_user_action(
-            {
-                "userAction": {
-                    "type": "approve_plan",
-                    "surfaceId": "surface_plan_typo_agent",
-                    "payload": {
-                        "planId": "plan_typo_agent",
-                        "editedPlanVersion": 1,
-                        "approvedStepIds": ["step_typo_agent"],
-                    },
-                }
+    # Act
+    result = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "approve_plan",
+                "surfaceId": "surface_plan_typo_agent",
+                "payload": {
+                    "planId": "plan_typo_agent",
+                    "editedPlanVersion": 1,
+                    "approvedStepIds": ["step_typo_agent"],
+                },
             }
-        )
+        }
+    )
 
+    # Assert
+    assert result.status == "failed"
+    assert result.failure_reason == (
+        "no specialist handler registered for approved plan step "
+        "step_typo_agent agent relationship_summarry"
+    )
+    assert [event.status for event in result.graph_status_events] == [
+        "plan_approved",
+        "graph_created",
+        "step_failed",
+    ]
     record_after_failed_execution = store.get("plan_typo_agent")
     assert record_after_failed_execution.status == "draft"
     assert record_after_failed_execution.approved_plan is None
