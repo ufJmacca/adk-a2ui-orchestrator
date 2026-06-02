@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from orchestrator_demo.contracts import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+AUDIT_LOGGER_NAME = "orchestrator_demo.audit"
 
 
 def _specialist_a2ui(surface_id: str) -> list[dict[str, Any]]:
@@ -141,6 +143,15 @@ class RecordingSpecialistAdapter:
     async def handle_user_action(self, user_action: Any) -> dict[str, str]:
         self.received_user_actions.append(user_action)
         return {"status": "handled", "agent_id": "product_opportunity"}
+
+
+class FailingSpecialistAdapter:
+    def __init__(self) -> None:
+        self.received_user_actions: list[Any] = []
+
+    async def handle_user_action(self, user_action: Any) -> None:
+        self.received_user_actions.append(user_action)
+        raise RuntimeError("specialist handler unavailable")
 
 
 class SurfaceReturningSpecialistAdapter:
@@ -554,6 +565,53 @@ async def test_specialist_owned_user_action_is_forwarded_with_original_payload()
     assert adapter.received_user_actions == [user_action]
     assert adapter.received_user_actions[0] is user_action
     assert user_action == original_user_action
+
+
+@pytest.mark.asyncio
+async def test_failed_specialist_user_action_handler_is_audit_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    adapter = FailingSpecialistAdapter()
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"buttonId": "show_more_detail"},
+        }
+    }
+
+    # Act
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        with pytest.raises(RuntimeError, match="specialist handler unavailable"):
+            await registry.route_user_action(
+                user_action,
+                specialist_adapters={"product_opportunity": adapter},
+            )
+
+    # Assert
+    audit_payloads = [
+        getattr(record, "event_payload")
+        for record in caplog.records
+        if getattr(record, "audit_event", None) == "ui_event_routed"
+    ]
+    assert audit_payloads[-1] == {
+        "status": "error",
+        "surface_id": "surface_product_recommendation",
+        "owner_type": "specialist",
+        "owner_id": "product_opportunity",
+        "plan_id": None,
+        "error_code": "owner_handler_failed",
+        "owner_inference_attempted": False,
+    }
+    assert adapter.received_user_actions == [user_action]
 
 
 @pytest.mark.asyncio

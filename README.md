@@ -12,6 +12,7 @@ lockfile updates, virtual environment synchronization, and command execution.
 uv sync --locked
 uv run pytest
 uv run ruff check .
+uv run mypy orchestrator_demo
 ```
 
 Runtime secrets must be provided through environment variables or a local
