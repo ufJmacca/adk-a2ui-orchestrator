@@ -147,6 +147,23 @@ def _validate_dependency_topology(
             f"{contract_name} {id_field_name} values must be unique: {duplicates}"
         )
 
+    duplicate_dependencies_by_id = {
+        node_id: duplicate_dependencies
+        for node_id, dependency_ids in dependencies_by_id.items()
+        if (duplicate_dependencies := _duplicate_values(dependency_ids))
+    }
+    if duplicate_dependencies_by_id:
+        duplicates = "; ".join(
+            f"{node_id}: {', '.join(duplicate_dependencies)}"
+            for node_id, duplicate_dependencies in sorted(
+                duplicate_dependencies_by_id.items()
+            )
+        )
+        raise ValueError(
+            f"{contract_name} {reference_source_label} entries must be unique "
+            f"per {id_field_name}: {duplicates}"
+        )
+
     declared_id_set = set(declared_ids)
     undeclared_ids = {
         node_id
@@ -331,10 +348,20 @@ class GraphSpec(ContractModel):
         dependencies_by_step_id = {
             step.graph_step_id: list(step.depends_on) for step in self.steps
         }
+        duplicate_edges = _duplicate_values(
+            [
+                f"{edge.from_step_id}->{edge.to_step_id}"
+                for edge in self.edges
+            ]
+        )
+        if duplicate_edges:
+            duplicates = ", ".join(duplicate_edges)
+            raise ValueError(f"GraphSpec edges must be unique: {duplicates}")
+
         for edge in self.edges:
-            dependencies_by_step_id.setdefault(edge.to_step_id, []).append(
-                edge.from_step_id
-            )
+            dependencies = dependencies_by_step_id.setdefault(edge.to_step_id, [])
+            if edge.from_step_id not in dependencies:
+                dependencies.append(edge.from_step_id)
 
         _validate_dependency_topology(
             contract_name="GraphSpec",

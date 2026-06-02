@@ -132,7 +132,7 @@ class AgentRegistry:
 
     def descriptors(self) -> list[AgentDescriptor]:
         return [
-            _copy_descriptor(descriptor)
+            descriptor.model_copy(deep=True)
             for descriptor in self._descriptors_by_id.values()
         ]
 
@@ -140,7 +140,7 @@ class AgentRegistry:
         descriptor = self._descriptors_by_id.get(agent_id)
         if descriptor is None:
             return None
-        return _copy_descriptor(descriptor)
+        return descriptor.model_copy(deep=True)
 
     def is_available_for_new_plan(self, agent_id: str) -> bool:
         return agent_id in self._descriptors_by_id

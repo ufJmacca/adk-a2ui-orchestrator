@@ -91,6 +91,56 @@ def _meeting_plan() -> ExecutionPlan:
     )
 
 
+def _dependent_chain_plan() -> ExecutionPlan:
+    return ExecutionPlan(
+        plan_id="plan_meeting_prep",
+        objective="Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        detected_intents=[
+            "meeting_prep",
+            "relationship_summary",
+            "internal_knowledge",
+            "credit_risk",
+        ],
+        selected_agents=[
+            "relationship_summary",
+            "internal_knowledge",
+            "credit_risk",
+        ],
+        steps=[
+            PlanStep(
+                step_id="step_relationship_summary",
+                agent_id="relationship_summary",
+                instruction="Summarize the relationship history.",
+                expected_output="Relationship history and open follow-ups.",
+                data_source_categories=["relationship_history"],
+            ),
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                depends_on=["step_relationship_summary"],
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_credit_risk",
+                agent_id="credit_risk",
+                instruction="Assess credit risk signals.",
+                depends_on=["step_internal_knowledge"],
+                expected_output="Credit risk considerations.",
+                data_source_categories=["credit_risk"],
+            ),
+        ],
+        data_source_categories=[
+            "relationship_history",
+            "internal_crm",
+            "credit_risk",
+        ],
+        risk_notes=["Synthetic demo data only."],
+        approval_surface_id="surface_plan_meeting_prep",
+    )
+
+
 def _action(action_type: str, payload: dict[str, object]) -> dict[str, object]:
     return {
         "userAction": {
@@ -512,12 +562,134 @@ def test_remove_reorder_replace_and_add_instruction_mutations_refresh_draft() ->
         "step_relationship_summary",
     }
     assert record.draft_plan.steps[1].agent_id == "credit_risk"
+    assert record.draft_plan.steps[1].expected_output == (
+        "Credit risk themes, missing data, and caveats."
+    )
+    assert record.draft_plan.steps[1].data_source_categories == ["credit_risk"]
+    assert "Flag credit risk themes" in record.draft_plan.steps[1].instruction
     assert "credit_risk" in record.draft_plan.selected_agents
     assert "industry_research" not in record.draft_plan.selected_agents
+    assert "credit_risk" in record.draft_plan.data_source_categories
+    assert "relationship_history" not in record.draft_plan.data_source_categories
     assert (
         "Additional instruction: Emphasize open follow-up items."
         in record.draft_plan.steps[0].instruction
     )
+
+
+def test_replace_agent_refreshes_metadata_before_approving_edited_plan() -> None:
+    # Arrange
+    store, _original_plan = _store_with_meeting_plan()
+
+    # Act
+    replaced = store.apply_user_action(
+        _action(
+            "replace_agent",
+            {
+                "stepId": "step_industry_research",
+                "replacementAgentId": "credit_risk",
+            },
+        )
+    )
+    draft_record = store.get("plan_meeting_prep")
+    approval_result = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "approve_plan",
+                "surfaceId": "surface_plan_meeting_prep",
+                "payload": {
+                    "planId": "plan_meeting_prep",
+                    "editedPlanVersion": 2,
+                    "approvedStepIds": [
+                        "step_relationship_summary",
+                        "step_internal_knowledge",
+                        "step_industry_research",
+                        "step_synthesis",
+                    ],
+                },
+            }
+        }
+    )
+
+    # Assert
+    assert replaced.status == "draft_updated"
+    replacement_step = next(
+        step
+        for step in draft_record.draft_plan.steps
+        if step.step_id == "step_industry_research"
+    )
+    assert replacement_step.agent_id == "credit_risk"
+    assert replacement_step.instruction == (
+        "Flag credit risk themes, missing credit context, covenant concerns, "
+        "and repayment indicators for: Prepare me for tomorrow's meeting with "
+        "ABC Manufacturing."
+    )
+    assert replacement_step.expected_output == (
+        "Credit risk themes, missing data, and caveats."
+    )
+    assert replacement_step.data_source_categories == ["credit_risk"]
+    assert draft_record.draft_plan.selected_agents == [
+        "relationship_summary",
+        "internal_knowledge",
+        "credit_risk",
+        "synthesis",
+    ]
+    assert draft_record.draft_plan.data_source_categories == [
+        "relationship_history",
+        "internal_crm",
+        "credit_risk",
+    ]
+
+    assert approval_result.status == "approved"
+    assert approval_result.approved_plan is not None
+    approved_step = next(
+        step
+        for step in approval_result.approved_plan.steps
+        if step.step_id == "step_industry_research"
+    )
+    assert approved_step == replacement_step
+    assert approval_result.graph_execution is not None
+    replacement_request = next(
+        request
+        for request in approval_result.graph_execution.specialist_requests
+        if request.step_id == "step_industry_research"
+    )
+    assert replacement_request.agent_id == "credit_risk"
+    assert replacement_request.user_input == replacement_step.instruction
+    assert (
+        replacement_request.context["expectedOutput"]
+        == replacement_step.expected_output
+    )
+    assert replacement_request.context["dataSourceCategories"] == ["credit_risk"]
+
+
+def test_remove_step_rewires_dependents_to_removed_step_dependencies() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+
+    store = ApprovalStateStore(agent_descriptors=_agent_descriptors())
+    store.add_draft(_dependent_chain_plan())
+
+    # Act
+    result = store.apply_user_action(
+        _action("remove_step", {"stepId": "step_internal_knowledge"})
+    )
+    record = store.get("plan_meeting_prep")
+
+    # Assert
+    assert result.status == "draft_updated"
+    assert record.draft_plan.plan_version == 2
+    assert [step.step_id for step in record.draft_plan.steps] == [
+        "step_relationship_summary",
+        "step_credit_risk",
+    ]
+    credit_risk_step = record.draft_plan.steps[-1]
+    assert credit_risk_step.depends_on == ["step_relationship_summary"]
+    assert record.draft_plan.selected_agents == [
+        "relationship_summary",
+        "credit_risk",
+    ]
+    assert "internal_crm" not in record.draft_plan.data_source_categories
 
 
 def test_remove_step_reconnects_dependents_to_removed_step_dependencies() -> None:
@@ -1219,6 +1391,139 @@ def test_replace_agent_rejects_conditional_data_quality_step_before_approval() -
 
 
 @pytest.mark.parametrize(
+    ("action_type", "replacement_payload"),
+    [
+        (
+            "replace_agent",
+            {
+                "replacementAgentId": (
+                    "OPENROUTER_API_KEY="
+                    "sk-or-v1-replacement-agent-secret-should-not-appear"
+                )
+            },
+        ),
+        (
+            "choose_agent",
+            {
+                "agentId": (
+                    "OPENROUTER_API_KEY="
+                    "sk-or-v1-replacement-agent-secret-should-not-appear"
+                )
+            },
+        ),
+    ],
+)
+def test_unregistered_replacement_agent_error_omits_secret_like_input(
+    action_type: str,
+    replacement_payload: dict[str, object],
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanMutationError
+
+    store, _original_plan = _store_with_meeting_plan()
+    leaked_replacement_agent_id = str(next(iter(replacement_payload.values())))
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError) as exc_info:
+        store.apply_user_action(
+            _action(
+                action_type,
+                {
+                    "stepId": "step_industry_research",
+                    **replacement_payload,
+                },
+            )
+        )
+
+    message = str(exc_info.value)
+    assert "replacement agent is unavailable" in message
+    assert leaked_replacement_agent_id not in message
+    assert "OPENROUTER_API_KEY" not in message
+    assert "sk-or-v1-replacement-agent-secret-should-not-appear" not in message
+
+
+@pytest.mark.parametrize(
+    ("action_type", "payload"),
+    [
+        ("remove_step", {}),
+        ("add_instruction", {"instruction": "Focus on recent deposit trends."}),
+        ("replace_agent", {"replacementAgentId": "credit_risk"}),
+    ],
+)
+def test_unknown_step_mutation_error_omits_secret_like_step_id(
+    action_type: str,
+    payload: dict[str, object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanMutationError
+
+    store, _original_plan = _store_with_meeting_plan()
+    leaked_step_id = (
+        "OPENROUTER_API_KEY=sk-or-v1-step-id-secret-should-not-appear"
+    )
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError) as exc_info:
+        store.apply_user_action(
+            _action(
+                action_type,
+                {
+                    "stepId": leaked_step_id,
+                    **payload,
+                },
+            )
+        )
+
+    message = str(exc_info.value)
+    assert message == "unknown stepId"
+    assert leaked_step_id not in message
+    assert "OPENROUTER_API_KEY" not in message
+    assert "sk-or-v1-step-id-secret-should-not-appear" not in message
+    assert leaked_step_id not in caplog.text
+    assert "OPENROUTER_API_KEY" not in caplog.text
+    assert "sk-or-v1-step-id-secret-should-not-appear" not in caplog.text
+
+
+def test_missing_plan_error_omits_secret_like_plan_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanNotFoundError
+
+    store, _original_plan = _store_with_meeting_plan()
+    leaked_plan_id = "plan_sk-or-v1-missing-plan-secret-should-not-appear"
+
+    # Act / Assert
+    with pytest.raises(PlanNotFoundError) as exc_info:
+        store.apply_user_action(
+            {
+                "userAction": {
+                    "type": "approve_plan",
+                    "surfaceId": "surface_plan_meeting_prep",
+                    "payload": {
+                        "planId": leaked_plan_id,
+                        "editedPlanVersion": 1,
+                        "approvedStepIds": [
+                            "step_relationship_summary",
+                            "step_internal_knowledge",
+                            "step_industry_research",
+                            "step_synthesis",
+                        ],
+                    },
+                }
+            }
+        )
+
+    message = str(exc_info.value)
+    assert message == "unknown plan"
+    assert leaked_plan_id not in message
+    assert "sk-or-v1-missing-plan-secret-should-not-appear" not in message
+    assert leaked_plan_id not in caplog.text
+    assert "sk-or-v1-missing-plan-secret-should-not-appear" not in caplog.text
+
+
+@pytest.mark.parametrize(
     ("payload", "message"),
     [
         ({}, "requires approvedStepIds"),
@@ -1271,6 +1576,69 @@ def test_approve_plan_rejects_malformed_approved_step_ids_before_freezing(
     assert record_after_failed_approval.status == "draft"
     assert record_after_failed_approval.approved_plan is None
     assert record_after_failed_approval.draft_plan == draft_snapshot
+
+
+def test_failed_graph_execution_keeps_plan_recoverable() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+    )
+
+    class FailingGraphRuntime:
+        def __init__(self) -> None:
+            self.specialist_calls: list[tuple[str, str]] = []
+
+        def execute(self, plan: ExecutionPlan) -> object:
+            self.specialist_calls.append((plan.plan_id, plan.steps[0].step_id))
+            raise RuntimeError(f"graph failed for {plan.plan_id}")
+
+    graph_runtime = FailingGraphRuntime()
+    store = ApprovalStateStore(
+        agent_descriptors=_agent_descriptors(),
+        graph_runtime=graph_runtime,
+    )
+    store.add_draft(_meeting_plan())
+    approve_event = _action(
+        "approve_plan",
+        {
+            "approvedStepIds": [
+                "step_relationship_summary",
+                "step_internal_knowledge",
+                "step_industry_research",
+                "step_synthesis",
+            ]
+        },
+    )
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="graph failed for plan_meeting_prep"):
+        store.apply_user_action(approve_event)
+
+    record_after_failed_execution = store.get("plan_meeting_prep")
+    assert graph_runtime.specialist_calls == [
+        ("plan_meeting_prep", "step_relationship_summary")
+    ]
+    assert record_after_failed_execution.status == "draft"
+    assert record_after_failed_execution.approved_plan is None
+    assert record_after_failed_execution.approved_version is None
+
+    recovery_result = store.apply_user_action(
+        _action(
+            "add_instruction",
+            {
+                "stepId": "step_internal_knowledge",
+                "instruction": "Retry after graph recovery.",
+            },
+        )
+    )
+    recovered_record = store.get("plan_meeting_prep")
+    assert recovery_result.status == "draft_updated"
+    assert recovery_result.plan_version == 2
+    assert recovered_record.status == "draft"
+    assert recovered_record.approved_plan is None
+    assert recovered_record.draft_plan.steps[1].instruction.endswith(
+        "Additional instruction: Retry after graph recovery."
+    )
 
 
 def test_draft_update_commits_only_after_refreshed_canvas_validation() -> None:
@@ -1394,8 +1762,60 @@ def test_approval_freezes_referenced_plan_version_and_rejects_future_mutation() 
     # Assert
     assert edit_result.status == "draft_updated"
     assert approval_result.status == "approved"
-    assert approval_result.graph_created is False
-    assert approval_result.specialists_called is False
+    assert approval_result.graph_created is True
+    assert approval_result.specialists_called is True
+    assert approval_result.graph_execution is not None
+    assert approval_result.graph_execution.graph.plan_id == "plan_meeting_prep"
+    assert approval_result.graph_execution.graph.pattern == "fan_out_fan_in"
+    assert approval_result.graph_execution.workflow.__class__.__module__.startswith(
+        "google.adk.workflow"
+    )
+    assert [
+        request.step_id for request in approval_result.graph_execution.specialist_requests
+    ] == [
+        "step_relationship_summary",
+        "step_internal_knowledge",
+        "step_industry_research",
+        "step_synthesis",
+    ]
+    responses_by_agent = {
+        response.agent_id: response
+        for response in approval_result.graph_execution.specialist_responses
+    }
+    assert set(responses_by_agent) == {
+        "relationship_summary",
+        "internal_knowledge",
+        "industry_research",
+        "synthesis",
+    }
+    assert responses_by_agent["relationship_summary"].structured_output[
+        "provenance"
+    ]["generated_by"] == "relationship_summary"
+    assert responses_by_agent["internal_knowledge"].structured_output[
+        "provenance"
+    ]["generated_by"] == "internal_knowledge"
+    assert all(
+        "synthetic" not in response.structured_output
+        for response in responses_by_agent.values()
+    )
+    assert all(
+        "completed approved step" not in response.content
+        for response in responses_by_agent.values()
+    )
+    status_events = approval_result.graph_execution.status_events
+    assert [event.status for event in status_events[:2]] == [
+        "plan_approved",
+        "graph_created",
+    ]
+    assert status_events[0].details == {"planVersion": 2}
+    assert {event.status for event in status_events} >= {
+        "plan_approved",
+        "graph_created",
+        "step_started",
+        "step_completed",
+        "synthesis_started",
+        "final_response_ready",
+    }
     assert record.status == "approved"
     assert record.approved_version == 2
     assert record.approved_plan is not None
@@ -1427,6 +1847,108 @@ def test_approval_freezes_referenced_plan_version_and_rejects_future_mutation() 
                 }
             }
         )
+
+
+def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+    from orchestrator_demo.orchestrator.graph_runtime import GraphRuntimeError
+
+    plan = ExecutionPlan(
+        plan_id="plan_typo_agent",
+        objective="Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        detected_intents=["meeting_prep"],
+        selected_agents=["relationship_summarry"],
+        steps=[
+            PlanStep(
+                step_id="step_typo_agent",
+                agent_id="relationship_summarry",
+                instruction="Summarize the relationship history.",
+                expected_output="Relationship history and open follow-ups.",
+            ),
+        ],
+        approval_surface_id="surface_plan_typo_agent",
+    )
+    store = ApprovalStateStore(agent_descriptors=_agent_descriptors())
+    store.add_draft(plan)
+
+    # Act / Assert
+    with pytest.raises(
+        GraphRuntimeError,
+        match=(
+            "no specialist handler registered for approved plan step "
+            "step_typo_agent agent relationship_summarry"
+        ),
+    ):
+        store.apply_user_action(
+            {
+                "userAction": {
+                    "type": "approve_plan",
+                    "surfaceId": "surface_plan_typo_agent",
+                    "payload": {
+                        "planId": "plan_typo_agent",
+                        "editedPlanVersion": 1,
+                        "approvedStepIds": ["step_typo_agent"],
+                    },
+                }
+            }
+        )
+
+    record_after_failed_execution = store.get("plan_typo_agent")
+    assert record_after_failed_execution.status == "draft"
+    assert record_after_failed_execution.approved_plan is None
+    assert record_after_failed_execution.approved_version is None
+
+
+def test_graph_runtime_awaits_async_specialist_handlers() -> None:
+    # Arrange
+    from orchestrator_demo.contracts import SpecialistResponse
+    from orchestrator_demo.orchestrator.graph_runtime import AdkGraphRuntime
+
+    handler_requests = []
+
+    async def async_relationship_handler(request):
+        handler_requests.append(request)
+        return SpecialistResponse(
+            response_id=f"response_{request.request_id.removeprefix('request_')}",
+            agent_id=request.agent_id,
+            content="async relationship summary completed",
+            structured_output={"handler": "async", "step_id": request.step_id},
+        )
+
+    runtime = AdkGraphRuntime(
+        specialist_handlers={"relationship_summary": async_relationship_handler}
+    )
+    relationship_step = _meeting_plan().steps[0].model_copy(
+        update={"parallel_group": None}
+    )
+    plan = ExecutionPlan(
+        plan_id="plan_relationship_summary",
+        objective="Summarize relationship history.",
+        detected_intents=["relationship_summary"],
+        selected_agents=["relationship_summary"],
+        steps=[relationship_step],
+        data_source_categories=["relationship_history"],
+        risk_notes=["Synthetic demo data only."],
+        approval_surface_id="surface_plan_relationship_summary",
+    )
+
+    # Act
+    result = runtime.execute(plan)
+
+    # Assert
+    assert len(handler_requests) == 1
+    assert handler_requests[0].agent_id == "relationship_summary"
+    relationship_response = next(
+        response
+        for response in result.specialist_responses
+        if response.agent_id == "relationship_summary"
+    )
+    assert relationship_response.content == "async relationship summary completed"
+    assert relationship_response.structured_output == {
+        "handler": "async",
+        "step_id": "step_relationship_summary",
+    }
 
 
 def test_approval_record_accessors_return_defensive_snapshots() -> None:
@@ -1698,3 +2220,41 @@ def test_plan_action_requires_matching_approval_surface_before_state_change() ->
     assert record.status == "draft"
     assert record.approved_plan is None
     assert record.draft_plan.plan_version == 1
+
+
+def test_surface_mismatch_error_omits_secret_like_surface_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanSurfaceMismatchError
+
+    store, _original_plan = _store_with_meeting_plan()
+    leaked_surface_id = "surface_plan_sk-or-v1-surface-secret-should-not-appear"
+
+    # Act / Assert
+    with pytest.raises(PlanSurfaceMismatchError) as exc_info:
+        store.apply_user_action(
+            {
+                "userAction": {
+                    "type": "approve_plan",
+                    "surfaceId": leaked_surface_id,
+                    "payload": {
+                        "planId": "plan_meeting_prep",
+                        "editedPlanVersion": 1,
+                        "approvedStepIds": [
+                            "step_relationship_summary",
+                            "step_internal_knowledge",
+                            "step_industry_research",
+                            "step_synthesis",
+                        ],
+                    },
+                }
+            }
+        )
+
+    message = str(exc_info.value)
+    assert "approval surface" in message
+    assert leaked_surface_id not in message
+    assert "sk-or-v1-surface-secret-should-not-appear" not in message
+    assert leaked_surface_id not in caplog.text
+    assert "sk-or-v1-surface-secret-should-not-appear" not in caplog.text

@@ -118,6 +118,62 @@ def _valid_canvas_payload() -> dict[str, Any]:
     )
 
 
+def _valid_workflow_canvas_payload() -> dict[str, Any]:
+    return {
+        "version": A2UI_VERSION,
+        "updateComponents": {
+            "surfaceId": "surface_plan_meeting_prep",
+            "catalog": "basic",
+            "planId": "plan_meeting_prep",
+            "planVersion": 1,
+            "kind": "workflowCanvas",
+            "components": [
+                {
+                    "type": "workflowCanvas",
+                    "id": "root",
+                    "objective": "Prepare for the ABC Manufacturing meeting.",
+                    "selectedAgents": [
+                        {
+                            "agentId": "internal_knowledge",
+                            "displayName": "Internal Knowledge Agent",
+                        }
+                    ],
+                    "steps": [
+                        {
+                            "stepId": "step_internal_knowledge",
+                            "agentId": "internal_knowledge",
+                            "instruction": "Review internal CRM notes.",
+                            "dependsOn": [],
+                            "expectedOutput": "Internal customer context.",
+                        }
+                    ],
+                    "parallelGroups": [],
+                    "controls": [
+                        {
+                            "controlId": "control_approve_plan",
+                            "type": "approve_plan",
+                            "label": "Approve",
+                            "action": {
+                                "type": "approve_plan",
+                                "surfaceId": "surface_plan_meeting_prep",
+                                "planId": "plan_meeting_prep",
+                                "planVersion": 1,
+                                "payload": {
+                                    "planId": "plan_meeting_prep",
+                                    "planVersion": 1,
+                                    "approvedStepIds": [
+                                        "step_internal_knowledge"
+                                    ],
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
 def test_a2ui_validation_success_emits_data_part_without_repair() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
@@ -133,6 +189,22 @@ def test_a2ui_validation_success_emits_data_part_without_repair() -> None:
     assert result.validation_errors == []
     assert isinstance(result.renderer_part, DataPart)
     assert result.renderer_part.metadata["mimeType"] == A2UI_MIME_TYPE
+    assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_accepts_structured_workflow_canvas_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _valid_workflow_canvas_payload()
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
     assert result.renderer_part.data == payload
 
 
@@ -830,6 +902,102 @@ def test_a2ui_validation_rejects_schema_valid_secret_bearing_payload() -> None:
     assert not isinstance(result.renderer_part, DataPart)
     assert leaked_value not in exposed_diagnostic_text
     assert "sk-live-a2ui-secret-token-123456789" not in exposed_diagnostic_text
+    assert "<redacted-secret>" in exposed_diagnostic_text
+    assert "secret-like value" in exposed_diagnostic_text
+
+
+@pytest.mark.parametrize(
+    ("surface_id", "component_id", "leaked_fragment"),
+    [
+        (
+            "surface_product_card",
+            "component_sk-live-renderer-id-secret-token-123456789",
+            "sk-live-renderer-id-secret-token-123456789",
+        ),
+        (
+            "surface_ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "root",
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        ),
+    ],
+)
+def test_a2ui_validation_rejects_secret_tokens_embedded_in_renderer_ids(
+    surface_id: str,
+    component_id: str,
+    leaked_fragment: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id=surface_id,
+        components=[
+            {
+                "component": "Text",
+                "id": component_id,
+                "text": "Treasury services fit the stated need.",
+            }
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert not isinstance(result.renderer_part, DataPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+            "renderer_part": result.renderer_part.model_dump(mode="json"),
+        }
+    )
+    assert leaked_fragment not in exposed_diagnostic_text
+    assert "<redacted-secret>" in exposed_diagnostic_text
+    assert "secret-like value" in exposed_diagnostic_text
+
+
+@pytest.mark.parametrize(
+    "leaked_value",
+    [
+        "Authorization: Bearer renderer-credential-1234567890",
+        "Bearer renderer-credential-1234567890",
+    ],
+)
+def test_a2ui_validation_rejects_bearer_credentials_before_renderer(
+    leaked_value: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        components=[
+            {
+                "component": "Text",
+                "id": "root",
+                "text": f"Debug header copied from upstream: {leaked_value}",
+            }
+        ]
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert not isinstance(result.renderer_part, DataPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+            "renderer_part": result.renderer_part.model_dump(mode="json"),
+        }
+    )
+    assert leaked_value not in exposed_diagnostic_text
+    assert "renderer-credential-1234567890" not in exposed_diagnostic_text
     assert "<redacted-secret>" in exposed_diagnostic_text
     assert "secret-like value" in exposed_diagnostic_text
 

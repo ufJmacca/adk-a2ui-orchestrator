@@ -8,6 +8,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2ui_support.validation import (
+    _redact_secret_like_values,
+    _safe_path_component,
+)
 from orchestrator_demo.contracts import (
     PLAN_APPROVAL_SURFACE_PREFIX,
     PLAN_USER_ACTION_TYPES,
@@ -89,8 +93,11 @@ def _extract_event_payload(candidate: Any) -> Mapping[str, Any]:
 
 
 def _event_payload_from_mapping(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-    if isinstance(candidate.get("userAction"), Mapping):
-        return _with_renderer_edit_state(candidate, candidate)
+    user_action = candidate.get("userAction")
+    if isinstance(user_action, Mapping):
+        return _direct_user_action_payload(
+            _with_renderer_edit_state(user_action, candidate)
+        )
 
     action = candidate.get("action")
     if isinstance(action, Mapping):
@@ -244,11 +251,34 @@ def _with_renderer_edit_state(
 
 def _direct_user_action_payload(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
     payload = _with_renderer_edit_state(candidate, candidate)
-    return {
+    direct_payload = {
         key: value
         for key, value in payload.items()
         if key not in {"approvalEdits", "data", "values", "formData", "state"}
     }
+    action_payload = direct_payload.get("payload")
+    normalized_payload = _basic_catalog_payload_from(action_payload)
+    if normalized_payload is not None:
+        direct_payload = {
+            **direct_payload,
+            "payload": normalized_payload,
+        }
+    return direct_payload
+
+
+def _basic_catalog_payload_from(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, list):
+        return None
+
+    payload: dict[str, Any] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            return None
+        payload[key] = item.get("value")
+    return payload
 
 
 def _approval_edits_from(source: Mapping[str, Any]) -> Any | None:
@@ -270,8 +300,10 @@ def _validation_error_summary(exc: ValidationError) -> str:
         return str(exc)
 
     first_error = errors[0]
-    location = ".".join(str(part) for part in first_error.get("loc", ()))
-    message = first_error.get("msg", str(exc))
+    location = ".".join(
+        _safe_path_component(str(part)) for part in first_error.get("loc", ())
+    )
+    message = _redact_secret_like_values(first_error.get("msg", str(exc)))
     if location:
         return f"{location}: {message}"
     return str(message)

@@ -10,7 +10,13 @@ from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.approval_canvas import approval_canvas_data_parts
 from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
 from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep, UserAction
-from orchestrator_demo.orchestrator.planner import _step_metadata
+from orchestrator_demo.orchestrator.graph_runtime import (
+    AdkGraphRuntime,
+    GraphExecutionResult,
+    GraphRuntime,
+    default_specialist_handlers,
+)
+from orchestrator_demo.orchestrator.planner import step_metadata_for_agent
 
 
 PlanState = Literal["draft", "approved", "rejected"]
@@ -88,6 +94,7 @@ class ApprovalActionResult:
     draft_plan: ExecutionPlan | None = None
     approved_plan: ExecutionPlan | None = None
     rejection_reason: str | None = None
+    graph_execution: GraphExecutionResult | None = None
     graph_created: bool = False
     specialists_called: bool = False
 
@@ -103,12 +110,25 @@ class ApprovalActionResult:
 class ApprovalStateStore:
     """Manage draft, approved, and rejected plan state."""
 
-    def __init__(self, *, agent_descriptors: Sequence[AgentDescriptor]) -> None:
-        self._agent_descriptors = list(agent_descriptors)
+    def __init__(
+        self,
+        *,
+        agent_descriptors: Sequence[AgentDescriptor],
+        graph_runtime: GraphRuntime | None = None,
+    ) -> None:
+        self._agent_descriptors = [
+            descriptor.model_copy(deep=True) for descriptor in agent_descriptors
+        ]
+        self._agent_descriptors_by_id = {
+            descriptor.agent_id: descriptor for descriptor in self._agent_descriptors
+        }
         self._agent_ids = {
             descriptor.agent_id for descriptor in self._agent_descriptors
         }
         self._records: dict[str, ApprovalRecord] = {}
+        self._graph_runtime = graph_runtime or AdkGraphRuntime(
+            specialist_handlers=default_specialist_handlers(self._agent_ids)
+        )
 
     def add_draft(self, plan: ExecutionPlan) -> ApprovalRecord:
         """Store a deep copy of a draft plan without owning the caller's object."""
@@ -133,7 +153,7 @@ class ApprovalStateStore:
         try:
             return self._records[plan_id]
         except KeyError:
-            raise PlanNotFoundError(f"unknown plan: {plan_id}") from None
+            raise PlanNotFoundError("unknown plan") from None
 
     def handle_natural_language(self, _message: str) -> ApprovalActionResult:
         """Ignore conversational approvals; only A2UI userAction events count."""
@@ -165,6 +185,8 @@ class ApprovalStateStore:
         _require_approved_step_ids(record.draft_plan, action.payload)
 
         frozen_plan = record.draft_plan.model_copy(deep=True)
+        graph_execution = self._graph_runtime.execute(frozen_plan)
+
         record.status = "approved"
         record.approved_plan = frozen_plan
         record.approved_version = frozen_plan.plan_version
@@ -174,8 +196,9 @@ class ApprovalStateStore:
             plan_id=frozen_plan.plan_id,
             plan_version=frozen_plan.plan_version,
             approved_plan=frozen_plan.model_copy(deep=True),
-            graph_created=False,
-            specialists_called=False,
+            graph_execution=graph_execution,
+            graph_created=True,
+            specialists_called=bool(graph_execution.specialist_requests),
         )
 
     def _reject(
@@ -254,11 +277,16 @@ class ApprovalStateStore:
             "agentId",
             "agent_id",
         )
-        if replacement_agent_id not in self._agent_ids:
-            raise PlanMutationError(
-                f"replacement agent is unavailable: {replacement_agent_id}"
-            )
+        replacement_descriptor = self._agent_descriptors_by_id.get(
+            replacement_agent_id
+        )
+        if replacement_descriptor is None:
+            raise PlanMutationError("replacement agent is unavailable")
 
+        replacement_metadata = step_metadata_for_agent(
+            replacement_descriptor.agent_id,
+            plan.objective,
+        )
         replaced = False
         steps: list[PlanStep] = []
         for step in plan.steps:
@@ -267,24 +295,18 @@ class ApprovalStateStore:
                 continue
             replaced = True
             _require_replaceable_step(step)
-            replacement_metadata = _step_metadata(
-                replacement_agent_id,
-                plan.objective,
-            )
             steps.append(
                 _step_copy(
                     step,
-                    agent_id=replacement_agent_id,
+                    agent_id=replacement_descriptor.agent_id,
                     instruction=replacement_metadata.instruction,
                     expected_output=replacement_metadata.expected_output,
-                    data_source_categories=(
-                        replacement_metadata.data_source_categories
-                    ),
+                    data_source_categories=replacement_metadata.data_source_categories,
                 )
             )
 
         if not replaced:
-            raise PlanMutationError(f"unknown stepId: {step_id}")
+            raise PlanMutationError("unknown stepId")
         if not _has_non_synthesis_step(steps):
             raise PlanMutationError(
                 "replace_agent must leave at least one non-synthesis specialist step"
@@ -326,7 +348,7 @@ class ApprovalStateStore:
             return
         raise PlanSurfaceMismatchError(
             f"plan {record.draft_plan.plan_id} belongs to approval surface "
-            f"{expected_surface_id!r}, got {action.surface_id!r}"
+            f"{expected_surface_id!r}"
         )
 
 
@@ -373,16 +395,23 @@ def _is_generated_edit_control_payload(payload: Mapping[str, Any]) -> bool:
 
 def _remove_step(plan: ExecutionPlan, payload: Mapping[str, Any]) -> ExecutionPlan:
     step_id = _required_string(payload, "stepId")
-    steps_by_id = {step.step_id: step for step in plan.steps}
-    removed_step = steps_by_id.get(step_id)
+    removed_step = next(
+        (step for step in plan.steps if step.step_id == step_id),
+        None,
+    )
     if removed_step is None:
-        raise PlanMutationError(f"unknown stepId: {step_id}")
+        raise PlanMutationError("unknown stepId")
     _require_removal_preserves_conditional_sources(plan.steps, removed_step)
 
     steps = [
         _step_copy(
             step,
-            depends_on=_dependencies_after_step_removal(step, removed_step),
+            depends_on=_rewired_dependencies(
+                step.depends_on,
+                removed_step_id=step_id,
+                removed_step_dependencies=removed_step.depends_on,
+                target_step_id=step.step_id,
+            ),
         )
         for step in plan.steps
         if step.step_id != step_id
@@ -424,20 +453,28 @@ def _require_removal_preserves_conditional_sources(
             )
 
 
-def _dependencies_after_step_removal(
-    step: PlanStep,
-    removed_step: PlanStep,
+def _rewired_dependencies(
+    dependencies: Sequence[str],
+    *,
+    removed_step_id: str,
+    removed_step_dependencies: Sequence[str],
+    target_step_id: str,
 ) -> list[str]:
-    dependencies: list[str] = []
-    for dependency in step.depends_on:
-        if dependency == removed_step.step_id:
-            for upstream_dependency in removed_step.depends_on:
-                if upstream_dependency not in dependencies:
-                    dependencies.append(upstream_dependency)
-            continue
-        if dependency not in dependencies:
-            dependencies.append(dependency)
-    return dependencies
+    rewired: list[str] = []
+    for dependency in dependencies:
+        replacement_dependencies = (
+            removed_step_dependencies
+            if dependency == removed_step_id
+            else (dependency,)
+        )
+        for replacement_dependency in replacement_dependencies:
+            if (
+                replacement_dependency == target_step_id
+                or replacement_dependency in rewired
+            ):
+                continue
+            rewired.append(replacement_dependency)
+    return rewired
 
 
 def _reorder_steps(plan: ExecutionPlan, payload: Mapping[str, Any]) -> ExecutionPlan:
@@ -476,7 +513,7 @@ def _add_instruction(plan: ExecutionPlan, payload: Mapping[str, Any]) -> Executi
         )
 
     if not updated:
-        raise PlanMutationError(f"unknown stepId: {step_id}")
+        raise PlanMutationError("unknown stepId")
 
     return _plan_copy(plan, steps=steps)
 
