@@ -85,6 +85,7 @@ _REQUIRED_ENV_NAMES = set(_REQUIRED_ENV_ORDER)
 def load_settings(env_file: str | Path | None = ".env") -> Settings:
     """Load settings and raise a redacted fail-fast error on failure."""
 
+    redacted_error: ConfigurationError | None = None
     try:
         settings_kwargs: dict[str, Any] = {"_env_file": env_file}
         return Settings(**settings_kwargs)
@@ -94,16 +95,19 @@ def load_settings(env_file: str | Path | None = ".env") -> Settings:
             names = ", ".join(
                 name for name in _REQUIRED_ENV_ORDER if name in missing_or_invalid
             )
-            raise ConfigurationError(
+            redacted_error = ConfigurationError(
                 "Missing required runtime configuration: "
                 f"{names}. Set these environment variables or provide a local "
                 ".env file copied from .env.example."
-            ) from None
+            )
+        else:
+            redacted_error = ConfigurationError(
+                "Invalid runtime configuration. Check environment variables and "
+                ".env.example."
+            )
 
-        raise ConfigurationError(
-            "Invalid runtime configuration. Check environment variables and "
-            ".env.example."
-        ) from None
+    assert redacted_error is not None
+    raise redacted_error
 
 
 def _required_env_names_from_validation_error(exc: ValidationError) -> set[str]:
