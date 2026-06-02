@@ -138,7 +138,17 @@ def test_core_contracts_accept_valid_business_banking_workflow() -> None:
         response_id="response_internal_notes",
         agent_id="internal_knowledge",
         content="ABC Manufacturing has two open follow-ups.",
-        a2ui_payload={"surfaceId": "surface_internal_notes", "components": []},
+        a2ui_payload=[
+            {
+                "version": "v0.9",
+                "createSurface": {
+                    "surfaceId": "surface_internal_notes",
+                    "catalogId": (
+                        "https://a2ui.org/specification/v0_9/basic_catalog.json"
+                    ),
+                },
+            }
+        ],
         surface_id="surface_internal_notes",
     )
     graph = GraphSpec(
@@ -754,7 +764,7 @@ def test_user_action_accepts_wire_format_and_specialist_action_types() -> None:
     assert specialist_action.surface_id == "surface_relationship_summary"
 
 
-def test_specialist_user_action_with_colliding_plan_type_remains_pass_through() -> None:
+def test_plan_action_type_on_specialist_surface_remains_pass_through() -> None:
     # Arrange
     from orchestrator_demo.contracts import UserAction
 
@@ -772,7 +782,7 @@ def test_specialist_user_action_with_colliding_plan_type_remains_pass_through() 
     assert user_action.surface_id == "surface_relationship_summary"
     assert user_action.plan_id is None
     assert user_action.plan_version is None
-    assert user_action.payload["cardId"] == "relationship_overview"
+    assert user_action.payload == {"cardId": "relationship_overview"}
 
 
 def test_specialist_user_action_payload_plan_id_remains_pass_through() -> None:

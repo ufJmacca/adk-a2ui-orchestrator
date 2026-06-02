@@ -44,6 +44,7 @@ UserActionType = Literal[
     "add_instructions",
     "specialist_action",
 ]
+A2uiPayload = dict[str, Any] | list[dict[str, Any]]
 PLAN_USER_ACTION_TYPES: set[str] = {
     "approve_plan",
     "reject_plan",
@@ -295,7 +296,7 @@ class SpecialistResponse(ContractModel):
     agent_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
     structured_output: dict[str, Any] = Field(default_factory=dict)
-    a2ui_payload: dict[str, Any] | None = None
+    a2ui_payload: A2uiPayload | None = None
     surface_id: str | None = Field(
         default=None,
         pattern=r"^surface_[A-Za-z0-9][A-Za-z0-9_-]*$",
@@ -492,6 +493,7 @@ class StatusEvent(ContractModel):
 
 
 __all__ = [
+    "A2uiPayload",
     "AgentDescriptor",
     "Complexity",
     "ContractModel",

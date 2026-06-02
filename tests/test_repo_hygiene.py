@@ -86,6 +86,19 @@ def test_pyproject_declares_runtime_and_dev_dependencies() -> None:
     assert DEV_DEPENDENCIES <= dev_dependencies
 
 
+def test_pyproject_limits_package_discovery_to_application_package() -> None:
+    # Arrange
+    pyproject_path = ROOT / "pyproject.toml"
+
+    # Act
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    package_discovery = pyproject["tool"]["setuptools"]["packages"]["find"]
+
+    # Assert
+    assert package_discovery["include"] == ["orchestrator_demo*"]
+    assert "prds*" in package_discovery["exclude"]
+
+
 def test_uv_lock_contains_declared_project_dependencies() -> None:
     # Arrange
     lock_path = ROOT / "uv.lock"

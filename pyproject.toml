@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,13 +26,13 @@ dev = [
     "mypy",
 ]
 
-[tool.setuptools.packages.find]
-include = ["orchestrator_demo*"]
-exclude = ["prds*", "tests*"]
-
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+
+[tool.setuptools.packages.find]
+include = ["orchestrator_demo*"]
+exclude = ["prds*", "tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

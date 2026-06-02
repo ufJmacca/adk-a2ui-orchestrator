@@ -26,6 +26,18 @@ SPEC_REQUIRED_SPECIALIST_AGENT_IDS = {
 }
 
 
+def _openai_style_key(suffix: str) -> str:
+    return "sk-" + suffix
+
+
+def _openrouter_key(suffix: str) -> str:
+    return _openai_style_key(f"or-{suffix}")
+
+
+def _authorization_bearer(value: str) -> str:
+    return "Authorization: " + "Bearer " + value
+
+
 def _descriptor_source(agent_id: str, *, display_name: str | None = None) -> str:
     display_name = display_name or agent_id.replace("_", " ").title()
     return f"""AgentDescriptor(
@@ -614,6 +626,14 @@ def test_invalid_reload_keeps_previous_registry_and_redacts_secret_like_values(
         ),
     ],
 )
+@pytest.mark.parametrize(
+    "leaked_value",
+    [
+        _openai_style_key("live-string-value-should-not-appear"),
+        _authorization_bearer("or-live-token-should-not-appear"),
+    ],
+    ids=["api-key", "authorization-bearer"],
+)
 def test_invalid_reload_rejects_secret_like_string_values_without_leaking_them(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -621,11 +641,11 @@ def test_invalid_reload_rejects_secret_like_string_values_without_leaking_them(
     routing_examples: str,
     input_schema: str,
     expected_path: str,
+    leaked_value: str,
 ) -> None:
     # Arrange
     from orchestrator_demo.registry.agent_registry import RegistryValidationError
 
-    leaked_value = "sk-live-string-value-should-not-appear"
     config_path = tmp_path / "agent_config.py"
     _write_config(config_path, [_descriptor_source("internal_knowledge")])
     registry = _registry_from(config_path)
@@ -1741,14 +1761,108 @@ def test_invalid_reload_rejects_secret_like_top_level_mapping_keys_without_leaki
     assert leaked_key not in caplog.text
 
 
+@pytest.mark.parametrize("schema_field", ["input_schema", "output_schema"])
 def test_invalid_reload_rejects_secret_like_schema_property_keys_without_leaking_them(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    schema_field: str,
 ) -> None:
     # Arrange
     from orchestrator_demo.registry.agent_registry import RegistryValidationError
 
-    leaked_key = "sk-live-schema-property-key-should-not-appear"
+    leaked_key = _openrouter_key("v1-descriptor-property-key-should-not-appear")
+    input_schema = "{'type': 'object'}"
+    output_schema = "{'type': 'object'}"
+    schema_with_secret_property = (
+        "{"
+        "'type': 'object', "
+        "'properties': {leaked_key: {'type': 'string'}},"
+        "}"
+    )
+    if schema_field == "input_schema":
+        input_schema = schema_with_secret_property
+    else:
+        output_schema = schema_with_secret_property
+
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        f"leaked_key = {leaked_key!r}\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Mutated Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
+        f"        input_schema={input_schema},\n"
+        f"        output_schema={output_schema},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    assert {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    } == previous_descriptors
+    assert "secret-like schema map key" in str(exc_info.value)
+    assert f"{schema_field}.properties.<redacted>" in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+    assert leaked_key not in str(exc_info.value)
+    assert leaked_key not in caplog.text
+
+
+@pytest.mark.parametrize("schema_field", ["input_schema", "output_schema"])
+@pytest.mark.parametrize(
+    ("schema_source", "expected_path"),
+    [
+        pytest.param(
+            (
+                "{"
+                "'type': 'object', "
+                "'properties': {'authorization': {'type': 'string'}},"
+                "}"
+            ),
+            "properties.authorization",
+            id="property",
+        ),
+        pytest.param(
+            "{'type': 'object', 'required': ['authorization']}",
+            "required[0]",
+            id="required",
+        ),
+    ],
+)
+def test_invalid_reload_rejects_authorization_schema_fields(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    schema_field: str,
+    schema_source: str,
+    expected_path: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    input_schema = "{'type': 'object'}"
+    output_schema = "{'type': 'object'}"
+    if schema_field == "input_schema":
+        input_schema = schema_source
+    else:
+        output_schema = schema_source
+
     config_path = tmp_path / "agent_config.py"
     _write_config(config_path, [_descriptor_source("internal_knowledge")])
     registry = _registry_from(config_path)
@@ -1763,11 +1877,56 @@ def test_invalid_reload_rejects_secret_like_schema_property_keys_without_leaking
         "        agent_id='internal_knowledge',\n"
         "        display_name='Mutated Internal Knowledge Agent',\n"
         "        capabilities=['crm notes'],\n"
+        f"        input_schema={input_schema},\n"
+        f"        output_schema={output_schema},\n"
+        "        a2ui_catalogs=['basic'],\n"
+        "        routing_examples=['Summarize notes.'],\n"
+        "        execution_mode='local_llm',\n"
+        "    )\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    # Act / Assert
+    with caplog.at_level(logging.ERROR, logger="orchestrator_demo.registry.agent_registry"):
+        with pytest.raises(RegistryValidationError) as exc_info:
+            registry.reload()
+
+    assert {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    } == previous_descriptors
+    assert "secret-like field" in str(exc_info.value)
+    assert f"{schema_field}.{expected_path}" in str(exc_info.value)
+    assert "agent registry reload rejected" in caplog.text
+
+
+def test_invalid_reload_redacts_embedded_secret_like_schema_keys(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    leaked_key = f"Customer_{_openrouter_key('v1-descriptor-key-should-not-appear')}"
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    previous_descriptors = {
+        descriptor.agent_id: descriptor.model_dump()
+        for descriptor in registry.descriptors()
+    }
+    config_path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        f"leaked_key = {leaked_key!r}\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        "    AgentDescriptor(\n"
+        "        agent_id='internal_knowledge',\n"
+        "        display_name='Mutated Internal Knowledge Agent',\n"
+        "        capabilities=['crm notes'],\n"
         "        input_schema={\n"
         "            'type': 'object',\n"
-        "            'properties': {\n"
-        f"                {leaked_key!r}: {{'type': 'string'}},\n"
-        "            },\n"
+        "            '$defs': {leaked_key: {'type': 'object'}},\n"
         "        },\n"
         "        output_schema={'type': 'object'},\n"
         "        a2ui_catalogs=['basic'],\n"
@@ -1788,7 +1947,7 @@ def test_invalid_reload_rejects_secret_like_schema_property_keys_without_leaking
         for descriptor in registry.descriptors()
     } == previous_descriptors
     assert "secret-like schema map key" in str(exc_info.value)
-    assert "input_schema.properties.<redacted>" in str(exc_info.value)
+    assert "input_schema.$defs.<redacted>" in str(exc_info.value)
     assert "agent registry reload rejected" in caplog.text
     assert leaked_key not in str(exc_info.value)
     assert leaked_key not in caplog.text
