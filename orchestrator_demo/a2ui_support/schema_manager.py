@@ -7,11 +7,11 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
-from a2ui.basic_catalog.provider import (  # type: ignore[import-untyped]
+from a2ui.basic_catalog.provider import (
     BasicCatalog as SdkBasicCatalog,
 )
-from a2ui.schema.constants import VERSION_0_9  # type: ignore[import-untyped]
-from a2ui.schema.manager import A2uiSchemaManager  # type: ignore[import-untyped]
+from a2ui.schema.constants import VERSION_0_9
+from a2ui.schema.manager import A2uiSchemaManager
 
 
 BASIC_CATALOG_NAME = "basic"
