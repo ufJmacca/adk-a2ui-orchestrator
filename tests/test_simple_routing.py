@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from orchestrator_demo.contracts import (
@@ -5,7 +7,10 @@ from orchestrator_demo.contracts import (
     IntentSuggestion,
     LlmIntentAssessment,
 )
-from orchestrator_demo.intent.classifier import DeterministicIntentClassifier
+from orchestrator_demo.intent.classifier import (
+    DeterministicIntentClassifier,
+    LiteLlmIntentClassifier,
+)
 from orchestrator_demo.intent.slm_mock_client import MockSlmIntentClient
 from orchestrator_demo.orchestrator.router import RequestRouter
 from orchestrator_demo.registry.agent_registry import AgentRegistry
@@ -104,6 +109,101 @@ async def test_simple_route_above_threshold_selects_single_agent_directly() -> N
     assert context.decision.confidence >= 0.85
     assert context.llm_assessment.intents == ["internal_knowledge"]
     assert context.llm_assessment.required_agents == ["internal_knowledge"]
+
+
+@pytest.mark.asyncio
+async def test_retail_trade_risk_example_routes_to_industry_research_directly() -> None:
+    # Arrange
+    user_input = "What are key risks in retail trade this quarter?"
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+
+    # Act
+    context = await router.route_request(user_input)
+
+    # Assert
+    assert context.slm_suggestion.intent == "credit_risk"
+    assert context.llm_assessment.intents == ["industry_research"]
+    assert context.llm_assessment.required_agents == ["industry_research"]
+    assert context.decision.path == "direct"
+    assert context.decision.selected_agent == "industry_research"
+
+
+@pytest.mark.asyncio
+async def test_standalone_customer_risk_request_requires_guarded_plan() -> None:
+    # Arrange
+    user_input = "Flag risk themes for this customer."
+    router = RequestRouter(
+        slm_client=MockSlmIntentClient(),
+        intent_classifier=DeterministicIntentClassifier(),
+        registry=AgentRegistry.from_default_config(),
+    )
+
+    # Act
+    context = await router.route_request(user_input)
+
+    # Assert
+    assert context.slm_suggestion.intent == "credit_risk"
+    assert context.llm_assessment.intents == ["credit_risk"]
+    assert context.llm_assessment.required_agents == ["credit_risk"]
+    assert context.decision.path == "plan_required"
+    assert context.decision.selected_agent is None
+    assert "sensitive" in context.decision.reason.casefold()
+
+
+@pytest.mark.asyncio
+async def test_model_classifier_routes_using_final_assessment_after_echoed_json() -> None:
+    # Arrange
+    echoed_prompt_example = {
+        "intents": ["internal_knowledge"],
+        "confidence": 0.99,
+        "complexity": "simple",
+        "required_agents": ["internal_knowledge"],
+        "rationale": "Echoed example that should not drive routing.",
+    }
+    actual_assessment = {
+        "intents": ["prospect_research"],
+        "confidence": 0.9,
+        "complexity": "complex",
+        "required_agents": [
+            "web_search",
+            "industry_research",
+            "product_opportunity",
+            "credit_risk",
+            "synthesis",
+        ],
+        "rationale": "Actual response requires a reviewed multi-agent plan.",
+    }
+
+    async def fake_completion(_prompt: str) -> str:
+        return (
+            "Here is the schema example I saw:\n"
+            f"{json.dumps(echoed_prompt_example)}\n"
+            "Final classifier assessment:\n"
+            f"{json.dumps(actual_assessment)}"
+        )
+
+    router = RequestRouter(
+        slm_client=_RecordingSlmClient(
+            IntentSuggestion(intent="internal_knowledge", confidence=0.95)
+        ),
+        intent_classifier=LiteLlmIntentClassifier(completion=fake_completion),
+        registry=AgentRegistry.from_default_config(),
+    )
+
+    # Act
+    context = await router.route_request(
+        "Research ABC Manufacturing as a new prospect and include risks."
+    )
+
+    # Assert
+    assert context.llm_assessment.intents == ["prospect_research"]
+    assert context.llm_assessment.required_agents == actual_assessment["required_agents"]
+    assert context.decision.path == "plan_required"
+    assert context.decision.selected_agent is None
 
 
 @pytest.mark.asyncio

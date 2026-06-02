@@ -181,10 +181,55 @@ def _part_discriminator(value: Any) -> str | None:
     return str(part_type)
 
 
+def _dump_sdk_model(value: Any) -> Any:
+    root = getattr(value, "root", None)
+    if root is not None:
+        value = root
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(by_alias=True, mode="json", exclude_none=True)
+
+    return value
+
+
 A2APartPayload = Annotated[
     Annotated[TextPart, Tag("text")] | Annotated[DataPart, Tag("data")],
     Discriminator(_part_discriminator),
 ]
+
+
+class A2AArtifact(TransportModel):
+    artifact_id: str = Field(min_length=1, alias="artifactId")
+    description: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    extensions: list[str] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+    name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    parts: list[A2APartPayload] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_sdk_artifact_model(cls, value: Any) -> Any:
+        value = _dump_sdk_model(value)
+        if not isinstance(value, dict):
+            return value
+
+        normalized = dict(value)
+        if normalized.get("metadata") is None:
+            normalized.pop("metadata", None)
+        return normalized
 
 
 class A2AMessage(TransportModel):
@@ -355,6 +400,10 @@ class A2ATask(TransportModel):
         validation_alias=AliasChoices("history", "messages"),
         serialization_alias="history",
     )
+    artifacts: list[A2AArtifact] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -372,13 +421,12 @@ class A2ATask(TransportModel):
         kind = normalized.pop("kind", None)
         if kind is not None and kind != "task":
             raise ValueError("kind must be task")
-        _pop_empty_unsupported_sdk_field(
-            normalized,
-            field_label="artifacts",
-            keys=("artifacts",),
-        )
+        if normalized.get("artifacts") is None:
+            normalized.pop("artifacts", None)
         if normalized.get("history") is None:
             normalized.pop("history", None)
+        if normalized.get("messages") is None:
+            normalized.pop("messages", None)
 
         status = normalized.get("status")
         if status is not None and not isinstance(status, dict):
@@ -445,6 +493,8 @@ class A2ATask(TransportModel):
                 by_alias=True,
                 mode="json",
             )
+        if value.metadata:
+            wire_status["metadata"] = value.metadata
 
         return wire_status
 
@@ -531,6 +581,7 @@ class A2uiUserAction(UserAction):
 
 __all__ = [
     "A2UI_MIME_TYPE",
+    "A2AArtifact",
     "A2AMessage",
     "A2APart",
     "A2APartPayload",

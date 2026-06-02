@@ -237,6 +237,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
             )
 
         for property_name, field_names in dependent_required.items():
+            safe_property_name = _safe_path_component(property_name)
             if not isinstance(property_name, str):
                 raise DescriptorValidationError(
                     f"{location}.dependentRequired must map strings to string lists"
@@ -544,10 +545,23 @@ def _is_secret_like_field_name(field_name: str) -> bool:
     )
 
 
+def _safe_path_component(value: Any) -> str:
+    if isinstance(value, int):
+        return str(value)
+
+    if not isinstance(value, str):
+        return type(value).__name__
+
+    if _is_secret_like_value(value):
+        return "<redacted-key>"
+
+    return value
+
+
 def _redacted_validation_message(exc: ValidationError) -> str:
     messages: list[str] = []
     for error in exc.errors(include_url=False, include_input=False):
-        location = ".".join(str(part) for part in error["loc"])
+        location = ".".join(_safe_path_component(part) for part in error["loc"])
         messages.append(f"{location}: {error['msg']}")
     return "; ".join(messages)
 

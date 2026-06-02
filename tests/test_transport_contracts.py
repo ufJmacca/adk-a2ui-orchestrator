@@ -702,6 +702,37 @@ def test_a2a_task_accepts_sdk_envelope_with_null_metadata() -> None:
     assert serialized_task["history"] == []
 
 
+def test_a2a_task_serializes_non_empty_status_metadata() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.transport import A2ATask, TaskStatusUpdate
+
+    status = TaskStatusUpdate(
+        task_id="task_meeting_prep",
+        context_id="ctx_abc_manufacturing",
+        status="auth-required",
+        timestamp=datetime(2026, 5, 30, 12, 3, tzinfo=UTC),
+        metadata={"retryAfterSeconds": 30, "diagnostic": "reauth required"},
+    )
+    task = A2ATask(
+        task_id="task_meeting_prep",
+        context_id="ctx_abc_manufacturing",
+        status=status,
+    )
+
+    # Act
+    serialized_task = task.model_dump(by_alias=True, mode="json")
+
+    # Assert
+    assert serialized_task["status"] == {
+        "state": "auth-required",
+        "timestamp": "2026-05-30T12:03:00Z",
+        "metadata": {
+            "retryAfterSeconds": 30,
+            "diagnostic": "reauth required",
+        },
+    }
+
+
 def test_a2a_task_accepts_sdk_task_model_with_null_history() -> None:
     # Arrange
     from a2a.types import Task
@@ -743,36 +774,59 @@ def test_a2a_task_accepts_sdk_task_model_with_null_history() -> None:
     assert "kind" not in serialized_task
 
 
-def test_a2a_task_rejects_sdk_task_model_with_non_empty_artifacts() -> None:
+def test_a2a_task_preserves_non_empty_sdk_artifacts() -> None:
     # Arrange
-    from a2a.types import Task
+    from a2a.types import Artifact, Part, Task, TaskStatus
+    from a2a.types import DataPart as SdkDataPart
+    from a2a.types import TextPart as SdkTextPart
 
-    from orchestrator_demo.a2a_support.transport import A2ATask
+    from orchestrator_demo.a2a_support.transport import A2ATask, A2UI_MIME_TYPE
 
-    sdk_task = Task.model_validate(
-        {
-            "id": "task_sdk_artifacts",
-            "contextId": "ctx_sdk_artifacts",
-            "status": {
-                "state": "completed",
-                "timestamp": "2026-05-30T12:06:00Z",
-            },
-            "artifacts": [
-                {
-                    "artifactId": "artifact_result",
-                    "parts": [{"kind": "text", "text": "Returned result."}],
-                }
-            ],
-        }
+    sdk_task = Task(
+        id="task_meeting_prep",
+        contextId="ctx_abc_manufacturing",
+        status=TaskStatus(
+            state="completed",
+            timestamp="2026-05-30T12:06:00Z",
+        ),
+        artifacts=[
+            Artifact(
+                artifactId="artifact_final_output",
+                name="Final output",
+                parts=[
+                    Part(root=SdkTextPart(text="Final brief ready.")),
+                    Part(
+                        root=SdkDataPart(
+                            data={"kind": "text", "text": "A2UI final output"},
+                            metadata={"mimeType": A2UI_MIME_TYPE},
+                        )
+                    ),
+                ],
+            )
+        ],
     )
 
-    # Act / Assert
-    with pytest.raises(ValidationError) as exc_info:
-        A2ATask.model_validate(sdk_task)
+    # Act
+    task = A2ATask.model_validate(sdk_task)
+    serialized_task = task.model_dump(by_alias=True, mode="json")
 
-    error_message = str(exc_info.value)
-    assert "artifacts" in error_message
-    assert "not supported" in error_message
+    # Assert
+    assert task.artifacts is not None
+    assert serialized_task["artifacts"] == [
+        {
+            "artifactId": "artifact_final_output",
+            "name": "Final output",
+            "parts": [
+                {"type": "text", "text": "Final brief ready."},
+                {
+                    "type": "data",
+                    "data": {"kind": "text", "text": "A2UI final output"},
+                    "metadata": {"mimeType": A2UI_MIME_TYPE},
+                },
+            ],
+        }
+    ]
+    assert "kind" not in serialized_task["artifacts"][0]["parts"][0]
 
 
 def test_a2a_task_rejects_sdk_status_message_with_non_empty_extensions() -> None:
