@@ -244,6 +244,7 @@ class PlanStep(ContractModel):
     agent_id: str = Field(min_length=1)
     instruction: str = Field(min_length=1)
     depends_on: list[str] = Field(default_factory=list)
+    condition: str | None = None
     expected_output: str = Field(min_length=1)
     data_source_categories: list[str] = Field(default_factory=list)
     parallel_group: str | None = None

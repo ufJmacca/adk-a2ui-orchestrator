@@ -21,6 +21,8 @@ from orchestrator_demo.orchestrator.planner import step_metadata_for_agent
 
 PlanState = Literal["draft", "approved", "rejected"]
 ApprovalActionStatus = Literal["ignored", "draft_updated", "approved", "rejected"]
+CONDITIONAL_DATA_QUALITY_AGENT_ID = "data_quality"
+CONDITIONAL_DATA_QUALITY_ROUTE = "missing_internal_data"
 
 
 class ApprovalStateError(ValueError):
@@ -89,6 +91,7 @@ class ApprovalActionResult:
     plan_id: str | None = None
     plan_version: int | None = None
     refreshed_a2ui_parts: list[DataPart] = field(default_factory=list)
+    draft_plan: ExecutionPlan | None = None
     approved_plan: ExecutionPlan | None = None
     rejection_reason: str | None = None
     graph_execution: GraphExecutionResult | None = None
@@ -254,6 +257,7 @@ class ApprovalStateStore:
             plan_id=candidate_plan.plan_id,
             plan_version=candidate_plan.plan_version,
             refreshed_a2ui_parts=refreshed_parts,
+            draft_plan=candidate_plan.model_copy(deep=True),
             graph_created=False,
             specialists_called=False,
         )
@@ -290,6 +294,7 @@ class ApprovalStateStore:
                 steps.append(step)
                 continue
             replaced = True
+            _require_replaceable_step(step)
             steps.append(
                 _step_copy(
                     step,
@@ -396,6 +401,7 @@ def _remove_step(plan: ExecutionPlan, payload: Mapping[str, Any]) -> ExecutionPl
     )
     if removed_step is None:
         raise PlanMutationError("unknown stepId")
+    _require_removal_preserves_conditional_sources(plan.steps, removed_step)
 
     steps = [
         _step_copy(
@@ -423,6 +429,28 @@ def _remove_step(plan: ExecutionPlan, payload: Mapping[str, Any]) -> ExecutionPl
         selected_agents=_selected_agents(steps),
         data_source_categories=_data_source_categories(steps),
     )
+
+
+def _require_removal_preserves_conditional_sources(
+    steps: Sequence[PlanStep],
+    removed_step: PlanStep,
+) -> None:
+    if (
+        removed_step.agent_id == CONDITIONAL_DATA_QUALITY_AGENT_ID
+        and removed_step.condition == CONDITIONAL_DATA_QUALITY_ROUTE
+    ):
+        raise PlanMutationError(
+            "remove_step cannot remove a conditional data_quality step"
+        )
+
+    for step in steps:
+        if step.step_id == removed_step.step_id or step.condition is None:
+            continue
+        if removed_step.step_id in step.depends_on:
+            raise PlanMutationError(
+                "remove_step cannot remove the source dependency for "
+                f"conditional step {step.step_id}"
+            )
 
 
 def _rewired_dependencies(
@@ -527,6 +555,16 @@ def _data_source_categories(steps: Sequence[PlanStep]) -> list[str]:
 
 def _has_non_synthesis_step(steps: Sequence[PlanStep]) -> bool:
     return any(step.agent_id != "synthesis" for step in steps)
+
+
+def _require_replaceable_step(step: PlanStep) -> None:
+    if (
+        step.agent_id == CONDITIONAL_DATA_QUALITY_AGENT_ID
+        and step.condition == CONDITIONAL_DATA_QUALITY_ROUTE
+    ):
+        raise PlanMutationError(
+            "replace_agent cannot replace a conditional data_quality step"
+        )
 
 
 def _require_final_synthesis_preserved(

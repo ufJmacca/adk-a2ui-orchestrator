@@ -26,6 +26,12 @@ CompletionCallable = Callable[[str], Awaitable[str | Mapping[str, Any]]]
 _ASSESSMENT_PAYLOAD_KEYS = frozenset(
     {"intents", "confidence", "complexity", "required_agents", "rationale"}
 )
+_SENSITIVE_GUARDRAIL_INTENTS: tuple[IntentName, ...] = (
+    "credit_risk",
+    "compliance_policy",
+)
+_SENSITIVE_GUARDRAIL_AGENTS = ("credit_risk", "compliance_policy")
+_SYNTHESIS_AGENT_ID = "synthesis"
 
 
 class ClassifierUnavailableAgentsError(ValueError):
@@ -73,19 +79,9 @@ class DeterministicIntentClassifier:
 
         text = _normalize_text(user_input)
 
-        if _is_sensitive_credit_or_compliance(text):
-            assessment = _assessment(
-                intents=["credit_risk", "compliance_policy"],
-                confidence=0.87,
-                complexity="complex",
-                required_agents=["credit_risk", "compliance_policy", "synthesis"],
-                rationale=(
-                    "Sensitive credit, risk, or compliance language requires "
-                    "review before producing an RM-facing answer."
-                ),
-            )
-        elif _is_prospect_research(text):
-            assessment = _assessment(
+        if _is_prospect_research(text):
+            intents, required_agents, rationale = _add_sensitive_guardrails_if_needed(
+                text=text,
                 intents=[
                     "prospect_research",
                     "web_search",
@@ -93,8 +89,6 @@ class DeterministicIntentClassifier:
                     "product_opportunity",
                     "credit_risk",
                 ],
-                confidence=0.90,
-                complexity="complex",
                 required_agents=[
                     "web_search",
                     "industry_research",
@@ -107,16 +101,22 @@ class DeterministicIntentClassifier:
                     "risk review, opportunity analysis, and synthesis."
                 ),
             )
-        elif _is_relationship_and_industry_comparison(text):
             assessment = _assessment(
+                intents=intents,
+                confidence=0.90,
+                complexity="complex",
+                required_agents=required_agents,
+                rationale=rationale,
+            )
+        elif _is_relationship_and_industry_comparison(text):
+            intents, required_agents, rationale = _add_sensitive_guardrails_if_needed(
+                text=text,
                 intents=[
                     "relationship_summary",
                     "industry_research",
                     "credit_risk",
                     "meeting_prep",
                 ],
-                confidence=0.88,
-                complexity="complex",
                 required_agents=[
                     "relationship_summary",
                     "industry_research",
@@ -128,27 +128,22 @@ class DeterministicIntentClassifier:
                     "multiple sources and synthesis."
                 ),
             )
-        elif _is_standalone_risk_request(text):
             assessment = _assessment(
-                intents=["credit_risk"],
-                confidence=0.89,
-                complexity="simple",
-                required_agents=["credit_risk"],
-                rationale=(
-                    "Standalone customer risk language requires guarded "
-                    "credit-risk review before producing an RM-facing answer."
-                ),
+                intents=intents,
+                confidence=0.88,
+                complexity="complex",
+                required_agents=required_agents,
+                rationale=rationale,
             )
         elif _is_meeting_prep(text):
-            assessment = _assessment(
+            intents, required_agents, rationale = _add_sensitive_guardrails_if_needed(
+                text=text,
                 intents=[
                     "meeting_prep",
                     "relationship_summary",
                     "internal_knowledge",
                     "industry_research",
                 ],
-                confidence=0.91,
-                complexity="complex",
                 required_agents=[
                     "relationship_summary",
                     "internal_knowledge",
@@ -158,6 +153,35 @@ class DeterministicIntentClassifier:
                 rationale=(
                     "Meeting preparation requires relationship context, internal "
                     "notes, industry context, and final synthesis."
+                ),
+            )
+            assessment = _assessment(
+                intents=intents,
+                confidence=0.91,
+                complexity="complex",
+                required_agents=required_agents,
+                rationale=rationale,
+            )
+        elif _is_sensitive_credit_or_compliance(text):
+            assessment = _assessment(
+                intents=["credit_risk", "compliance_policy"],
+                confidence=0.87,
+                complexity="complex",
+                required_agents=["credit_risk", "compliance_policy", "synthesis"],
+                rationale=(
+                    "Sensitive credit, risk, or compliance language requires "
+                    "review before producing an RM-facing answer."
+                ),
+            )
+        elif _is_standalone_risk_request(text):
+            assessment = _assessment(
+                intents=["credit_risk"],
+                confidence=0.89,
+                complexity="simple",
+                required_agents=["credit_risk"],
+                rationale=(
+                    "Standalone customer risk language requires guarded "
+                    "credit-risk review before producing an RM-facing answer."
                 ),
             )
         elif _contains_any(text, ("internal notes", "crm", "relationship notes")):
@@ -297,6 +321,54 @@ def _assessment(
         required_agents=required_agents,
         rationale=rationale,
     )
+
+
+def _add_sensitive_guardrails_if_needed(
+    *,
+    text: str,
+    intents: list[IntentName],
+    required_agents: list[str],
+    rationale: str,
+) -> tuple[list[IntentName], list[str], str]:
+    if not _is_sensitive_credit_or_compliance(text):
+        return intents, required_agents, rationale
+
+    return (
+        _dedupe_intents([*intents, *_SENSITIVE_GUARDRAIL_INTENTS]),
+        _append_agents_before_synthesis(
+            required_agents,
+            _SENSITIVE_GUARDRAIL_AGENTS,
+        ),
+        (
+            f"{rationale} Sensitive credit, loan, or compliance language adds "
+            "credit and policy guardrails."
+        ),
+    )
+
+
+def _append_agents_before_synthesis(
+    agent_ids: Sequence[str],
+    additions: Sequence[str],
+) -> list[str]:
+    ordered_agent_ids = [
+        agent_id for agent_id in agent_ids if agent_id != _SYNTHESIS_AGENT_ID
+    ]
+    for agent_id in additions:
+        if agent_id not in ordered_agent_ids:
+            ordered_agent_ids.append(agent_id)
+    if _SYNTHESIS_AGENT_ID in agent_ids:
+        ordered_agent_ids.append(_SYNTHESIS_AGENT_ID)
+
+    return ordered_agent_ids
+
+
+def _dedupe_intents(values: Sequence[IntentName]) -> list[IntentName]:
+    deduped: list[IntentName] = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+
+    return deduped
 
 
 def _normalize_text(text: str) -> str:

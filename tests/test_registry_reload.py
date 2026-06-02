@@ -153,7 +153,13 @@ def test_registry_descriptor_accessors_return_defensive_deep_copies(
 ) -> None:
     # Arrange
     config_path = tmp_path / "agent_config.py"
-    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    _write_config(
+        config_path,
+        [
+            _descriptor_source("internal_knowledge"),
+            _descriptor_source("synthesis"),
+        ],
+    )
     registry = _registry_from(config_path)
 
     # Act
@@ -163,8 +169,10 @@ def test_registry_descriptor_accessors_return_defensive_deep_copies(
     descriptor.agent_id = "tampered_agent"
     descriptor.capabilities.append("unvalidated capability")
     descriptor.input_schema["additionalProperties"] = False
+    descriptor.output_schema["poisoned"] = True
     descriptors[0].display_name = "Tampered Display Name"
     descriptors[0].routing_examples.append("Unvalidated route.")
+    descriptors[0].output_schema["poisoned"] = True
 
     # Assert
     fresh_descriptor = registry.get("internal_knowledge")
@@ -173,10 +181,12 @@ def test_registry_descriptor_accessors_return_defensive_deep_copies(
     assert fresh_descriptor.display_name == "Internal Knowledge"
     assert fresh_descriptor.capabilities == ["business banking support"]
     assert fresh_descriptor.input_schema == {"type": "object"}
+    assert fresh_descriptor.output_schema == {"type": "object"}
     assert fresh_descriptor.routing_examples == [
         "Handle a internal_knowledge request."
     ]
-    assert registry.agent_ids() == ["internal_knowledge"]
+    assert registry.agent_ids() == ["internal_knowledge", "synthesis"]
+    assert registry.get("tampered_agent") is None
     assert registry.is_available_for_new_plan("internal_knowledge") is True
     assert registry.is_available_for_new_plan("tampered_agent") is False
 
