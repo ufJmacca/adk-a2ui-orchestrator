@@ -93,13 +93,13 @@ class BasicCatalogSchema:
         if message_type is None:
             return errors
 
-        _validate_with_a2ui_sdk(payload, errors)
-
         if message_type == CREATE_SURFACE_MESSAGE:
+            _validate_with_a2ui_sdk(payload, errors)
             _validate_create_surface(payload[CREATE_SURFACE_MESSAGE], errors)
             return errors
 
         if message_type != UPDATE_COMPONENTS_MESSAGE:
+            _validate_with_a2ui_sdk(payload, errors)
             _validate_surface_message(payload[message_type], message_type, errors)
             return errors
 
@@ -123,6 +123,11 @@ class BasicCatalogSchema:
             )
             return errors
 
+        if _is_workflow_canvas_payload(update_components, components):
+            _validate_approval_canvas_payload(update_components, components, errors)
+            return errors
+
+        _validate_with_a2ui_sdk(payload, errors)
         _validate_generic_components(
             components,
             errors,
@@ -135,6 +140,19 @@ class BasicCatalogSchema:
                 path=f"{UPDATE_COMPONENTS_MESSAGE}.components",
             )
         return errors
+
+
+def _is_workflow_canvas_payload(
+    update_components: Mapping[str, Any],
+    components: list[Any],
+) -> bool:
+    return (
+        update_components.get("kind") == WORKFLOW_CANVAS_TYPE
+        or any(
+            _is_workflow_canvas_component(component)
+            for component in components
+        )
+    )
 
 
 def _is_approval_canvas_payload(
@@ -303,6 +321,12 @@ def _validate_approval_canvas_payload(
     components: list[Any],
     errors: list[str],
 ) -> None:
+    _require_pattern(payload, "surfaceId", SURFACE_ID_PATTERN, errors)
+    surface_id = payload.get("surfaceId")
+    if isinstance(surface_id, str) and not surface_id.startswith(
+        PLAN_APPROVAL_SURFACE_PREFIX
+    ):
+        errors.append("surfaceId must target a plan approval surface")
     _require_string(
         payload,
         "catalog",
@@ -324,7 +348,7 @@ def _validate_approval_canvas_payload(
         if not isinstance(component, Mapping):
             errors.append(f"{path} must be an object")
             continue
-        component_type = component.get("type")
+        component_type = component.get("type", component.get("component"))
         if component_type == WORKFLOW_CANVAS_TYPE:
             workflow_canvas_seen = True
             _validate_workflow_canvas_component(component, path, payload, errors)
@@ -474,9 +498,6 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
         return
 
     action_type = context["type"]
-    if action_type not in ALLOWED_CONTROL_ACTIONS:
-        errors.append(f"{path}.event.context.type must be a supported plan action")
-
     _require_pattern(
         context,
         "surfaceId",
@@ -485,12 +506,19 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
         path=f"{path}.event.context",
     )
 
+    if not str(context.get("surfaceId")).startswith(PLAN_APPROVAL_SURFACE_PREFIX):
+        if not _is_specialist_action_payload(context.get("payload")):
+            errors.append(
+                f"{path}.event.context.payload must be an object or key/value array"
+            )
+        return
+
+    if action_type not in ALLOWED_CONTROL_ACTIONS:
+        errors.append(f"{path}.event.context.type must be a supported plan action")
+
     payload = context.get("payload")
     if not isinstance(payload, Mapping):
         errors.append(f"{path}.event.context.payload must be an object")
-        return
-
-    if not str(context.get("surfaceId")).startswith(PLAN_APPROVAL_SURFACE_PREFIX):
         return
 
     _require_pattern(
@@ -550,6 +578,22 @@ def _require_user_action_context_fields(
         errors.append(f"{path}.surfaceId must be a non-empty string")
     if "payload" not in context:
         errors.append(f"{path}.payload must be present")
+
+
+def _is_specialist_action_payload(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return True
+
+    if not isinstance(value, list):
+        return False
+
+    for item in value:
+        if not isinstance(item, Mapping):
+            return False
+        key = item.get("key")
+        if not isinstance(key, str) or not key:
+            return False
+    return True
 
 
 def _require_card_content(

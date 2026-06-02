@@ -10,6 +10,11 @@ from orchestrator_demo.a2a_support.transport import (
     DataPart,
     TextPart,
 )
+from orchestrator_demo.a2ui_support.event_parser import (
+    PlanUserActionParseError,
+    StructuredUserActionRequiredError,
+    parse_user_action,
+)
 from orchestrator_demo.contracts import A2uiPayload
 
 
@@ -47,8 +52,15 @@ def a2ui_user_action_from_part(part: DataPart) -> A2uiUserAction:
         raise ValueError("A2UI userAction DataPart data must be an object")
 
     try:
-        return A2uiUserAction.model_validate(part.data)
-    except ValidationError:
+        action = parse_user_action(part)
+        return A2uiUserAction.model_validate(
+            action.model_dump(by_alias=True, mode="json")
+        )
+    except (
+        PlanUserActionParseError,
+        StructuredUserActionRequiredError,
+        ValidationError,
+    ):
         raise ValueError("invalid A2UI userAction DataPart payload") from None
 
 

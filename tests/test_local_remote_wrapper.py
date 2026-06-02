@@ -174,6 +174,42 @@ async def test_wrapper_preserves_safe_user_action_payload_for_local_specialist()
 
 
 @pytest.mark.asyncio
+async def test_wrapper_accepts_routed_basic_catalog_event_context() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.local_remote_wrapper import LocalRemoteAgentWrapper
+    from orchestrator_demo.agents.product_opportunity import ProductOpportunityAgent
+
+    local_agent = ProductOpportunityAgent()
+    wrapper = LocalRemoteAgentWrapper(local_agent)
+    user_action_payload = {
+        "event": {
+            "name": "specialist_action",
+            "context": {
+                "type": "specialist_action",
+                "surfaceId": "surface_product_opportunity_request_product_opportunity",
+                "payload": {
+                    "selectedProduct": "treasury_services",
+                    "filters": ["cash_visibility", "controls"],
+                },
+            },
+        }
+    }
+
+    # Act
+    response = await wrapper.handle_user_action(user_action_payload)
+
+    # Assert
+    assert response.agent_id == "product_opportunity"
+    assert local_agent.call_count == 1
+    forwarded_request = local_agent.calls[0]
+    assert forwarded_request.agent_id == "product_opportunity"
+    assert forwarded_request.context["user_action_payload"] == user_action_payload
+    assert forwarded_request.context["user_action"] == user_action_payload["event"][
+        "context"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_wrapped_a2ui_specialist_response_payload_is_data_part_compatible() -> None:
     # Arrange
     from a2a.types import DataPart as SdkDataPart
