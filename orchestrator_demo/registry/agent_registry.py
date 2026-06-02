@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import logging
 import runpy
 import sys
-from importlib import invalidate_caches
-from importlib import util as importlib_util
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -59,10 +59,25 @@ class AgentRegistry:
         """Reload config and keep the previous valid registry on failure."""
 
         previous_agent_ids = set(self._descriptors_by_id)
+        previous_config_module = MISSING
+        previous_parent_module_attribute = MISSING
+        restore_config_module_on_error = self._config_path is None
+        if restore_config_module_on_error:
+            previous_config_module = sys.modules.get(self._config_module, MISSING)
+            previous_parent_module_attribute = _get_parent_module_attribute(
+                self._config_module
+            )
+
         try:
-            raw_descriptors, module_to_publish = self._load_raw_descriptors()
+            raw_descriptors = self._load_raw_descriptors()
             next_descriptors = validate_agent_descriptors(raw_descriptors)
         except RegistryValidationError as exc:
+            if restore_config_module_on_error:
+                _restore_config_module(
+                    self._config_module,
+                    previous_config_module,
+                    previous_parent_module_attribute,
+                )
             self._logger.error(
                 "agent registry reload rejected source=%s error=%s",
                 self._source_label,
@@ -70,19 +85,23 @@ class AgentRegistry:
             )
             raise
         except DescriptorValidationError as exc:
+            if restore_config_module_on_error:
+                _restore_config_module(
+                    self._config_module,
+                    previous_config_module,
+                    previous_parent_module_attribute,
+                )
             registry_error = RegistryValidationError(str(exc))
             self._logger.error(
                 "agent registry reload rejected source=%s error=%s",
                 self._source_label,
                 registry_error,
             )
-            raise registry_error from exc
+            raise registry_error from None
 
         next_agent_ids = set(next_descriptors)
         added_agent_ids = sorted(next_agent_ids - previous_agent_ids)
         removed_agent_ids = sorted(previous_agent_ids - next_agent_ids)
-        if module_to_publish is not None:
-            sys.modules[self._config_module] = module_to_publish
         self._descriptors_by_id = dict(sorted(next_descriptors.items()))
         self._logger.info(
             "agent registry reloaded source=%s added=%s removed=%s total=%d",
@@ -128,18 +147,45 @@ class AgentRegistry:
             return str(self._config_path)
         return self._config_module
 
-    def _load_raw_descriptors(self) -> tuple[Any, ModuleType | None]:
+    def _load_raw_descriptors(self) -> Any:
         if self._config_path is not None:
-            return self._load_raw_descriptors_from_path(), None
+            return self._load_raw_descriptors_from_path()
 
+        return self._load_raw_descriptors_from_module_source()
+
+    def _load_raw_descriptors_from_module_source(self) -> Any:
         try:
-            module = _load_module_from_source(self._config_module)
+            importlib.invalidate_caches()
+            spec = importlib.util.find_spec(self._config_module)
+            if spec is None or spec.origin is None:
+                raise RegistryValidationError(
+                    f"registry config module has no source file: {self._config_module}"
+                )
+            source_path = Path(spec.origin)
+            if not source_path.is_file():
+                raise RegistryValidationError(
+                    f"registry config module has no source file: {self._config_module}"
+                )
+            source = source_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            if isinstance(exc, RegistryValidationError):
+                raise
+            raise RegistryValidationError(
+                f"failed to load registry config module: {type(exc).__name__}"
+            ) from None
+
+        module = importlib.util.module_from_spec(spec)
+        module.__file__ = str(source_path)
+        _install_config_module(self._config_module, module)
+        try:
+            code = compile(source, str(source_path), "exec", dont_inherit=True)
+            exec(code, module.__dict__)
         except Exception as exc:
             raise RegistryValidationError(
                 f"failed to load registry config module: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
-        return _available_agents_from_namespace(module), module
+        return _available_agents_from_namespace(module)
 
     def _load_raw_descriptors_from_path(self) -> Any:
         if self._config_path is None:
@@ -150,7 +196,7 @@ class AgentRegistry:
         except Exception as exc:
             raise RegistryValidationError(
                 f"failed to load registry config file: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
         return _available_agents_from_namespace(namespace)
 
@@ -167,20 +213,6 @@ def _available_agents_from_namespace(namespace: ModuleType | dict[str, Any]) -> 
     return raw_descriptors
 
 
-def _load_module_from_source(module_name: str) -> ModuleType:
-    invalidate_caches()
-    spec = importlib_util.find_spec(module_name)
-    if spec is None or spec.origin is None:
-        raise RegistryValidationError(f"cannot find source for {module_name}")
-
-    source_path = Path(spec.origin)
-    source = source_path.read_text(encoding="utf-8")
-    code = compile(source, str(source_path), "exec")
-    module = importlib_util.module_from_spec(spec)
-    exec(code, module.__dict__)
-    return module
-
-
 def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
     agent_ids: list[str] = []
     for agent_id in plan.selected_agents:
@@ -194,6 +226,66 @@ def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
 
 def _format_agent_ids(agent_ids: list[str]) -> str:
     return ",".join(agent_ids) if agent_ids else "-"
+
+
+def _install_config_module(module_name: str, module: ModuleType) -> None:
+    sys.modules[module_name] = module
+    _set_parent_module_attribute(module_name, module)
+
+
+def _restore_config_module(
+    module_name: str,
+    previous_module: Any,
+    previous_parent_module_attribute: Any,
+) -> None:
+    if previous_module is MISSING:
+        sys.modules.pop(module_name, None)
+    else:
+        sys.modules[module_name] = previous_module
+
+    _restore_parent_module_attribute(module_name, previous_parent_module_attribute)
+
+
+def _get_parent_module_attribute(module_name: str) -> Any:
+    parent_name, _, child_name = module_name.rpartition(".")
+    if not parent_name:
+        return MISSING
+
+    parent_module = sys.modules.get(parent_name)
+    if parent_module is None:
+        return MISSING
+
+    return getattr(parent_module, child_name, MISSING)
+
+
+def _set_parent_module_attribute(module_name: str, module: ModuleType) -> None:
+    parent_name, _, child_name = module_name.rpartition(".")
+    if not parent_name:
+        return
+
+    parent_module = sys.modules.get(parent_name)
+    if parent_module is not None:
+        setattr(parent_module, child_name, module)
+
+
+def _restore_parent_module_attribute(
+    module_name: str,
+    previous_parent_module_attribute: Any,
+) -> None:
+    parent_name, _, child_name = module_name.rpartition(".")
+    if not parent_name:
+        return
+
+    parent_module = sys.modules.get(parent_name)
+    if parent_module is None:
+        return
+
+    if previous_parent_module_attribute is MISSING:
+        if hasattr(parent_module, child_name):
+            delattr(parent_module, child_name)
+        return
+
+    setattr(parent_module, child_name, previous_parent_module_attribute)
 
 
 __all__ = [

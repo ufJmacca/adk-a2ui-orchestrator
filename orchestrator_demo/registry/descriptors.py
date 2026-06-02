@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -36,6 +37,22 @@ JSON_SCHEMA_TYPES = frozenset(
         "string",
     }
 )
+JSON_SCHEMA_LIST_CONTAINERS = ("allOf", "anyOf", "oneOf", "prefixItems")
+JSON_SCHEMA_MAP_CONTAINERS = (
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+)
+JSON_SCHEMA_VALUE_CONTAINERS = (
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+)
 SECRET_FIELD_MARKERS = (
     "api_key",
     "apikey",
@@ -46,6 +63,19 @@ SECRET_FIELD_MARKERS = (
     "credential",
     "private_key",
     "openrouter_api_key",
+)
+SECRET_VALUE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+        r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}\b",
+        r"\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}\b",
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        r"\bAIza[0-9A-Za-z_-]{20,}\b",
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        r"\b(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
+    )
 )
 
 
@@ -66,6 +96,7 @@ def validate_agent_descriptors(raw_descriptors: Any) -> dict[str, AgentDescripto
         location = f"AVAILABLE_AGENTS[{index}]"
         _reject_secret_like_fields(raw_descriptor, location)
         descriptor = _coerce_descriptor(raw_descriptor, location)
+        _reject_secret_like_fields(descriptor, location)
         _validate_descriptor_shape(descriptor, location)
 
         if descriptor.agent_id in descriptors_by_id:
@@ -79,14 +110,14 @@ def validate_agent_descriptors(raw_descriptors: Any) -> dict[str, AgentDescripto
 
 def _coerce_descriptor(raw_descriptor: Any, location: str) -> AgentDescriptor:
     if isinstance(raw_descriptor, AgentDescriptor):
-        return raw_descriptor
+        raw_descriptor = raw_descriptor.model_dump(warnings=False)
 
     try:
         return AgentDescriptor.model_validate(raw_descriptor)
     except ValidationError as exc:
         raise DescriptorValidationError(
             f"invalid descriptor at {location}: {_redacted_validation_message(exc)}"
-        ) from exc
+        ) from None
 
 
 def _validate_descriptor_shape(
@@ -108,32 +139,25 @@ def _validate_descriptor_shape(
     _validate_json_schema(descriptor.output_schema, f"{location}.output_schema")
 
 
-def _validate_json_schema(schema: Any, location: str) -> None:
+def _validate_json_schema(
+    schema: Any,
+    location: str,
+    *,
+    allow_boolean: bool = False,
+) -> None:
+    if isinstance(schema, bool) and allow_boolean:
+        return
+
     if not isinstance(schema, Mapping):
         raise DescriptorValidationError(f"{location} must be a JSON-schema object")
 
-    schema_type = schema.get("type")
-    if schema_type is None:
-        raise DescriptorValidationError(f"{location} must declare a JSON-schema type")
+    _validate_required_fields(schema, location)
 
-    invalid_types: list[str] = []
-    if isinstance(schema_type, str):
-        if schema_type not in JSON_SCHEMA_TYPES:
-            invalid_types.append(schema_type)
-    elif isinstance(schema_type, Sequence) and not isinstance(
-        schema_type, (bytes, bytearray)
-    ):
-        for type_name in schema_type:
-            if not isinstance(type_name, str) or type_name not in JSON_SCHEMA_TYPES:
-                invalid_types.append(str(type_name))
-    else:
-        invalid_types.append(str(schema_type))
+    if "type" in schema:
+        _validate_json_schema_type(schema["type"], location)
 
-    if invalid_types:
-        invalid = ", ".join(invalid_types)
-        raise DescriptorValidationError(
-            f"{location} has invalid JSON-schema type: {invalid}"
-        )
+    if "$ref" in schema and not isinstance(schema["$ref"], str):
+        raise DescriptorValidationError(f"{location}.$ref must be a string")
 
     properties = schema.get("properties")
     if properties is not None:
@@ -143,24 +167,198 @@ def _validate_json_schema(schema: Any, location: str) -> None:
             _validate_json_schema(
                 property_schema,
                 f"{location}.properties.{property_name}",
+                allow_boolean=True,
             )
 
     items = schema.get("items")
     if items is not None:
-        _validate_json_schema(items, f"{location}.items")
+        _validate_json_schema(items, f"{location}.items", allow_boolean=True)
 
-    required = schema.get("required")
-    if required is not None and (
-        not isinstance(required, Sequence)
-        or isinstance(required, (str, bytes, bytearray))
-        or any(not isinstance(field_name, str) for field_name in required)
+    for container_name in JSON_SCHEMA_VALUE_CONTAINERS:
+        _validate_schema_value_container(schema, container_name, location)
+
+    for container_name in JSON_SCHEMA_LIST_CONTAINERS:
+        _validate_schema_list_container(schema, container_name, location)
+
+    for container_name in JSON_SCHEMA_MAP_CONTAINERS:
+        _validate_schema_map_container(schema, container_name, location)
+
+    additional_properties = schema.get("additionalProperties")
+    if isinstance(additional_properties, Mapping):
+        _validate_json_schema(
+            additional_properties,
+            f"{location}.additionalProperties",
+            allow_boolean=True,
+        )
+    elif additional_properties is not None and not isinstance(
+        additional_properties,
+        bool,
     ):
-        raise DescriptorValidationError(f"{location}.required must be a string list")
+        raise DescriptorValidationError(
+            f"{location}.additionalProperties must be a JSON-schema object or boolean"
+        )
+
+
+def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
+    required = schema.get("required")
+    if required is not None:
+        if (
+            not isinstance(required, Sequence)
+            or isinstance(required, (str, bytes, bytearray))
+            or any(not isinstance(field_name, str) for field_name in required)
+        ):
+            raise DescriptorValidationError(f"{location}.required must be a string list")
+
+        for index, field_name in enumerate(required):
+            if _is_secret_like_field_name(field_name):
+                raise DescriptorValidationError(
+                    f"descriptor config contains secret-like field: "
+                    f"{location}.required[{index}]"
+                )
+
+    dependent_required = schema.get("dependentRequired")
+    if dependent_required is not None:
+        if not isinstance(dependent_required, Mapping):
+            raise DescriptorValidationError(
+                f"{location}.dependentRequired must be an object"
+            )
+
+        for property_name, field_names in dependent_required.items():
+            if not isinstance(property_name, str):
+                raise DescriptorValidationError(
+                    f"{location}.dependentRequired must map strings to string lists"
+                )
+            if _is_secret_like_field_name(property_name):
+                raise DescriptorValidationError(
+                    f"descriptor config contains secret-like field: "
+                    f"{location}.dependentRequired.{property_name}"
+                )
+            if (
+                not isinstance(field_names, Sequence)
+                or isinstance(field_names, (str, bytes, bytearray))
+                or any(not isinstance(field_name, str) for field_name in field_names)
+            ):
+                raise DescriptorValidationError(
+                    f"{location}.dependentRequired.{property_name} "
+                    "must be a string list"
+                )
+
+            for index, field_name in enumerate(field_names):
+                if _is_secret_like_field_name(field_name):
+                    raise DescriptorValidationError(
+                        f"descriptor config contains secret-like field: "
+                        f"{location}.dependentRequired.{property_name}[{index}]"
+                    )
+
+
+def _validate_json_schema_type(schema_type: Any, location: str) -> None:
+    has_invalid_type = False
+    if isinstance(schema_type, str):
+        if schema_type not in JSON_SCHEMA_TYPES:
+            has_invalid_type = True
+    elif isinstance(schema_type, Sequence) and not isinstance(
+        schema_type, (bytes, bytearray)
+    ):
+        if not schema_type:
+            has_invalid_type = True
+        else:
+            for type_name in schema_type:
+                if not isinstance(type_name, str) or type_name not in JSON_SCHEMA_TYPES:
+                    has_invalid_type = True
+                    break
+    else:
+        has_invalid_type = True
+
+    if has_invalid_type:
+        raise DescriptorValidationError(
+            f"{location}.type has invalid JSON-schema type"
+        )
+
+
+def _validate_schema_value_container(
+    schema: Mapping[str, Any],
+    container_name: str,
+    location: str,
+) -> None:
+    if container_name not in schema:
+        return
+
+    nested_schema = schema[container_name]
+    _validate_json_schema(
+        nested_schema,
+        f"{location}.{container_name}",
+        allow_boolean=True,
+    )
+
+
+def _validate_schema_list_container(
+    schema: Mapping[str, Any],
+    container_name: str,
+    location: str,
+) -> None:
+    nested_schemas = schema.get(container_name)
+    if nested_schemas is None:
+        return
+
+    if not isinstance(nested_schemas, Sequence) or isinstance(
+        nested_schemas,
+        (str, bytes, bytearray),
+    ):
+        raise DescriptorValidationError(
+            f"{location}.{container_name} must be a JSON-schema list"
+        )
+
+    for index, nested_schema in enumerate(nested_schemas):
+        _validate_json_schema(
+            nested_schema,
+            f"{location}.{container_name}[{index}]",
+            allow_boolean=True,
+        )
+
+
+def _validate_schema_map_container(
+    schema: Mapping[str, Any],
+    container_name: str,
+    location: str,
+) -> None:
+    nested_schemas = schema.get(container_name)
+    if nested_schemas is None:
+        return
+
+    if not isinstance(nested_schemas, Mapping):
+        raise DescriptorValidationError(
+            f"{location}.{container_name} must be a JSON-schema object"
+        )
+
+    for nested_name, nested_schema in nested_schemas.items():
+        _validate_json_schema(
+            nested_schema,
+            f"{location}.{container_name}.{nested_name}",
+            allow_boolean=True,
+        )
 
 
 def _reject_secret_like_fields(value: Any, path: str) -> None:
     if isinstance(value, AgentDescriptor):
-        value = value.model_dump()
+        value = value.model_dump(warnings=False)
+
+    if isinstance(value, str):
+        if not _is_schema_type_value_path(path) and _is_secret_like_value(value):
+            raise DescriptorValidationError(
+                f"descriptor config contains secret-like value: {path}"
+            )
+        return
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value_text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        if not _is_schema_type_value_path(path) and _is_secret_like_value(value_text):
+            raise DescriptorValidationError(
+                f"descriptor config contains secret-like value: {path}"
+            )
+        return
 
     if isinstance(value, Mapping):
         for key, child_value in value.items():
@@ -173,14 +371,32 @@ def _reject_secret_like_fields(value: Any, path: str) -> None:
             _reject_secret_like_fields(child_value, child_path)
         return
 
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, Iterable):
         for index, child_value in enumerate(value):
             _reject_secret_like_fields(child_value, f"{path}[{index}]")
 
 
+def _is_secret_like_value(value: str) -> bool:
+    stripped_value = value.strip()
+    return bool(stripped_value) and any(
+        pattern.search(stripped_value) for pattern in SECRET_VALUE_PATTERNS
+    )
+
+
+def _is_schema_type_value_path(path: str) -> bool:
+    if ".input_schema" not in path and ".output_schema" not in path:
+        return False
+    return re.search(r"\.type(?:\[\d+\])?$", path) is not None
+
+
 def _is_secret_like_field_name(field_name: str) -> bool:
-    normalized = field_name.lower().replace("-", "_")
-    return any(marker in normalized for marker in SECRET_FIELD_MARKERS)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", field_name)
+    normalized = normalized.lower().replace("-", "_")
+    compact_normalized = normalized.replace("_", "")
+    return any(
+        marker in normalized or marker.replace("_", "") in compact_normalized
+        for marker in SECRET_FIELD_MARKERS
+    )
 
 
 def _redacted_validation_message(exc: ValidationError) -> str:
