@@ -189,19 +189,54 @@ async def test_specialist_a2ui_surfaces_use_stable_surface_ids_when_produced(
     second_payload = second_response.a2ui_payload
     assert isinstance(first_payload, list)
     assert isinstance(second_payload, list)
-    assert first_payload[0]["createSurface"]["surfaceId"] == first_response.surface_id
-    assert second_payload[0]["createSurface"]["surfaceId"] == second_response.surface_id
-    assert first_payload[1]["updateComponents"]["surfaceId"] == (
+    first_updates = first_payload
+    second_updates = second_payload
+    assert first_updates[0]["createSurface"]["surfaceId"] == first_response.surface_id
+    assert second_updates[0]["createSurface"]["surfaceId"] == second_response.surface_id
+    assert first_updates[1]["updateComponents"]["surfaceId"] == (
         first_response.surface_id
     )
-    assert second_payload[1]["updateComponents"]["surfaceId"] == (
+    assert second_updates[1]["updateComponents"]["surfaceId"] == (
         second_response.surface_id
     )
-    assert first_payload[0]["createSurface"]["theme"]["agentDisplayName"] == (
+    assert first_updates[0]["createSurface"]["theme"]["agentDisplayName"] == (
         agent.display_name
     )
-    assert first_payload[1]["updateComponents"]["components"][0]["id"] == "root"
+    assert first_updates[1]["updateComponents"]["components"][0]["id"] == "root"
 
     validator = _basic_a2ui_validator()
-    validator.validate(first_payload)
-    validator.validate(second_payload)
+    validator.validate(first_updates)
+    validator.validate(second_updates)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_id", sorted(A2UI_SPECIALIST_AGENT_IDS))
+async def test_specialist_a2ui_data_parts_use_top_level_messages_for_sdk(
+    agent_id: str,
+) -> None:
+    # Arrange
+    from a2a.types import DataPart as SdkDataPart
+
+    from orchestrator_demo.a2a_support.part_converters import (
+        a2ui_data_parts_from_payload,
+    )
+    from orchestrator_demo.agents import build_default_specialists
+
+    agent = build_default_specialists()[agent_id]
+    request = _request_for(agent_id)
+
+    # Act
+    response = await agent.handle(request)
+
+    # Assert
+    assert response.a2ui_payload is not None
+    data_parts = a2ui_data_parts_from_payload(response.a2ui_payload)
+    assert [part.data for part in data_parts] == response.a2ui_payload
+    for part in data_parts:
+        assert "a2ui" not in part.data
+        SdkDataPart(data=part.data, metadata=part.metadata)
+
+    a2ui_updates = [part.data for part in data_parts]
+    assert "updates" not in a2ui_updates[0]
+    assert a2ui_updates[0]["createSurface"]["surfaceId"] == response.surface_id
+    _basic_a2ui_validator().validate(a2ui_updates)

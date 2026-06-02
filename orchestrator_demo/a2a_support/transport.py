@@ -205,6 +205,16 @@ class A2AMessage(TransportModel):
     parts: list[A2APartPayload] = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_sdk_message_wire_fields(cls, value: Any) -> Any:
+        return _normalize_sdk_message_fields(
+            value,
+            fallback_timestamp=None,
+            task_id=None,
+            context_id=None,
+        )
+
 
 class TaskStatusUpdate(TransportModel):
     task_id: str = Field(
@@ -229,14 +239,104 @@ class TaskStatusUpdate(TransportModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_sdk_status_model(cls, value: Any) -> Any:
-        if isinstance(value, dict):
+        if not isinstance(value, dict):
+            model_dump = getattr(value, "model_dump", None)
+            if callable(model_dump):
+                value = model_dump(by_alias=True, mode="json")
+
+        if not isinstance(value, dict):
             return value
 
-        model_dump = getattr(value, "model_dump", None)
-        if callable(model_dump):
-            return model_dump(by_alias=True, mode="json")
+        normalized = dict(value)
+        task_id = _first_present(normalized, "taskId", "task_id")
+        context_id = _first_present(normalized, "contextId", "context_id")
+        message = normalized.get("message")
+        if message is not None:
+            normalized["message"] = _normalize_sdk_message_fields(
+                message,
+                fallback_timestamp=normalized.get("timestamp"),
+                task_id=task_id,
+                context_id=context_id,
+            )
 
-        return value
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_child_message_shares_task_context(self) -> "TaskStatusUpdate":
+        if self.message is None:
+            return self
+
+        if self.message.task_id != self.task_id:
+            raise ValueError("status message taskId must match status taskId")
+        if self.message.context_id != self.context_id:
+            raise ValueError("status message contextId must match status contextId")
+
+        return self
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+
+    return None
+
+
+def _coalesce_alias_pair(
+    mapping: dict[str, Any],
+    *,
+    alias_key: str,
+    field_name: str,
+) -> None:
+    if alias_key not in mapping or field_name not in mapping:
+        return
+
+    alias_value = mapping[alias_key]
+    field_value = mapping[field_name]
+    if alias_value is not None and field_value is not None and alias_value != field_value:
+        raise ValueError(f"{alias_key} and {field_name} must match")
+    if alias_value is None and field_value is not None:
+        mapping[alias_key] = field_value
+    mapping.pop(field_name, None)
+
+
+def _setdefault_child_id(
+    mapping: dict[str, Any],
+    *,
+    alias_key: str,
+    field_name: str,
+    value: Any,
+) -> None:
+    _coalesce_alias_pair(mapping, alias_key=alias_key, field_name=field_name)
+    if (
+        value is not None
+        and mapping.get(alias_key) is None
+        and mapping.get(field_name) is None
+    ):
+        mapping[alias_key] = value
+        mapping.pop(field_name, None)
+
+
+def _pop_empty_unsupported_sdk_field(
+    mapping: dict[str, Any],
+    *,
+    field_label: str,
+    keys: tuple[str, ...],
+) -> None:
+    for key in keys:
+        if key not in mapping:
+            continue
+
+        value = mapping.pop(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set, dict)) and len(value) == 0:
+            continue
+
+        raise ValueError(
+            f"{field_label} are not supported by the local A2A transport"
+        )
 
 
 class A2ATask(TransportModel):
@@ -269,21 +369,65 @@ class A2ATask(TransportModel):
             return value
 
         normalized = dict(value)
+        kind = normalized.pop("kind", None)
+        if kind is not None and kind != "task":
+            raise ValueError("kind must be task")
+        _pop_empty_unsupported_sdk_field(
+            normalized,
+            field_label="artifacts",
+            keys=("artifacts",),
+        )
+        if normalized.get("history") is None:
+            normalized.pop("history", None)
+
         status = normalized.get("status")
         if status is not None and not isinstance(status, dict):
             model_dump = getattr(status, "model_dump", None)
             if callable(model_dump):
                 status = model_dump(by_alias=True, mode="json")
 
+        task_id = _first_present(normalized, "id", "taskId", "task_id")
+        context_id = _first_present(normalized, "contextId", "context_id")
         if isinstance(status, dict):
             normalized_status = dict(status)
-            task_id = normalized.get("id") or normalized.get("taskId")
-            context_id = normalized.get("contextId")
-            if task_id is not None:
-                normalized_status.setdefault("taskId", task_id)
-            if context_id is not None:
-                normalized_status.setdefault("contextId", context_id)
+            _setdefault_child_id(
+                normalized_status,
+                alias_key="taskId",
+                field_name="task_id",
+                value=task_id,
+            )
+            _setdefault_child_id(
+                normalized_status,
+                alias_key="contextId",
+                field_name="context_id",
+                value=context_id,
+            )
+            status_timestamp = normalized_status.get("timestamp")
+            message = normalized_status.get("message")
+            if message is not None:
+                normalized_status["message"] = _normalize_sdk_message_fields(
+                    message,
+                    fallback_timestamp=status_timestamp,
+                    task_id=task_id,
+                    context_id=context_id,
+                )
             normalized["status"] = normalized_status
+
+        status_timestamp = None
+        if isinstance(normalized.get("status"), dict):
+            status_timestamp = normalized["status"].get("timestamp")
+        messages = normalized.get("history", normalized.get("messages"))
+        if isinstance(messages, list):
+            normalized["history"] = [
+                _normalize_sdk_message_fields(
+                    message,
+                    fallback_timestamp=status_timestamp,
+                    task_id=task_id,
+                    context_id=context_id,
+                )
+                for message in messages
+            ]
+            normalized.pop("messages", None)
 
         return normalized
 
@@ -323,6 +467,62 @@ class A2ATask(TransportModel):
                 raise ValueError("message contextId must match task contextId")
 
         return self
+
+
+def _normalize_sdk_message_fields(
+    value: Any,
+    *,
+    fallback_timestamp: Any,
+    task_id: Any,
+    context_id: Any,
+) -> Any:
+    root = getattr(value, "root", None)
+    if root is not None:
+        value = root
+
+    if not isinstance(value, dict):
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            value = model_dump(by_alias=True, mode="json")
+
+    if not isinstance(value, dict):
+        return value
+
+    normalized = dict(value)
+    kind = normalized.pop("kind", None)
+    if kind is not None and kind != "message":
+        raise ValueError("message kind must be message")
+    _pop_empty_unsupported_sdk_field(
+        normalized,
+        field_label="message extensions",
+        keys=("extensions",),
+    )
+    _pop_empty_unsupported_sdk_field(
+        normalized,
+        field_label="message referenceTaskIds",
+        keys=("referenceTaskIds", "reference_task_ids"),
+    )
+    if normalized.get("timestamp") is None and fallback_timestamp is not None:
+        normalized["timestamp"] = fallback_timestamp
+    _coalesce_alias_pair(
+        normalized,
+        alias_key="messageId",
+        field_name="message_id",
+    )
+    _setdefault_child_id(
+        normalized,
+        alias_key="taskId",
+        field_name="task_id",
+        value=task_id,
+    )
+    _setdefault_child_id(
+        normalized,
+        alias_key="contextId",
+        field_name="context_id",
+        value=context_id,
+    )
+
+    return normalized
 
 
 class A2uiUserAction(UserAction):

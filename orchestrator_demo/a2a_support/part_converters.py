@@ -1,6 +1,8 @@
 """Helpers for constructing and parsing local A2A transport parts."""
 
-from typing import Any
+from typing import Any, overload
+
+from pydantic import ValidationError
 
 from orchestrator_demo.a2a_support.transport import (
     A2UI_MIME_TYPE,
@@ -8,22 +10,51 @@ from orchestrator_demo.a2a_support.transport import (
     DataPart,
     TextPart,
 )
+from orchestrator_demo.contracts import A2uiPayload
 
 
 def text_part_from_text(text: str) -> TextPart:
     return TextPart(text=text)
 
 
-def a2ui_data_part_from_payload(payload: dict[str, Any]) -> DataPart:
+@overload
+def a2ui_data_part_from_payload(payload: dict[str, Any]) -> DataPart: ...
+
+
+@overload
+def a2ui_data_part_from_payload(payload: list[dict[str, Any]]) -> list[DataPart]: ...
+
+
+def a2ui_data_part_from_payload(payload: A2uiPayload) -> DataPart | list[DataPart]:
+    if isinstance(payload, list):
+        return a2ui_data_parts_from_payload(payload)
+
     return DataPart(data=payload, metadata={"mimeType": A2UI_MIME_TYPE})
 
 
+def a2ui_data_parts_from_payload(payload: A2uiPayload) -> list[DataPart]:
+    if isinstance(payload, list):
+        return [
+            DataPart(data=message, metadata={"mimeType": A2UI_MIME_TYPE})
+            for message in payload
+        ]
+
+    return [DataPart(data=payload, metadata={"mimeType": A2UI_MIME_TYPE})]
+
+
 def a2ui_user_action_from_part(part: DataPart) -> A2uiUserAction:
-    return A2uiUserAction.model_validate(part.data)
+    if not isinstance(part.data, dict):
+        raise ValueError("A2UI userAction DataPart data must be an object")
+
+    try:
+        return A2uiUserAction.model_validate(part.data)
+    except ValidationError:
+        raise ValueError("invalid A2UI userAction DataPart payload") from None
 
 
 __all__ = [
     "a2ui_data_part_from_payload",
+    "a2ui_data_parts_from_payload",
     "a2ui_user_action_from_part",
     "text_part_from_text",
 ]
