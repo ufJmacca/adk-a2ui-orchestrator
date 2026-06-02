@@ -13,6 +13,7 @@ from orchestrator_demo.a2ui_support.renderer_contract import (
     prepare_specialist_a2ui_for_renderer,
 )
 from orchestrator_demo.agents import SpecialistAgent, build_default_specialists
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import (
     ExecutionPlan,
     RoutingDecision,
@@ -211,6 +212,18 @@ class OrchestratorService:
         plan = self._planner.create_plan(context)
         self._approval_store.add_draft(plan)
         self._contexts_by_plan_id[plan.plan_id] = context
+        log_audit_event(
+            "plan_proposed",
+            {
+                "plan_id": plan.plan_id,
+                "approval_surface_id": plan.approval_surface_id,
+                "detected_intents": list(plan.detected_intents),
+                "selected_agent_ids": list(plan.selected_agents),
+                "step_ids": [step.step_id for step in plan.steps],
+                "step_count": len(plan.steps),
+                "approval_required": True,
+            },
+        )
         a2ui_parts = prepare_approval_a2ui_for_renderer(
             build_approval_canvas(
                 plan,

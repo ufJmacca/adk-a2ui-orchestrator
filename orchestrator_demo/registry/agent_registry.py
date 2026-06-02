@@ -11,6 +11,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from orchestrator_demo.app.logging import log_audit_event, redact_text_for_audit
 from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan
 from orchestrator_demo.registry.descriptors import (
     DescriptorValidationError,
@@ -78,10 +79,16 @@ class AgentRegistry:
                     previous_config_module,
                     previous_parent_module_attribute,
                 )
+            safe_error = redact_text_for_audit(exc)
+            log_audit_event(
+                "registry_reload_rejected",
+                {"source": self._source_label, "error": safe_error},
+                level=logging.ERROR,
+            )
             self._logger.error(
                 "agent registry reload rejected source=%s error=%s",
                 self._source_label,
-                exc,
+                safe_error,
             )
             raise
         except DescriptorValidationError as exc:
@@ -92,10 +99,16 @@ class AgentRegistry:
                     previous_parent_module_attribute,
                 )
             registry_error = RegistryValidationError(str(exc))
+            safe_error = redact_text_for_audit(registry_error)
+            log_audit_event(
+                "registry_reload_rejected",
+                {"source": self._source_label, "error": safe_error},
+                level=logging.ERROR,
+            )
             self._logger.error(
                 "agent registry reload rejected source=%s error=%s",
                 self._source_label,
-                registry_error,
+                safe_error,
             )
             raise registry_error from None
         except Exception as exc:
@@ -108,10 +121,16 @@ class AgentRegistry:
             registry_error = RegistryValidationError(
                 f"failed to validate registry config: {type(exc).__name__}"
             )
+            safe_error = redact_text_for_audit(registry_error)
+            log_audit_event(
+                "registry_reload_rejected",
+                {"source": self._source_label, "error": safe_error},
+                level=logging.ERROR,
+            )
             self._logger.error(
                 "agent registry reload rejected source=%s error=%s",
                 self._source_label,
-                registry_error,
+                safe_error,
             )
             raise registry_error from None
 
@@ -119,6 +138,15 @@ class AgentRegistry:
         added_agent_ids = sorted(next_agent_ids - previous_agent_ids)
         removed_agent_ids = sorted(previous_agent_ids - next_agent_ids)
         self._descriptors_by_id = dict(sorted(next_descriptors.items()))
+        log_audit_event(
+            "registry_reload",
+            {
+                "source": self._source_label,
+                "added_agent_ids": added_agent_ids,
+                "removed_agent_ids": removed_agent_ids,
+                "total_agents": len(self._descriptors_by_id),
+            },
+        )
         self._logger.info(
             "agent registry reloaded source=%s added=%s removed=%s total=%d",
             self._source_label,
