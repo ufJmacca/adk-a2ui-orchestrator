@@ -138,7 +138,17 @@ def test_core_contracts_accept_valid_business_banking_workflow() -> None:
         response_id="response_internal_notes",
         agent_id="internal_knowledge",
         content="ABC Manufacturing has two open follow-ups.",
-        a2ui_payload={"surfaceId": "surface_internal_notes", "components": []},
+        a2ui_payload=[
+            {
+                "version": "v0.9",
+                "createSurface": {
+                    "surfaceId": "surface_internal_notes",
+                    "catalogId": (
+                        "https://a2ui.org/specification/v0_9/basic_catalog.json"
+                    ),
+                },
+            }
+        ],
         surface_id="surface_internal_notes",
     )
     graph = GraphSpec(
