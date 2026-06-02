@@ -152,14 +152,28 @@ class AdkGraphRuntime:
         requests: list[SpecialistRequest] = []
         responses: list[SpecialistResponse] = []
         step_outputs: dict[str, dict[str, Any]] = {}
-        _raise_for_missing_specialist_handlers(
-            plan=plan,
-            graph=graph,
-            specialist_handlers=self._specialist_handlers,
-            events=events,
-            requests=requests,
-            responses=responses,
-        )
+        try:
+            _raise_for_missing_specialist_handlers(
+                plan=plan,
+                graph=graph,
+                specialist_handlers=self._specialist_handlers,
+                events=events,
+                requests=requests,
+                responses=responses,
+            )
+        except GraphRuntimeError as exc:
+            log_audit_event(
+                "graph_execution_failed",
+                {
+                    "graph_id": graph.graph_id,
+                    "plan_id": graph.plan_id,
+                    "error_type": type(exc).__name__,
+                    "status_event_count": len(events),
+                    "request_count": len(requests),
+                    "response_count": len(responses),
+                },
+            )
+            raise
 
         try:
             workflow = self._build_workflow(

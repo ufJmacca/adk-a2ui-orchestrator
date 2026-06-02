@@ -45,6 +45,7 @@ UserActionType = Literal[
     "specialist_action",
 ]
 A2uiPayload = dict[str, Any] | list[dict[str, Any]]
+AGENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]*$"
 PLAN_USER_ACTION_TYPES: set[str] = {
     "approve_plan",
     "reject_plan",
@@ -283,7 +284,7 @@ class ExecutionPlan(ContractModel):
 
 
 class AgentDescriptor(ContractModel):
-    agent_id: str = Field(min_length=1)
+    agent_id: str = Field(pattern=AGENT_ID_PATTERN)
     display_name: str = Field(min_length=1)
     capabilities: list[str]
     input_schema: dict[str, Any]

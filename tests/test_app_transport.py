@@ -1088,6 +1088,182 @@ def test_artifacts_replay_merges_incremental_data_model_path_value_updates() -> 
     }
 
 
+def test_artifacts_replay_resets_snapshot_when_surface_is_recreated() -> None:
+    # Arrange
+    from orchestrator_demo.app.server import LocalOrchestratorApp
+
+    app = LocalOrchestratorApp()
+    surface_id = "surface_recreated_approval"
+    metadata = {"mimeType": "application/json+a2ui"}
+
+    # Act
+    app._merge_result_a2ui(
+        [
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": surface_id,
+                        "catalogId": (
+                            "https://a2ui.org/specification/v0_9/"
+                            "basic_catalog.json"
+                        ),
+                    },
+                },
+                "metadata": metadata,
+            },
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "updateDataModel": {
+                        "surfaceId": surface_id,
+                        "data": {"removed": "stale"},
+                    },
+                },
+                "metadata": metadata,
+            },
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "updateComponents": {
+                        "surfaceId": surface_id,
+                        "components": [
+                            {
+                                "id": "component_removed_step",
+                                "component": "Text",
+                                "text": "Removed step",
+                            },
+                            {
+                                "id": "component_kept_step",
+                                "component": "Text",
+                                "text": "Original kept step",
+                            },
+                        ],
+                    },
+                },
+                "metadata": metadata,
+            },
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": surface_id,
+                        "catalogId": (
+                            "https://a2ui.org/specification/v0_9/"
+                            "basic_catalog.json"
+                        ),
+                    },
+                },
+                "metadata": metadata,
+            },
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "updateComponents": {
+                        "surfaceId": surface_id,
+                        "components": [
+                            {
+                                "id": "component_kept_step",
+                                "component": "Text",
+                                "text": "Updated kept step",
+                            }
+                        ],
+                    },
+                },
+                "metadata": metadata,
+            },
+        ]
+    )
+    artifacts = app.latest_artifacts()
+
+    # Assert
+    replay_payloads = [part["data"] for part in artifacts["a2uiParts"]]
+    assert not any("updateDataModel" in payload for payload in replay_payloads)
+    replay_update = next(
+        payload["updateComponents"]
+        for payload in replay_payloads
+        if "updateComponents" in payload
+    )
+    assert replay_update["components"] == [
+        {
+            "id": "component_kept_step",
+            "component": "Text",
+            "text": "Updated kept step",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        [
+            {"customer": "ABC Manufacturing"},
+            {"customer": "XYZ Supplies"},
+        ],
+        False,
+    ],
+)
+def test_artifacts_replay_preserves_non_object_data_model_snapshots(
+    snapshot: Any,
+) -> None:
+    # Arrange
+    from orchestrator_demo.app.server import LocalOrchestratorApp
+
+    app = LocalOrchestratorApp()
+    surface_id = "surface_data_model_snapshot_replay"
+    metadata = {"mimeType": "application/json+a2ui"}
+
+    # Act
+    app._merge_result_a2ui(
+        [
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "createSurface": {
+                        "surfaceId": surface_id,
+                        "catalogId": (
+                            "https://a2ui.org/specification/v0_9/"
+                            "basic_catalog.json"
+                        ),
+                    },
+                },
+                "metadata": metadata,
+            },
+            {
+                "type": "data",
+                "data": {
+                    "version": "v0.9",
+                    "updateDataModel": {
+                        "surfaceId": surface_id,
+                        "data": snapshot,
+                    },
+                },
+                "metadata": metadata,
+            },
+        ]
+    )
+    artifacts = app.latest_artifacts()
+
+    # Assert
+    replay_payloads = [part["data"] for part in artifacts["a2uiParts"]]
+    replay_update = next(
+        payload["updateDataModel"]
+        for payload in replay_payloads
+        if "updateDataModel" in payload
+    )
+    assert replay_update == {
+        "surfaceId": surface_id,
+        "path": "/",
+        "value": snapshot,
+    }
+
+
 def test_downstream_a2ui_surface_is_exposed_and_specialist_action_routes_by_surface() -> (
     None
 ):

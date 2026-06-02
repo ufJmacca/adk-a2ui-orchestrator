@@ -52,6 +52,26 @@ def _descriptor_source(agent_id: str, *, display_name: str | None = None) -> str
     )"""
 
 
+def _descriptor_mapping_source(
+    agent_id: str,
+    *,
+    display_name: str | None = None,
+) -> str:
+    display_name = display_name or agent_id.replace("_", " ").title()
+    return repr(
+        {
+            "agent_id": agent_id,
+            "display_name": display_name,
+            "capabilities": ["business banking support"],
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "a2ui_catalogs": ["basic"],
+            "routing_examples": [f"Handle a {agent_id} request."],
+            "execution_mode": "local_llm",
+        }
+    )
+
+
 def _write_config(path: Path, descriptor_sources: list[str]) -> None:
     path.write_text(
         "from orchestrator_demo.contracts import AgentDescriptor\n\n"
@@ -179,6 +199,26 @@ def test_registry_descriptor_accessors_return_defensive_deep_copies(
     assert registry.agent_ids() == ["internal_knowledge"]
     assert registry.is_available_for_new_plan("internal_knowledge") is True
     assert registry.is_available_for_new_plan("tampered_agent") is False
+
+
+def test_registry_reload_rejects_agent_ids_that_cannot_be_embedded_in_contract_ids(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import RegistryValidationError
+
+    config_path = tmp_path / "agent_config.py"
+    _write_config(config_path, [_descriptor_source("internal_knowledge")])
+    registry = _registry_from(config_path)
+    _write_config(config_path, [_descriptor_mapping_source("cash flow")])
+
+    # Act / Assert
+    with pytest.raises(RegistryValidationError) as exc_info:
+        registry.reload()
+
+    assert "invalid descriptor at AVAILABLE_AGENTS[0]" in str(exc_info.value)
+    assert "agent_id" in str(exc_info.value)
+    assert registry.agent_ids() == ["internal_knowledge"]
 
 
 def test_module_registry_reload_reads_source_when_bytecode_cache_is_stale(

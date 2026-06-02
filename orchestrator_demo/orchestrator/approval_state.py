@@ -25,7 +25,10 @@ from orchestrator_demo.orchestrator.graph_runtime import (
     GraphRuntimeError,
     default_specialist_handlers,
 )
-from orchestrator_demo.orchestrator.planner import step_metadata_for_agent
+from orchestrator_demo.orchestrator.planner import (
+    normalize_parallel_groups,
+    step_metadata_for_agent,
+)
 
 
 PlanState = Literal["draft", "approving", "approved", "rejected"]
@@ -343,7 +346,7 @@ class ApprovalStateStore:
         else:
             raise PlanMutationError(f"unsupported draft mutation: {action.type}")
 
-        candidate_plan = _with_next_version(next_plan)
+        candidate_plan = _with_next_version(normalize_parallel_groups(next_plan))
         _require_final_synthesis_preserved(plan, candidate_plan)
         refreshed_parts = approval_canvas_data_parts(
             candidate_plan,

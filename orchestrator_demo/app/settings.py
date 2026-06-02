@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     )
     or_app_name: str | None = Field(default=None, alias="OR_APP_NAME")
     or_site_url: str | None = Field(default=None, alias="OR_SITE_URL")
+    orchestrator_app_host: str = Field(
+        default="127.0.0.1",
+        alias="ORCHESTRATOR_APP_HOST",
+    )
+    orchestrator_app_port: int = Field(
+        default=8000,
+        ge=0,
+        le=65535,
+        alias="ORCHESTRATOR_APP_PORT",
+    )
 
     @field_validator("openrouter_api_key")
     @classmethod
@@ -44,7 +54,7 @@ class Settings(BaseSettings):
 
         return value
 
-    @field_validator("llm_model", "openrouter_api_base")
+    @field_validator("llm_model", "openrouter_api_base", "orchestrator_app_host")
     @classmethod
     def require_non_empty_text(cls, value: str) -> str:
         if not value.strip():

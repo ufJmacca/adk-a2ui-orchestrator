@@ -746,6 +746,8 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
 
     event = value.get("event")
     if not isinstance(event, Mapping):
+        if "event" in value:
+            errors.append(f"{path}.event must be an object")
         return
 
     plan_action_event = _is_plan_action_event(event, None)

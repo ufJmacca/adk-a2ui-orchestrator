@@ -209,6 +209,26 @@ def test_core_contracts_accept_valid_business_banking_workflow() -> None:
     assert status_event.status == "step_started"
 
 
+def test_agent_descriptor_rejects_ids_that_cannot_be_embedded_in_contract_ids() -> None:
+    # Arrange
+    from orchestrator_demo.contracts import AgentDescriptor
+
+    # Act / Assert
+    with pytest.raises(ValidationError) as exc_info:
+        AgentDescriptor(
+            agent_id="cash flow",
+            display_name="Cash Flow Agent",
+            capabilities=["cash flow analysis"],
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            a2ui_catalogs=["basic"],
+            routing_examples=["Analyze cash flow."],
+            execution_mode="local_llm",
+        )
+
+    assert "agent_id" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_error"),
     [

@@ -200,6 +200,16 @@ def _plan_metadata_text(part: DataPart) -> str:
     return metadata["text"]
 
 
+def _parallel_groups_text(part: DataPart) -> str:
+    components = part.data["updateComponents"]["components"]
+    parallel_groups = next(
+        component
+        for component in components
+        if component["id"] == "component_plan_meeting_prep_parallel_groups"
+    )
+    return parallel_groups["text"]
+
+
 def _objective_text(part: DataPart) -> str:
     components = part.data["updateComponents"]["components"]
     objective = next(
@@ -504,6 +514,44 @@ def test_remove_reorder_replace_and_add_instruction_mutations_refresh_draft() ->
     assert (
         "Additional instruction: Emphasize open follow-up items."
         in record.draft_plan.steps[0].instruction
+    )
+
+
+def test_remove_step_to_single_workstream_clears_stale_parallel_group() -> None:
+    # Arrange
+    store, _original_plan = _store_with_meeting_plan()
+
+    # Act
+    first_edit = store.apply_user_action(
+        _action("remove_step", {"stepId": "step_industry_research"})
+    )
+    second_edit = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "remove_step",
+                "surfaceId": "surface_plan_meeting_prep",
+                "payload": {
+                    "planId": "plan_meeting_prep",
+                    "editedPlanVersion": 2,
+                    "stepId": "step_relationship_summary",
+                },
+            }
+        }
+    )
+    record = store.get("plan_meeting_prep")
+
+    # Assert
+    assert first_edit.status == "draft_updated"
+    assert second_edit.refreshed_a2ui_part is not None
+    assert record.draft_plan.plan_version == 3
+    assert [step.agent_id for step in record.draft_plan.steps] == [
+        "internal_knowledge",
+        "synthesis",
+    ]
+    assert all(step.parallel_group is None for step in record.draft_plan.steps)
+    assert record.draft_plan.steps[-1].depends_on == ["step_internal_knowledge"]
+    assert "Parallel groups: none" in _parallel_groups_text(
+        second_edit.refreshed_a2ui_part
     )
 
 

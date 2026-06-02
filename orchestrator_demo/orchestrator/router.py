@@ -116,14 +116,13 @@ class RequestRouter:
             available_agents,
         )
         if unavailable_agents:
-            unavailable = ", ".join(unavailable_agents)
             return RoutingDecision(
                 path="clarification_required",
                 selected_agent=None,
                 confidence=confidence,
                 reason=(
                     "A safe route or plan cannot be formed because required "
-                    f"agents are unavailable: {unavailable}."
+                    "specialist support is unavailable."
                 ),
             )
 

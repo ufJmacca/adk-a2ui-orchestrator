@@ -377,8 +377,8 @@ async def test_router_requires_implicit_synthesis_before_plan_required() -> None
     assert context.llm_assessment.required_agents == ["data_quality"]
     assert context.decision.path == "clarification_required"
     assert context.decision.selected_agent is None
-    assert "synthesis" in context.decision.reason
     assert "unavailable" in context.decision.reason.casefold()
+    assert "synthesis" not in context.decision.reason
 
 
 def test_planner_does_not_require_synthesis_for_duplicate_single_workstream() -> None:
@@ -453,7 +453,7 @@ def test_planner_generates_unique_step_ids_for_slug_colliding_agent_ids() -> Non
             intents=["unknown"],
             confidence=0.9,
             complexity="complex",
-            required_agents=["foo bar", "foo_bar", "synthesis"],
+            required_agents=["Foo_Bar", "foo_bar", "synthesis"],
             rationale="Dynamic agents need combined review and synthesis.",
         ),
         decision=RoutingDecision(
@@ -465,7 +465,7 @@ def test_planner_generates_unique_step_ids_for_slug_colliding_agent_ids() -> Non
     )
     planner = DraftExecutionPlanner(
         registry=_StaticRegistry(
-            [_descriptor("foo bar"), _descriptor("foo_bar"), _descriptor("synthesis")]
+            [_descriptor("Foo_Bar"), _descriptor("foo_bar"), _descriptor("synthesis")]
         )
     )
 
@@ -473,9 +473,9 @@ def test_planner_generates_unique_step_ids_for_slug_colliding_agent_ids() -> Non
     plan = planner.create_plan(context)
 
     # Assert
-    assert plan.selected_agents == ["foo bar", "foo_bar", "synthesis"]
+    assert plan.selected_agents == ["Foo_Bar", "foo_bar", "synthesis"]
     assert [step.agent_id for step in plan.steps] == [
-        "foo bar",
+        "Foo_Bar",
         "foo_bar",
         "synthesis",
     ]
@@ -617,7 +617,8 @@ async def test_non_hero_plan_required_route_drafts_plan_before_specialist_call()
     assert "Synthetic demo data only" in plan.risk_notes
     assert [step.agent_id for step in plan.steps] == ["data_quality", "synthesis"]
     assert plan.steps[0].expected_output == "Data quality gaps and clarification needs."
-    assert plan.steps[0].parallel_group == "parallel_research"
+    assert plan.steps[0].parallel_group is None
+    assert "parallelGroup" not in _approved_context_for_step(plan, plan.steps[0])
     assert plan.steps[1].depends_on == [plan.steps[0].step_id]
     assert plan.immutable_after_approval is True
 

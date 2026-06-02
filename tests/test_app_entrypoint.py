@@ -22,9 +22,11 @@ def _start_app_process(
     *,
     cwd: Path,
     env: dict[str, str],
+    configure_bind_env: bool = True,
 ) -> subprocess.Popen[str]:
-    env["ORCHESTRATOR_APP_HOST"] = "127.0.0.1"
-    env["ORCHESTRATOR_APP_PORT"] = "0"
+    if configure_bind_env:
+        env["ORCHESTRATOR_APP_HOST"] = "127.0.0.1"
+        env["ORCHESTRATOR_APP_PORT"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
     return subprocess.Popen(
         [sys.executable, "-m", "orchestrator_demo.app"],
@@ -112,9 +114,11 @@ def test_app_module_entrypoint_wires_configured_model_into_server(monkeypatch) -
         captured["app"] = app
         return FakeServer()
 
-    monkeypatch.setattr(app_main, "build_litellm_model", lambda: fake_model)
+    monkeypatch.setattr(app_main, "build_litellm_model", lambda settings: fake_model)
     monkeypatch.setattr(app_main, "LiteLlmIntentClassifier", RecordingClassifier)
     monkeypatch.setattr(app_main, "create_server", fake_create_server)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setenv("LLM_MODEL", "openrouter/test/model")
     monkeypatch.setenv("ORCHESTRATOR_APP_HOST", "127.0.0.1")
     monkeypatch.setenv("ORCHESTRATOR_APP_PORT", "0")
 
@@ -129,6 +133,60 @@ def test_app_module_entrypoint_wires_configured_model_into_server(monkeypatch) -
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 0
     assert captured["served"] is True
+    assert captured["stopped"] is True
+
+
+def test_app_module_entrypoint_uses_dotenv_bind_host_and_port(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.app import __main__ as app_main
+
+    captured = {}
+
+    class FakeServer:
+        base_url = "http://0.0.0.0:8123"
+
+        def serve_forever(self) -> None:
+            raise KeyboardInterrupt
+
+        def stop(self) -> None:
+            captured["stopped"] = True
+
+    def fake_create_server(*, host, port, app):
+        captured["host"] = host
+        captured["port"] = port
+        captured["app"] = app
+        return FakeServer()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("ORCHESTRATOR_APP_HOST", raising=False)
+    monkeypatch.delenv("ORCHESTRATOR_APP_PORT", raising=False)
+    monkeypatch.setattr(app_main, "build_litellm_model", lambda settings: object())
+    monkeypatch.setattr(app_main, "create_server", fake_create_server)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENROUTER_API_KEY=dotenv-openrouter-key",
+                "LLM_MODEL=openrouter/test/model",
+                "ORCHESTRATOR_APP_HOST=0.0.0.0",
+                "ORCHESTRATOR_APP_PORT=8123",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Act
+    result = app_main.main()
+
+    # Assert
+    assert result == 0
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 8123
     assert captured["stopped"] is True
 
 

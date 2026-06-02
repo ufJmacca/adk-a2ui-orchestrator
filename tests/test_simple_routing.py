@@ -268,6 +268,39 @@ async def test_unavailable_classifier_agent_returns_clarification_required() -> 
 
 
 @pytest.mark.asyncio
+async def test_unavailable_classifier_agent_reason_does_not_echo_agent_id() -> None:
+    # Arrange
+    user_input = "Use this pasted key if needed: sk-or-v1-leakedclassifiersecret."
+    leaked_agent_id = "sk-or-v1-leakedclassifiersecret"
+    slm_suggestion = IntentSuggestion(intent="internal_knowledge", confidence=0.9)
+    slm_client = _RecordingSlmClient(slm_suggestion)
+    classifier = _RecordingClassifier(
+        LlmIntentAssessment(
+            intents=["internal_knowledge"],
+            confidence=0.88,
+            complexity="simple",
+            required_agents=[leaked_agent_id],
+            rationale="The classifier echoed a pasted secret-like value.",
+        ),
+        slm_client,
+    )
+    router = RequestRouter(
+        slm_client=slm_client,
+        intent_classifier=classifier,
+        registry=AgentRegistry.from_default_config(),
+    )
+
+    # Act
+    context = await router.route_request(user_input)
+
+    # Assert
+    assert context.decision.path == "clarification_required"
+    assert "unavailable" in context.decision.reason.casefold()
+    assert leaked_agent_id not in context.decision.reason
+    assert "sk-or-v1" not in context.decision.reason
+
+
+@pytest.mark.asyncio
 async def test_high_confidence_single_agent_complex_assessment_requires_plan() -> None:
     # Arrange
     user_input = "Summarize the internal notes and prepare a follow-up workflow."

@@ -327,6 +327,11 @@ class _A2uiReplayCache:
             if isinstance(surface_id, str):
                 snapshot = self._snapshot_for(surface_id)
                 snapshot.create_part = deepcopy(dict(part))
+                snapshot.data_model = {}
+                snapshot.data_model_message = None
+                snapshot.update_components_message = None
+                snapshot.components_by_id.clear()
+                snapshot.component_order.clear()
                 return
 
         update_data_model = payload.get("updateDataModel")
@@ -673,8 +678,7 @@ def _applied_data_model_update(
     has_path = "path" in update_data_model
     has_value = "value" in update_data_model
     if not has_path and not has_value:
-        data = update_data_model.get("data")
-        return deepcopy(data) if isinstance(data, Mapping) else {}
+        return deepcopy(update_data_model["data"]) if "data" in update_data_model else {}
 
     parts = _safe_data_path_parts(update_data_model.get("path", "/"))
     if parts is None:

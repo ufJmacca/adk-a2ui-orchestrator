@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from orchestrator_demo.contracts import AgentDescriptor
+from orchestrator_demo.contracts import AGENT_ID_PATTERN, AgentDescriptor
 
 
 REQUIRED_SPECIALIST_AGENT_IDS = frozenset(
@@ -57,6 +57,7 @@ JSON_SCHEMA_VALUE_CONTAINERS = (
     "unevaluatedItems",
     "unevaluatedProperties",
 )
+AGENT_ID_TOKEN_RE = re.compile(AGENT_ID_PATTERN)
 SECRET_FIELD_MARKERS = (
     "api_key",
     "apikey",
@@ -132,6 +133,11 @@ def _validate_descriptor_shape(
     descriptor: AgentDescriptor,
     location: str,
 ) -> None:
+    if AGENT_ID_TOKEN_RE.fullmatch(descriptor.agent_id) is None:
+        raise DescriptorValidationError(
+            f"{location}.agent_id must match {AGENT_ID_PATTERN}"
+        )
+
     list_fields = {
         "capabilities": descriptor.capabilities,
         "a2ui_catalogs": descriptor.a2ui_catalogs,

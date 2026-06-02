@@ -51,6 +51,8 @@ def test_settings_load_required_and_optional_openrouter_values(
     monkeypatch.setenv("OPENROUTER_API_BASE", "https://example.test/api/v1")
     monkeypatch.setenv("OR_APP_NAME", "relationship-manager-demo")
     monkeypatch.setenv("OR_SITE_URL", "https://relationship-manager.example.test")
+    monkeypatch.setenv("ORCHESTRATOR_APP_HOST", "0.0.0.0")
+    monkeypatch.setenv("ORCHESTRATOR_APP_PORT", "8123")
 
     from orchestrator_demo.app.settings import load_settings
 
@@ -63,6 +65,8 @@ def test_settings_load_required_and_optional_openrouter_values(
     assert settings.openrouter_api_base == "https://example.test/api/v1"
     assert settings.or_app_name == "relationship-manager-demo"
     assert settings.or_site_url == "https://relationship-manager.example.test"
+    assert settings.orchestrator_app_host == "0.0.0.0"
+    assert settings.orchestrator_app_port == 8123
 
 
 def test_missing_required_settings_fail_fast_with_redacted_error(

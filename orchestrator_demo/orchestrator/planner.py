@@ -121,13 +121,15 @@ def _build_steps(
         for agent_id, step_id in step_ids_by_agent_id.items()
         if agent_id != SYNTHESIS_AGENT_ID
     ]
+    parallel_group = (
+        primary_parallel_group if len(non_synthesis_step_ids) > 1 else None
+    )
     steps: list[PlanStep] = []
 
     for agent_id in selected_agent_ids:
         metadata = step_metadata_for_agent(agent_id, objective)
         is_synthesis = agent_id == SYNTHESIS_AGENT_ID
         depends_on = non_synthesis_step_ids if is_synthesis else []
-        parallel_group = None if is_synthesis else primary_parallel_group
 
         steps.append(
             PlanStep(
@@ -137,11 +139,57 @@ def _build_steps(
                 depends_on=depends_on,
                 expected_output=metadata.expected_output,
                 data_source_categories=metadata.data_source_categories,
-                parallel_group=parallel_group,
+                parallel_group=None if is_synthesis else parallel_group,
             )
         )
 
     return steps
+
+
+def normalize_parallel_groups(plan: ExecutionPlan) -> ExecutionPlan:
+    """Remove stale parallel metadata that no longer represents branches."""
+
+    parallel_group_counts: dict[str, int] = {}
+    for step in plan.steps:
+        if step.agent_id == SYNTHESIS_AGENT_ID or step.parallel_group is None:
+            continue
+        parallel_group_counts[step.parallel_group] = (
+            parallel_group_counts.get(step.parallel_group, 0) + 1
+        )
+    valid_parallel_groups = {
+        group_id
+        for group_id, count in parallel_group_counts.items()
+        if count > 1
+    }
+
+    normalized_steps: list[PlanStep] = []
+    changed = False
+    for step in plan.steps:
+        next_parallel_group = (
+            step.parallel_group
+            if step.parallel_group in valid_parallel_groups
+            and step.agent_id != SYNTHESIS_AGENT_ID
+            else None
+        )
+        changed = changed or next_parallel_group != step.parallel_group
+        normalized_steps.append(
+            _step_copy(step, parallel_group=next_parallel_group)
+        )
+
+    if not changed:
+        return plan
+
+    payload = plan.model_dump()
+    payload["steps"] = [
+        step.model_dump(mode="json") for step in normalized_steps
+    ]
+    return ExecutionPlan.model_validate(payload)
+
+
+def _step_copy(step: PlanStep, **updates: object) -> PlanStep:
+    payload = step.model_dump()
+    payload.update(updates)
+    return PlanStep.model_validate(payload)
 
 
 def _step_ids_by_agent_id(selected_agent_ids: Sequence[str]) -> dict[str, str]:
@@ -364,4 +412,5 @@ __all__ = [
     "PlanCreationError",
     "PlanRequiredError",
     "SYNTHESIS_AGENT_ID",
+    "normalize_parallel_groups",
 ]

@@ -139,6 +139,11 @@ def test_sequential_workflow_executes_steps_in_plan_order_and_collects_outputs()
         "credit_risk",
         "synthesis",
     ]
+    assert result.graph.pattern == "sequential"
+    assert {
+        event.status
+        for event in result.status_events
+    }.isdisjoint({"parallel_branch_started", "parallel_branch_completed"})
     synthesis_request = result.specialist_requests[-1]
     assert synthesis_request.context["dependencyOutputs"] == {
         "step_credit_risk": {

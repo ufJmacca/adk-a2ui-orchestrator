@@ -265,12 +265,27 @@ class SurfaceRouteRegistry:
             _log_ui_event_routed(result)
             return result
 
-        response = handler(candidate)
-        if isawaitable(response):
-            response = await response
+        try:
+            response = handler(candidate)
+            if isawaitable(response):
+                response = await response
+        except Exception as exc:
+            result = SurfaceRouteResult(
+                status="error",
+                surface_id=action.surface_id,
+                owner=owner,
+                error=_routing_error(
+                    code="owner_handler_failed",
+                    surface_id=action.surface_id,
+                    message=f"Specialist userAction handler failed: {exc}",
+                ),
+                original_payload=candidate,
+            )
+            _log_ui_event_routed(result)
+            raise
 
         try:
-            self._register_specialist_response_surfaces(response, owner=owner)
+            self._validate_specialist_response_surfaces(response, owner=owner)
         except SurfaceOwnershipError as exc:
             result = SurfaceRouteResult(
                 status="error",
@@ -358,7 +373,7 @@ class SurfaceRouteRegistry:
             source=source,
         )
 
-    def _register_specialist_response_surfaces(
+    def _validate_specialist_response_surfaces(
         self,
         response: Any,
         *,
@@ -401,9 +416,6 @@ class SurfaceRouteRegistry:
                         agent_id=owner.owner_id,
                     ),
                 )
-
-        self._owners_by_surface_id = staged_owners
-        self._components_by_surface_id = staged_components
 
     def _clear_specialist_owned_surface_or_raise(
         self,

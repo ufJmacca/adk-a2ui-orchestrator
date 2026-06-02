@@ -147,6 +147,24 @@ class MixedValidityA2uiUserActionAdapter:
         )
 
 
+class DeleteSurfaceA2uiUserActionAdapter:
+    async def handle_user_action(self, user_action: Any) -> SpecialistResponse:
+        original_surface_id = user_action["userAction"]["surfaceId"]
+        return SpecialistResponse(
+            response_id="response_product_opportunity_close_surface",
+            agent_id="product_opportunity",
+            content="Product Opportunity Agent: surface closed.",
+            structured_output={"status": "closed"},
+            a2ui_payload=[
+                {
+                    "version": A2UI_VERSION,
+                    "deleteSurface": {"surfaceId": original_surface_id},
+                }
+            ],
+            surface_id=original_surface_id,
+        )
+
+
 class FailOnceSpecialist:
     def __init__(self, delegate: SpecialistAgent) -> None:
         self._delegate = delegate
@@ -939,6 +957,47 @@ async def test_specialist_user_action_response_normalizes_camel_case_a2ui() -> N
         "surface_product_opportunity_detail"
     )
     assert service.surface_owner("surface_product_opportunity_detail") is not None
+
+
+@pytest.mark.asyncio
+async def test_specialist_user_action_delete_surface_is_delivered_before_unregister() -> (
+    None
+):
+    # Arrange
+    service = OrchestratorService(
+        specialist_user_action_adapters={
+            "product_opportunity": DeleteSurfaceA2uiUserActionAdapter()
+        }
+    )
+    result = await service.handle_user_request(
+        "What product opportunities should I consider for a cafe business?"
+    )
+    surface_id = result.specialist_responses[0].surface_id
+    assert surface_id is not None
+    assert service.surface_owner(surface_id) is not None
+    expected_payload = {
+        "version": A2UI_VERSION,
+        "deleteSurface": {"surfaceId": surface_id},
+    }
+
+    # Act
+    routed = await service.handle_user_action(
+        {
+            "userAction": {
+                "type": "specialist_action",
+                "surfaceId": surface_id,
+                "payload": {"action": "close"},
+            }
+        }
+    )
+
+    # Assert
+    assert routed.status == "forwarded"
+    assert [part.data for part in routed.a2ui_parts] == [expected_payload]
+    assert service.surface_owner(surface_id) is None
+    final_response = routed.final_artifacts["final_response"]
+    assert final_response.surface_id == surface_id
+    assert final_response.a2ui_payload == [expected_payload]
 
 
 @pytest.mark.asyncio

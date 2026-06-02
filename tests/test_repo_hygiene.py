@@ -235,11 +235,7 @@ def test_pyproject_includes_static_renderer_assets_in_package_data() -> None:
     package_data = pyproject["tool"]["setuptools"]["package-data"]
 
     # Assert
-    assert package_data["orchestrator_demo.app"] == [
-        "static/*.html",
-        "static/*.js",
-        "static/*.css",
-    ]
+    assert package_data["orchestrator_demo.app"] == ["static/*", "static/**/*"]
 
 
 def test_pyproject_configures_pytest_ruff_and_mypy_quality_gates() -> None:

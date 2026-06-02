@@ -141,8 +141,8 @@ def _validated_data_parts(
     payload: A2uiPayload | DataPart | Sequence[DataPart],
     *,
     surface_registry: SurfaceRouteRegistry,
-) -> tuple[list[DataPart], SurfaceComponentGraphs]:
-    parts: list[DataPart] = []
+) -> tuple[list[DataPart | TextPart], SurfaceComponentGraphs]:
+    parts: list[DataPart | TextPart] = []
     staged_components = clone_surface_component_graphs(
         surface_registry._components_by_surface_id
     )

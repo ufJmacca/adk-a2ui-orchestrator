@@ -869,6 +869,40 @@ def test_a2ui_validation_rejects_mixed_routed_button_without_user_action_context
     assert any(expected_error in error for error in result.validation_errors)
 
 
+def test_a2ui_validation_rejects_non_object_button_event_in_mixed_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_invalid_button_event",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Button",
+                "id": "root",
+                "label": "Inspect customer",
+                "action": {"event": "inspect_customer"},
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(
+        "updateComponents.components[1].action.event must be an object" in error
+        for error in result.validation_errors
+    )
+
+
 @pytest.mark.parametrize(
     ("component", "expected_error"),
     [
