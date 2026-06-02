@@ -156,8 +156,8 @@ class ApprovalStateStore:
     def add_draft(self, plan: ExecutionPlan) -> ApprovalRecord:
         """Store a deep copy of a draft plan without owning the caller's object."""
 
-        draft = plan.model_copy(deep=True)
         with self._lock:
+            draft = plan.model_copy(deep=True)
             existing = self._records.get(draft.plan_id)
             if existing is not None and existing.status != "draft":
                 raise PlanAlreadyFinalError(

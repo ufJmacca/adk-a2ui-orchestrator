@@ -1,4 +1,5 @@
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -1363,6 +1364,80 @@ def test_draft_update_commits_only_after_refreshed_canvas_validation() -> None:
     assert record_after_failed_edit.status == "draft"
     assert record_after_failed_edit.approved_plan is None
     assert record_after_failed_edit.draft_plan == draft_snapshot
+
+
+def test_concurrent_duplicate_approvals_execute_graph_once() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanAlreadyFinalError,
+    )
+
+    class SlowGraphRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.first_execution_started = threading.Event()
+            self.second_execution_started = threading.Event()
+            self.release_execution = threading.Event()
+            self._lock = threading.Lock()
+
+        def execute(self, _plan: ExecutionPlan) -> object:
+            with self._lock:
+                self.calls += 1
+                call_number = self.calls
+            if call_number == 1:
+                self.first_execution_started.set()
+            else:
+                self.second_execution_started.set()
+            assert self.release_execution.wait(timeout=5)
+            return SimpleNamespace(specialist_requests=("request",))
+
+    graph_runtime = SlowGraphRuntime()
+    store = ApprovalStateStore(
+        agent_descriptors=_agent_descriptors(),
+        graph_runtime=graph_runtime,
+    )
+    store.add_draft(_meeting_plan())
+    approve_event = _action(
+        "approve_plan",
+        {
+            "approvedStepIds": [
+                "step_relationship_summary",
+                "step_internal_knowledge",
+                "step_industry_research",
+                "step_synthesis",
+            ]
+        },
+    )
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def approve() -> None:
+        try:
+            results.append(store.apply_user_action(approve_event))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=approve)
+    second_thread = threading.Thread(target=approve)
+
+    # Act
+    first_thread.start()
+    assert graph_runtime.first_execution_started.wait(timeout=5)
+    second_thread.start()
+    overlapped = graph_runtime.second_execution_started.wait(timeout=0.2)
+    graph_runtime.release_execution.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    # Assert
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not overlapped
+    assert graph_runtime.calls == 1
+    assert [getattr(result, "status", None) for result in results] == ["approved"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], PlanAlreadyFinalError)
 
 
 @pytest.mark.parametrize(

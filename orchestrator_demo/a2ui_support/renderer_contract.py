@@ -12,7 +12,12 @@ from orchestrator_demo.a2ui_support.schema_manager import (
     UPDATE_COMPONENTS_MESSAGE,
     UPDATE_DATA_MODEL_MESSAGE,
 )
-from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+from orchestrator_demo.a2ui_support.validation import (
+    SurfaceComponentGraphs,
+    apply_validated_a2ui_component_graph,
+    clone_surface_component_graphs,
+    validate_outbound_a2ui,
+)
 from orchestrator_demo.contracts import A2uiPayload
 from orchestrator_demo.orchestrator.surface_routes import (
     SurfaceOwnershipError,
@@ -33,7 +38,10 @@ def prepare_specialist_a2ui_for_renderer(
 ) -> list[DataPart | TextPart]:
     """Validate specialist A2UI, preserve it unchanged, and register ownership."""
 
-    parts = _validated_data_parts(payload)
+    parts, staged_components = _validated_data_parts(
+        payload,
+        surface_registry=surface_registry,
+    )
     staged_owners = dict(surface_registry._owners_by_surface_id)
     for part in parts:
         if not isinstance(part, DataPart):
@@ -56,6 +64,7 @@ def prepare_specialist_a2ui_for_renderer(
             )
 
     surface_registry._owners_by_surface_id = staged_owners
+    surface_registry._components_by_surface_id = staged_components
 
     return parts
 
@@ -68,7 +77,10 @@ def prepare_approval_a2ui_for_renderer(
 ) -> list[DataPart | TextPart]:
     """Validate approval A2UI and register approval surfaces to the orchestrator."""
 
-    parts = _validated_data_parts(payload)
+    parts, staged_components = _validated_data_parts(
+        payload,
+        surface_registry=surface_registry,
+    )
     staged_owners = dict(surface_registry._owners_by_surface_id)
     for part in parts:
         if not isinstance(part, DataPart):
@@ -92,6 +104,7 @@ def prepare_approval_a2ui_for_renderer(
             )
 
     surface_registry._owners_by_surface_id = staged_owners
+    surface_registry._components_by_surface_id = staged_components
 
     return parts
 
@@ -126,13 +139,31 @@ def deleted_surface_ids_from_a2ui_payload(payload: Mapping[str, Any]) -> list[st
 
 def _validated_data_parts(
     payload: A2uiPayload | DataPart | Sequence[DataPart],
-) -> list[DataPart | TextPart]:
-    parts: list[DataPart | TextPart] = []
+    *,
+    surface_registry: SurfaceRouteRegistry,
+) -> tuple[list[DataPart], SurfaceComponentGraphs]:
+    parts: list[DataPart] = []
+    staged_components = clone_surface_component_graphs(
+        surface_registry._components_by_surface_id
+    )
     for candidate in _iter_payload_messages(payload):
-        result = validate_outbound_a2ui(candidate)
+        result = validate_outbound_a2ui(
+            candidate,
+            existing_components_by_surface_id=staged_components,
+        )
+        if not isinstance(result.renderer_part, DataPart):
+            errors = "; ".join(result.validation_errors)
+            raise RendererContractError(
+                "A2UI payload failed validation and was not emitted to the "
+                f"renderer: {errors}"
+            )
         parts.append(result.renderer_part)
+        apply_validated_a2ui_component_graph(
+            staged_components,
+            result.renderer_part.data,
+        )
 
-    return parts
+    return parts, staged_components
 
 
 def _clear_surface_owned_by(

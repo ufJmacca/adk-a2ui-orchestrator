@@ -92,6 +92,9 @@ def _renderer_behavior_response() -> dict[str, object]:
                             "downstream_falsey_table",
                             "downstream_card_title_body",
                             "downstream_foreign_route",
+                            "downstream_card",
+                            "downstream_table",
+                            "downstream_button",
                         ],
                     },
                     {
@@ -134,6 +137,41 @@ def _renderer_behavior_response() -> dict[str, object]:
                         "id": "downstream_card_title_body",
                         "title": "Card title from specialist",
                         "body": "Card body from specialist",
+                    },
+                    {
+                        "component": "Card",
+                        "id": "downstream_card",
+                        "title": "Relationship signal",
+                        "body": "Treasury services are relevant to this prospect.",
+                    },
+                    {
+                        "component": "Table",
+                        "id": "downstream_table",
+                        "columns": [
+                            {"key": "balance", "label": "Balance"},
+                            {"key": "active", "label": "Active"},
+                        ],
+                        "rows": [
+                            {"balance": 0, "active": False},
+                        ],
+                    },
+                    {
+                        "component": "Button",
+                        "id": "downstream_button",
+                        "label": "Show detail",
+                        "action": {
+                            "event": {
+                                "name": "specialist_action",
+                                "context": {
+                                    "type": "specialist_action",
+                                    "surfaceId": "surface_product_opportunity_1",
+                                    "payload": {
+                                        "action": "show_more_detail",
+                                        "path": "synthetic://product-opportunity/source",
+                                    },
+                                },
+                            }
+                        },
                     },
                 ],
             },
@@ -209,6 +247,560 @@ def test_renderer_static_shell_exposes_required_local_endpoints() -> None:
     assert "fetch('/api/user-action'" in script
     assert "fetch('/api/status'" in script
     assert "fetch('/api/artifacts'" in script
+
+
+def test_renderer_surfaces_non_ok_user_action_json_payload(tmp_path: Path) -> None:
+    # Arrange
+    node_script = tmp_path / "renderer_non_ok_user_action_test.cjs"
+    node_script.write_text(
+        textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const vm = require('node:vm');
+
+            class MiniNode {{
+              constructor() {{
+                this.parentNode = null;
+              }}
+
+              get textContent() {{
+                return '';
+              }}
+            }}
+
+            class MiniTextNode extends MiniNode {{
+              constructor(text) {{
+                super();
+                this.text = String(text);
+              }}
+
+              get textContent() {{
+                return this.text;
+              }}
+
+              set textContent(value) {{
+                this.text = String(value);
+              }}
+            }}
+
+            class MiniElement extends MiniNode {{
+              constructor(tagName) {{
+                super();
+                this.nodeType = 1;
+                this.tagName = tagName.toUpperCase();
+                this.children = [];
+                this.dataset = {{}};
+                this.className = '';
+                this.id = '';
+                this.storedText = '';
+              }}
+
+              get textContent() {{
+                if (this.children.length > 0) {{
+                  return this.children.map((child) => child.textContent).join('');
+                }}
+                return this.storedText;
+              }}
+
+              set textContent(value) {{
+                this.storedText = String(value);
+                this.children = [];
+              }}
+
+              appendChild(child) {{
+                child.parentNode = this;
+                this.children.push(child);
+                return child;
+              }}
+
+              replaceChildren(...children) {{
+                this.children = [];
+                this.storedText = '';
+                for (const child of children) {{
+                  this.appendChild(child);
+                }}
+              }}
+
+              remove() {{
+                if (!this.parentNode) {{
+                  return;
+                }}
+                this.parentNode.children = this.parentNode.children.filter(
+                  (child) => child !== this,
+                );
+                this.parentNode = null;
+              }}
+
+              addEventListener() {{}}
+            }}
+
+            class MiniDocument extends MiniElement {{
+              constructor() {{
+                super('#document');
+                this.body = new MiniElement('body');
+                this.appendChild(this.body);
+              }}
+
+              createElement(tagName) {{
+                return new MiniElement(tagName);
+              }}
+
+              createTextNode(text) {{
+                return new MiniTextNode(text);
+              }}
+
+              getElementById(id) {{
+                let found = null;
+                const visit = (node) => {{
+                  if (found || node.nodeType !== 1) {{
+                    return;
+                  }}
+                  if (node.id === id) {{
+                    found = node;
+                    return;
+                  }}
+                  for (const child of node.children) {{
+                    visit(child);
+                  }}
+                }};
+                visit(this);
+                return found;
+              }}
+            }}
+
+            function mount(document, tagName, id) {{
+              const element = document.createElement(tagName);
+              element.id = id;
+              document.body.appendChild(element);
+              return element;
+            }}
+
+            async function main() {{
+              const rendererPath = {json.dumps(str(STATIC_ROOT / "renderer.js"))};
+              const document = new MiniDocument();
+              mount(document, 'form', 'request-form');
+              mount(document, 'textarea', 'request-input');
+              mount(document, 'section', 'approval-surfaces');
+              mount(document, 'ol', 'status-updates');
+              mount(document, 'pre', 'artifact-list');
+              mount(document, 'section', 'downstream-surfaces');
+
+              const retrySurfaceParts = [
+                {{
+                  data: {{
+                    version: '0.1',
+                    createSurface: {{
+                      surfaceId: 'surface_plan_retry',
+                      catalogId: 'basic',
+                    }},
+                  }},
+                }},
+                {{
+                  data: {{
+                    version: '0.1',
+                    updateComponents: {{
+                      surfaceId: 'surface_plan_retry',
+                      components: [
+                        {{
+                          component: 'Text',
+                          id: 'root',
+                          text: 'Retryable approval controls',
+                        }},
+                      ],
+                    }},
+                  }},
+                }},
+              ];
+              let statusRefreshed = false;
+              const fetch = async (url) => {{
+                if (url === '/api/user-action') {{
+                  return {{
+                    ok: false,
+                    status: 500,
+                    json: async () => ({{
+                      status: 'error',
+                      error: {{
+                        code: 'graph_execution_failed',
+                        message: 'Transient specialist failure.',
+                        retryable: true,
+                      }},
+                      statusEvents: [
+                        {{
+                          status: 'step_failed',
+                          message: 'Relationship summary failed.',
+                        }},
+                      ],
+                      artifacts: {{
+                        diagnostic: 'Approval can be retried after editing.',
+                      }},
+                    }}),
+                  }};
+                }}
+                if (url === '/api/status') {{
+                  statusRefreshed = true;
+                  return {{
+                    ok: true,
+                    json: async () => ({{
+                      statusEvents: [
+                        {{ status: 'stale', message: 'Stale server status.' }},
+                      ],
+                    }}),
+                  }};
+                }}
+                if (url === '/api/artifacts') {{
+                  return {{
+                    ok: true,
+                    json: async () => ({{ artifacts: {{}}, a2uiParts: retrySurfaceParts }}),
+                  }};
+                }}
+                throw new Error(`Unexpected fetch ${{url}}`);
+              }};
+
+              const context = {{
+                document,
+                fetch,
+                console,
+                Map,
+                Error,
+                JSON,
+                String,
+                Array,
+                Object,
+                Promise,
+              }};
+              context.window = context;
+              context.globalThis = context;
+              vm.createContext(context);
+              const source = fs.readFileSync(rendererPath, 'utf8')
+                + '\\nthis.__rendererApi = {{ handleTransportResponse, postUserAction }};';
+              vm.runInContext(source, context, {{ filename: 'renderer.js' }});
+
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: retrySurfaceParts,
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              await new Promise((resolve) => setImmediate(resolve));
+              statusRefreshed = false;
+
+              await context.__rendererApi.postUserAction({{
+                userAction: {{
+                  type: 'approve_plan',
+                  surfaceId: 'surface_plan_retry',
+                  payload: {{ planId: 'plan_retry', planVersion: 1 }},
+                }},
+              }});
+              await new Promise((resolve) => setImmediate(resolve));
+
+              const statusText = document.getElementById('status-updates').textContent;
+              assert.match(statusText, /step_failed: Relationship summary failed/);
+              assert.match(statusText, /graph_execution_failed: Transient specialist failure/);
+              assert.match(
+                document.getElementById('artifact-list').textContent,
+                /Approval can be retried after editing/,
+              );
+              assert.match(
+                document.getElementById('surface_plan_retry').textContent,
+                /Retryable approval controls/,
+              );
+              assert.equal(statusRefreshed, false);
+            }}
+
+            main().catch((error) => {{
+              console.error(error);
+              process.exit(1);
+            }});
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    # Act
+    completed = subprocess.run(
+        ["node", str(node_script)],
+        check=False,
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    # Assert
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_renderer_rejects_prototype_polluting_binding_paths(tmp_path: Path) -> None:
+    # Arrange
+    node_script = tmp_path / "renderer_binding_path_test.cjs"
+    node_script.write_text(
+        textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const vm = require('node:vm');
+
+            const context = {{
+              document: {{ addEventListener() {{}} }},
+              console,
+              Map,
+              Object,
+              Set,
+            }};
+            context.window = context;
+            context.globalThis = context;
+            vm.createContext(context);
+
+            const source = fs.readFileSync(
+              {json.dumps(str(STATIC_ROOT / "renderer.js"))},
+              'utf8',
+            ) + '\\nthis.__rendererApi = {{ state, valueAtPath, setValueAtPath }};';
+            vm.runInContext(source, context, {{ filename: 'renderer.js' }});
+
+            const api = context.__rendererApi;
+            api.state.surfaces.set('surface_dangerous_path', {{ dataModel: {{}} }});
+
+            Object.prototype.pollutedRead = 'prototype value';
+            try {{
+              assert.equal(
+                api.valueAtPath(
+                  'surface_dangerous_path',
+                  '__proto__/pollutedRead',
+                ),
+                undefined,
+              );
+            }} finally {{
+              delete Object.prototype.pollutedRead;
+            }}
+
+            api.setValueAtPath(
+              'surface_dangerous_path',
+              '__proto__/pollutedWrite',
+              'owned',
+            );
+
+            assert.equal(Object.prototype.pollutedWrite, undefined);
+            assert.deepEqual(
+              api.state.surfaces.get('surface_dangerous_path').dataModel,
+              {{}},
+            );
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    # Act
+    completed = subprocess.run(
+        ["node", str(node_script)],
+        check=False,
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    # Assert
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_renderer_guards_recursive_component_references(tmp_path: Path) -> None:
+    # Arrange
+    node_script = tmp_path / "renderer_recursive_component_test.cjs"
+    node_script.write_text(
+        textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const vm = require('node:vm');
+
+            class MiniNode {{
+              constructor() {{
+                this.parentNode = null;
+              }}
+
+              get textContent() {{
+                return '';
+              }}
+            }}
+
+            class MiniElement extends MiniNode {{
+              constructor(tagName) {{
+                super();
+                this.nodeType = 1;
+                this.tagName = tagName.toUpperCase();
+                this.children = [];
+                this.dataset = {{}};
+                this.className = '';
+                this.id = '';
+                this.storedText = '';
+              }}
+
+              get textContent() {{
+                if (this.children.length > 0) {{
+                  return this.children.map((child) => child.textContent).join('');
+                }}
+                return this.storedText;
+              }}
+
+              set textContent(value) {{
+                this.storedText = String(value);
+                this.children = [];
+              }}
+
+              appendChild(child) {{
+                child.parentNode = this;
+                this.children.push(child);
+                return child;
+              }}
+
+              replaceChildren(...children) {{
+                this.children = [];
+                this.storedText = '';
+                for (const child of children) {{
+                  this.appendChild(child);
+                }}
+              }}
+
+              remove() {{
+                if (!this.parentNode) {{
+                  return;
+                }}
+                this.parentNode.children = this.parentNode.children.filter(
+                  (child) => child !== this,
+                );
+                this.parentNode = null;
+              }}
+
+              addEventListener() {{}}
+            }}
+
+            class MiniDocument extends MiniElement {{
+              constructor() {{
+                super('#document');
+                this.body = new MiniElement('body');
+                this.appendChild(this.body);
+              }}
+
+              createElement(tagName) {{
+                return new MiniElement(tagName);
+              }}
+
+              createTextNode(text) {{
+                const node = new MiniNode();
+                node.text = String(text);
+                Object.defineProperty(node, 'textContent', {{
+                  get() {{
+                    return this.text;
+                  }},
+                  set(value) {{
+                    this.text = String(value);
+                  }},
+                }});
+                return node;
+              }}
+
+              getElementById(id) {{
+                let found = null;
+                const visit = (node) => {{
+                  if (found || node.nodeType !== 1) {{
+                    return;
+                  }}
+                  if (node.id === id) {{
+                    found = node;
+                    return;
+                  }}
+                  for (const child of node.children) {{
+                    visit(child);
+                  }}
+                }};
+                visit(this);
+                return found;
+              }}
+            }}
+
+            function mount(document, tagName, id) {{
+              const element = document.createElement(tagName);
+              element.id = id;
+              document.body.appendChild(element);
+              return element;
+            }}
+
+            const rendererPath = {json.dumps(str(STATIC_ROOT / "renderer.js"))};
+            const document = new MiniDocument();
+            mount(document, 'form', 'request-form');
+            mount(document, 'textarea', 'request-input');
+            mount(document, 'section', 'approval-surfaces');
+            mount(document, 'ol', 'status-updates');
+            mount(document, 'pre', 'artifact-list');
+            mount(document, 'section', 'downstream-surfaces');
+
+            const context = {{
+              document,
+              console,
+              Map,
+              Set,
+              Error,
+              JSON,
+              String,
+              Array,
+              Object,
+            }};
+            context.window = context;
+            context.globalThis = context;
+            vm.createContext(context);
+
+            const source = fs.readFileSync(rendererPath, 'utf8')
+              + '\\nthis.__rendererApi = {{ handleTransportResponse }};';
+            vm.runInContext(source, context, {{ filename: 'renderer.js' }});
+
+            context.__rendererApi.handleTransportResponse({{
+              httpOk: false,
+              a2uiParts: [
+                {{
+                  data: {{
+                    version: '0.1',
+                    createSurface: {{
+                      surfaceId: 'surface_recursive_component',
+                      catalogId: 'basic',
+                    }},
+                  }},
+                }},
+                {{
+                  data: {{
+                    version: '0.1',
+                    updateComponents: {{
+                      surfaceId: 'surface_recursive_component',
+                      components: [
+                        {{
+                          component: 'Column',
+                          id: 'root',
+                          children: ['root'],
+                        }},
+                      ],
+                    }},
+                  }},
+                }},
+              ],
+              statusEvents: [],
+              artifacts: {{}},
+            }});
+
+            const surface = document.getElementById('surface_recursive_component');
+            assert.match(surface.textContent, /Circular component reference: root/);
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    # Act
+    completed = subprocess.run(
+        ["node", str(node_script)],
+        check=False,
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    # Assert
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) -> None:
@@ -430,14 +1022,71 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
               mount(document, 'section', 'downstream-surfaces');
 
               const userActions = [];
+              let artifactA2uiParts = response.a2uiParts;
+              let requestA2uiParts = null;
+              const directRequestParts = [
+                {{
+                  data: {{
+                    version: '0.1',
+                    createSurface: {{
+                      surfaceId: 'surface_product_opportunity_fresh',
+                      catalogId: 'basic',
+                    }},
+                  }},
+                }},
+                {{
+                  data: {{
+                    version: '0.1',
+                    updateComponents: {{
+                      surfaceId: 'surface_product_opportunity_fresh',
+                      components: [
+                        {{
+                          component: 'Text',
+                          id: 'root',
+                          text: 'Fresh direct product surface',
+                        }},
+                      ],
+                    }},
+                  }},
+                }},
+              ];
+              requestA2uiParts = directRequestParts;
+              const approvalRefreshParts = response.a2uiParts.filter((part) => {{
+                const data = part.data || {{}};
+                const createSurface = data.createSurface || {{}};
+                const updateComponents = data.updateComponents || {{}};
+                return (
+                  createSurface.surfaceId === 'surface_plan_renderer_behavior'
+                  || updateComponents.surfaceId === 'surface_plan_renderer_behavior'
+                );
+              }});
               const fetch = async (url, options = {{}}) => {{
-                if (url === '/api/user-action') {{
-                  userActions.push(JSON.parse(options.body));
+                if (url === '/api/request') {{
+                  artifactA2uiParts = requestA2uiParts;
                   return {{
                     ok: true,
                     json: async () => ({{
-                      status: 'draft_updated',
-                      a2uiParts: [],
+                      a2uiParts: requestA2uiParts,
+                      statusEvents: [],
+                      artifacts: {{
+                        final_response: {{ agent_id: 'product_opportunity' }},
+                      }},
+                    }}),
+                  }};
+                }}
+                if (url === '/api/user-action') {{
+                  const submittedAction = JSON.parse(options.body);
+                  const userAction = submittedAction.userAction || {{}};
+                  const isApprovalEdit = userAction.surfaceId === 'surface_plan_renderer_behavior';
+                  userActions.push(submittedAction);
+                  if (isApprovalEdit) {{
+                    artifactA2uiParts = approvalRefreshParts;
+                  }}
+                  return {{
+                    ok: true,
+                    json: async () => ({{
+                      status: isApprovalEdit ? 'draft_updated' : 'routed',
+                      a2uiParts: isApprovalEdit ? approvalRefreshParts : [],
                       statusEvents: [],
                       artifacts: {{}},
                     }}),
@@ -451,7 +1100,7 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
                     ok: true,
                     json: async () => ({{
                       artifacts: response.artifacts,
-                      a2uiParts: response.a2uiParts,
+                      a2uiParts: artifactA2uiParts,
                     }}),
                   }};
                 }}
@@ -475,7 +1124,7 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
               context.globalThis = context;
               vm.createContext(context);
               const source = fs.readFileSync(rendererPath, 'utf8')
-                + '\\nthis.__rendererApi = {{ handleTransportResponse }};';
+                + '\\nthis.__rendererApi = {{ handleTransportResponse, submitRequest }};';
               vm.runInContext(source, context, {{ filename: 'renderer.js' }});
 
               context.__rendererApi.handleTransportResponse(response);
@@ -492,6 +1141,8 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
               assert.match(downstreamText, /Inline specialist detail/);
               assert.match(downstreamText, /Card title from specialist/);
               assert.match(downstreamText, /Card body from specialist/);
+              assert.match(downstreamText, /Relationship signal/);
+              assert.match(downstreamText, /Treasury services are relevant/);
               assert.match(downstreamText, /<script>globalThis.__executed = true<\\/script>/);
               assert.match(downstreamText, /A2UI rendering unavailable/);
               assert.match(downstreamText, /secret-like value/);
@@ -503,7 +1154,335 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
                 .getElementById('downstream-surfaces')
                 .querySelectorAll('td')
                 .map((cell) => cell.textContent);
-              assert.deepEqual(tableCells, ['Zero balance', '0', 'false']);
+              assert.deepEqual(tableCells, ['Zero balance', '0', 'false', '0', 'false']);
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: [
+                  {{
+                    data: {{
+                      version: '0.1',
+                      updateComponents: {{
+                        surfaceId: 'surface_product_opportunity_1',
+                        components: [
+                          {{
+                            component: 'Text',
+                            id: 'downstream_text',
+                            text: 'Updated product recommendation',
+                          }},
+                        ],
+                      }},
+                    }},
+                  }},
+                ],
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              const partiallyUpdatedText = document
+                .getElementById('surface_product_opportunity_1')
+                .textContent;
+              assert.match(partiallyUpdatedText, /Updated product recommendation/);
+              assert.match(partiallyUpdatedText, /Show detail/);
+              const preservedCells = document
+                .getElementById('surface_product_opportunity_1')
+                .querySelectorAll('td')
+                .map((cell) => cell.textContent);
+              assert.deepEqual(preservedCells, ['Zero balance', '0', 'false', '0', 'false']);
+
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: [
+                  {{
+                    data: {{
+                      version: '0.1',
+                      createSurface: {{
+                        surfaceId: 'surface_normalized_components',
+                        catalogId: 'basic',
+                      }},
+                    }},
+                  }},
+                  {{
+                    data: {{
+                      version: '0.1',
+                      updateComponents: {{
+                        surfaceId: 'surface_normalized_components',
+                        components: [
+                          {{
+                            component: 'Column',
+                            id: 'root',
+                            children: ['table_by_type', 'status_lower', 'conflict_by_type'],
+                          }},
+                          {{
+                            type: 'Table',
+                            id: 'table_by_type',
+                            columns: [{{ key: 'fit', label: 'Fit' }}],
+                            rows: [{{ fit: 'strong' }}],
+                          }},
+                          {{
+                            component: 'status',
+                            id: 'status_lower',
+                            message: 'Normalized status rendered.',
+                          }},
+                          {{
+                            type: 'Text',
+                            component: 'Button',
+                            id: 'conflict_by_type',
+                            text: 'Conflict rendered as text.',
+                            label: 'Do not dispatch',
+                            action: {{
+                              event: {{
+                                name: 'specialist_action',
+                                context: {{
+                                  type: 'specialist_action',
+                                  payload: {{ action: 'should_not_dispatch' }},
+                                }},
+                              }},
+                            }},
+                          }},
+                        ],
+                      }},
+                    }},
+                  }},
+                ],
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              const normalizedSurface = document.getElementById('surface_normalized_components');
+              assert.match(normalizedSurface.textContent, /Normalized status rendered/);
+              assert.match(normalizedSurface.textContent, /Conflict rendered as text/);
+              assert.equal(normalizedSurface.textContent.includes('Do not dispatch'), false);
+              assert.equal(normalizedSurface.textContent.includes('Unsupported component'), false);
+              assert.equal(normalizedSurface.querySelectorAll('button').length, 0);
+              assert.deepEqual(
+                normalizedSurface.querySelectorAll('td').map((cell) => cell.textContent),
+                ['strong'],
+              );
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: [
+                  {{
+                    data: {{
+                      version: '0.1',
+                      createSurface: {{
+                        surfaceId: 'surface_bound_renderer_data',
+                        catalogId: 'basic',
+                      }},
+                    }},
+                  }},
+                  {{
+                    data: {{
+                      version: '0.1',
+                      updateDataModel: {{
+                        surfaceId: 'surface_bound_renderer_data',
+                        path: '/',
+                        value: {{
+                          customer: {{ name: 'ABC Manufacturing' }},
+                          products: [
+                            {{
+                              accountId: 'acct_working_capital',
+                              name: 'Working capital line',
+                              cardName: 'Card Working Capital',
+                              accordionName: 'Accordion Working Capital',
+                              buttonLabel: 'Inspect Working Capital',
+                            }},
+                            {{
+                              accountId: 'acct_treasury',
+                              name: 'Treasury services',
+                              cardName: 'Card Treasury Services',
+                              accordionName: 'Accordion Treasury Services',
+                              buttonLabel: 'Inspect Treasury',
+                            }},
+                          ],
+                        }},
+                      }},
+                    }},
+                  }},
+                  {{
+                    data: {{
+                      version: '0.1',
+                      updateComponents: {{
+                        surfaceId: 'surface_bound_renderer_data',
+                        components: [
+                          {{
+                            component: 'Column',
+                            id: 'root',
+                            children: [
+                              'bound_customer_name',
+                              'product_list',
+                              'product_card_list',
+                              'product_accordion_list',
+                              'product_edit_list',
+                              'product_action_list',
+                            ],
+                          }},
+                          {{
+                            component: 'Text',
+                            id: 'bound_customer_name',
+                            text: {{ path: 'customer/name' }},
+                          }},
+                          {{
+                            component: 'List',
+                            id: 'product_list',
+                            children: {{
+                              componentId: 'product_name_template',
+                              path: 'products',
+                            }},
+                          }},
+                          {{
+                            component: 'Text',
+                            id: 'product_name_template',
+                            text: {{ path: 'name' }},
+                          }},
+                          {{
+                            component: 'List',
+                            id: 'product_card_list',
+                            children: {{
+                              componentId: 'product_card_template',
+                              path: 'products',
+                            }},
+                          }},
+                          {{
+                            component: 'Card',
+                            id: 'product_card_template',
+                            child: 'product_card_name',
+                          }},
+                          {{
+                            component: 'Text',
+                            id: 'product_card_name',
+                            text: {{ path: 'cardName' }},
+                          }},
+                          {{
+                            component: 'List',
+                            id: 'product_accordion_list',
+                            children: {{
+                              componentId: 'product_accordion_template',
+                              path: 'products',
+                            }},
+                          }},
+                          {{
+                            component: 'Accordion',
+                            id: 'product_accordion_template',
+                            title: 'Product detail',
+                            children: ['product_accordion_name'],
+                          }},
+                          {{
+                            component: 'Text',
+                            id: 'product_accordion_name',
+                            text: {{ path: 'accordionName' }},
+                          }},
+                          {{
+                            component: 'List',
+                            id: 'product_edit_list',
+                            children: {{
+                              componentId: 'product_name_edit_template',
+                              path: 'products',
+                            }},
+                          }},
+                          {{
+                            component: 'TextField',
+                            id: 'product_name_edit_template',
+                            label: 'Product name',
+                            value: {{ path: 'name' }},
+                          }},
+                          {{
+                            component: 'List',
+                            id: 'product_action_list',
+                            children: {{
+                              componentId: 'product_action_template',
+                              path: 'products',
+                            }},
+                          }},
+                          {{
+                            component: 'Button',
+                            id: 'product_action_template',
+                            child: 'product_action_label',
+                            action: {{
+                              event: {{
+                                name: 'specialist_action',
+                                context: {{
+                                  type: 'specialist_action',
+                                  surfaceId: 'surface_bound_renderer_data',
+                                  payload: {{
+                                    action: 'inspect_product',
+                                    accountId: {{ path: 'accountId' }},
+                                    productName: {{ path: 'name' }},
+                                  }},
+                                }},
+                              }},
+                            }},
+                          }},
+                          {{
+                            component: 'Text',
+                            id: 'product_action_label',
+                            text: {{ path: 'buttonLabel' }},
+                          }},
+                        ],
+                      }},
+                    }},
+                  }},
+                ],
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              const boundSurface = document.getElementById('surface_bound_renderer_data');
+              assert.match(boundSurface.textContent, /ABC Manufacturing/);
+              assert.match(boundSurface.textContent, /Working capital line/);
+              assert.match(boundSurface.textContent, /Treasury services/);
+              assert.match(boundSurface.textContent, /Card Working Capital/);
+              assert.match(boundSurface.textContent, /Card Treasury Services/);
+              assert.match(boundSurface.textContent, /Accordion Working Capital/);
+              assert.match(boundSurface.textContent, /Accordion Treasury Services/);
+              assert.match(boundSurface.textContent, /Inspect Working Capital/);
+              assert.match(boundSurface.textContent, /Inspect Treasury/);
+              assert.equal(boundSurface.textContent.includes('[object Object]'), false);
+              const productNameInputs = boundSurface.querySelectorAll('input');
+              assert.deepEqual(
+                productNameInputs.map((input) => input.value),
+                ['Working capital line', 'Treasury services'],
+              );
+              productNameInputs[1].value = 'Treasury management';
+              productNameInputs[1].dispatchEvent({{ type: 'input', target: productNameInputs[1] }});
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: [
+                  {{
+                    data: {{
+                      version: '0.1',
+                      updateDataModel: {{
+                        surfaceId: 'surface_bound_renderer_data',
+                        path: '/customer/name',
+                        value: 'XYZ Supplies',
+                      }},
+                    }},
+                  }},
+                ],
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              const reboundSurfaceText = document
+                .getElementById('surface_bound_renderer_data')
+                .textContent;
+              assert.match(reboundSurfaceText, /XYZ Supplies/);
+              assert.match(reboundSurfaceText, /Working capital line/);
+              assert.match(reboundSurfaceText, /Treasury management/);
+              assert.match(reboundSurfaceText, /Card Working Capital/);
+              assert.match(reboundSurfaceText, /Accordion Treasury Services/);
+              assert.equal(reboundSurfaceText.includes('ABC Manufacturing'), false);
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: [
+                  {{
+                    data: {{
+                      version: '0.1',
+                      updateDataModel: {{
+                        surfaceId: 'surface_bound_renderer_data',
+                        path: '/customer/name',
+                      }},
+                    }},
+                  }},
+                ],
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              const deletedValueSurfaceText = document
+                .getElementById('surface_bound_renderer_data')
+                .textContent;
+              assert.equal(deletedValueSurfaceText.includes('XYZ Supplies'), false);
+              assert.match(deletedValueSurfaceText, /Working capital line/);
               assert.match(statusText, /approval_required: Plan approval is pending/);
               assert.match(statusText, /step_completed: Relationship summary completed/);
               assert.match(artifactText, /Draft meeting brief ready/);
@@ -576,6 +1555,25 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
                 }},
               }});
 
+              const downstreamRoot = document.getElementById('downstream-surfaces');
+              const showDetail = byVisibleText(downstreamRoot, 'button', 'Show detail');
+              assert.ok(showDetail);
+              showDetail.click();
+              await new Promise((resolve) => setImmediate(resolve));
+
+              assert.equal(userActions.length, 3);
+              assert.deepEqual(userActions[2], {{
+                userAction: {{
+                  type: 'specialist_action',
+                  surfaceId: 'surface_product_opportunity_1',
+                  payload: {{
+                    action: 'show_more_detail',
+                    path: 'synthetic://product-opportunity/source',
+                  }},
+                }},
+              }});
+              assert.ok(document.getElementById('surface_product_opportunity_1'));
+
               const foreignRouteButton = byVisibleText(
                 document.getElementById('downstream-surfaces'),
                 'button',
@@ -587,7 +1585,66 @@ def test_renderer_behaves_as_trusted_dom_mapper_for_a2ui_loop(tmp_path: Path) ->
                 /surfaceId does not match rendered surface/,
               );
               await new Promise((resolve) => setImmediate(resolve));
-              assert.equal(userActions.length, 2);
+              assert.equal(userActions.length, 3);
+
+              const rowScopedAction = byVisibleText(
+                document.getElementById('surface_bound_renderer_data'),
+                'button',
+                'Inspect Treasury',
+              );
+              assert.ok(rowScopedAction);
+              rowScopedAction.click();
+              await new Promise((resolve) => setImmediate(resolve));
+
+              assert.equal(userActions.length, 4);
+              assert.deepEqual(userActions[3], {{
+                userAction: {{
+                  type: 'specialist_action',
+                  surfaceId: 'surface_bound_renderer_data',
+                  payload: {{
+                    action: 'inspect_product',
+                    accountId: 'acct_treasury',
+                    productName: 'Treasury management',
+                  }},
+                }},
+              }});
+              assert.ok(document.getElementById('surface_product_opportunity_1'));
+              assert.ok(document.getElementById('surface_bound_renderer_data'));
+
+              document.getElementById('request-input').value = 'new direct request';
+              await context.__rendererApi.submitRequest({{
+                preventDefault() {{}},
+              }});
+              await new Promise((resolve) => setImmediate(resolve));
+
+              assert.equal(document.getElementById('surface_plan_renderer_behavior'), null);
+              assert.equal(document.getElementById('surface_product_opportunity_1'), null);
+              const freshSurface = document.getElementById('surface_product_opportunity_fresh');
+              assert.ok(freshSurface);
+              assert.match(freshSurface.textContent, /Fresh direct product surface/);
+
+              artifactA2uiParts = [];
+              context.__rendererApi.handleTransportResponse({{
+                a2uiParts: [],
+                statusEvents: [],
+                artifacts: {{}},
+              }});
+              await new Promise((resolve) => setImmediate(resolve));
+
+              assert.equal(document.getElementById('surface_plan_renderer_behavior'), null);
+              assert.equal(document.getElementById('surface_product_opportunity_1'), null);
+              assert.ok(document.getElementById('surface_product_opportunity_fresh'));
+
+              requestA2uiParts = [];
+              document.getElementById('request-input').value = 'new no-ui request';
+              await context.__rendererApi.submitRequest({{
+                preventDefault() {{}},
+              }});
+              await new Promise((resolve) => setImmediate(resolve));
+
+              assert.equal(document.getElementById('surface_product_opportunity_fresh'), null);
+              assert.equal(document.getElementById('approval-surfaces').textContent, '');
+              assert.equal(document.getElementById('downstream-surfaces').textContent, '');
             }}
 
             main().catch((error) => {{
@@ -620,6 +1677,7 @@ def test_renderer_maps_basic_catalog_payloads_to_trusted_components() -> None:
     supported_components = {
         "Column",
         "Row",
+        "List",
         "Text",
         "Button",
         "TextField",
@@ -639,7 +1697,9 @@ def test_renderer_maps_basic_catalog_payloads_to_trusted_components() -> None:
     assert "renderUnsupportedComponent" in script
 
 
-def test_renderer_emits_structured_user_actions_with_surface_and_plan_metadata() -> None:
+def test_renderer_emits_structured_user_actions_with_surface_and_plan_metadata() -> (
+    None
+):
     # Arrange
     script = (STATIC_ROOT / "renderer.js").read_text(encoding="utf-8")
 

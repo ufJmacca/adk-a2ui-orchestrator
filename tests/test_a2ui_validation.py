@@ -161,9 +161,7 @@ def _valid_workflow_canvas_payload() -> dict[str, Any]:
                                 "payload": {
                                     "planId": "plan_meeting_prep",
                                     "planVersion": 1,
-                                    "approvedStepIds": [
-                                        "step_internal_knowledge"
-                                    ],
+                                    "approvedStepIds": ["step_internal_knowledge"],
                                 },
                             },
                         }
@@ -418,7 +416,9 @@ def test_a2ui_validation_rejects_simplified_top_level_component_payload() -> Non
     # Assert
     assert result.valid is False
     assert isinstance(result.renderer_part, TextPart)
-    assert any("server-to-client message" in error for error in result.validation_errors)
+    assert any(
+        "server-to-client message" in error for error in result.validation_errors
+    )
 
 
 def test_a2ui_validation_accepts_basic_catalog_child_id_references() -> None:
@@ -490,6 +490,867 @@ def test_a2ui_validation_accepts_basic_catalog_templated_child_list() -> None:
     assert result.validation_errors == []
     assert isinstance(result.renderer_part, DataPart)
     assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_accepts_renderer_supported_basic_catalog_components() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_product_insights",
+        components=[
+            {
+                "component": "Column",
+                "id": "root",
+                "children": [
+                    "component_status",
+                    "component_table",
+                    "component_accordion",
+                    "component_timeline",
+                ],
+            },
+            {
+                "component": "Status",
+                "id": "component_status",
+                "status": "ready",
+                "message": "Specialist output ready.",
+            },
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [
+                    {"key": "balance", "label": "Balance"},
+                    {"key": "active", "label": "Active"},
+                ],
+                "rows": [
+                    {"balance": 0, "active": False},
+                ],
+            },
+            {
+                "component": "Accordion",
+                "id": "component_accordion",
+                "title": "Assumptions",
+                "children": ["component_assumptions"],
+            },
+            {
+                "component": "Text",
+                "id": "component_assumptions",
+                "text": "Synthetic demo data only.",
+            },
+            {
+                "component": "Timeline",
+                "id": "component_timeline",
+                "items": [
+                    {
+                        "label": "Qualified",
+                        "detail": "Relationship summary reviewed.",
+                    }
+                ],
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_error"),
+    [
+        (
+            {
+                "component": "Button",
+                "id": "root",
+                "label": {"text": "Inspect"},
+                "action": {
+                    "event": {
+                        "name": "inspect_product",
+                        "context": {
+                            "type": "inspect_product",
+                            "surfaceId": "surface_mixed_invalid_basic",
+                            "payload": {"productId": "treasury"},
+                        },
+                    },
+                },
+            },
+            "updateComponents.components[1].label must be a non-empty string",
+        ),
+        (
+            {
+                "component": "TextField",
+                "id": "root",
+                "label": {"text": "Notes"},
+            },
+            "updateComponents.components[1].label must be a non-empty string",
+        ),
+    ],
+)
+def test_a2ui_validation_rejects_malformed_basic_component_in_mixed_payload(
+    component: dict[str, Any],
+    expected_error: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_invalid_basic",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            component,
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert expected_error in result.validation_errors
+
+
+def test_a2ui_validation_accepts_inline_child_extension_component() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_inline_extension",
+        components=[
+            {
+                "component": "Card",
+                "id": "root",
+                "child": {
+                    "component": "Table",
+                    "id": "component_inline_table",
+                    "columns": [{"key": "name", "label": "Name"}],
+                    "rows": [{"name": "ABC Manufacturing"}],
+                },
+            }
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_rejects_duplicate_ids_in_mixed_extension_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_duplicate_ids",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Text",
+                "id": "component_duplicate",
+                "text": "First summary.",
+            },
+            {
+                "component": "Text",
+                "id": "component_duplicate",
+                "text": "Second summary.",
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any("id must be unique" in error for error in result.validation_errors)
+
+
+def test_a2ui_validation_rejects_invalid_bindings_in_mixed_extension_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_invalid_binding",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Text",
+                "id": "root",
+                "text": {"path": "customer/~2bad"},
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(
+        "valid A2UI path syntax" in error for error in result.validation_errors
+    )
+
+
+def test_a2ui_validation_rejects_invalid_action_bindings_in_mixed_extension_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_invalid_action_binding",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Button",
+                "id": "root",
+                "label": "Inspect customer",
+                "action": {
+                    "event": {
+                        "name": "inspect_customer",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_mixed_invalid_action_binding",
+                            "payload": {
+                                "action": "inspect_customer",
+                                "customerName": {"path": "customer/~2bad"},
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(
+        "event.context.payload.customerName.path must use valid A2UI path syntax"
+        in error
+        for error in result.validation_errors
+    )
+
+
+def test_a2ui_validation_redacts_secret_like_action_payload_keys_in_diagnostics() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    secret_like_key = "openrouter_api_key"
+    payload = _a2ui_update(
+        surface_id="surface_mixed_secret_key_invalid_binding",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Button",
+                "id": "root",
+                "label": "Inspect customer",
+                "action": {
+                    "event": {
+                        "name": "inspect_customer",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_mixed_secret_key_invalid_binding",
+                            "payload": {
+                                secret_like_key: {"path": "customer/~2bad"},
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+        }
+    )
+    assert secret_like_key not in exposed_diagnostic_text
+    assert "payload.<redacted-key>.path must use valid A2UI path syntax" in (
+        exposed_diagnostic_text
+    )
+    assert "A2UI payload contains secret-like key" in exposed_diagnostic_text
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "expected_error"),
+    [
+        ("type", "action.event.context.type must be a non-empty string"),
+        ("surfaceId", "action.event.context.surfaceId must be a non-empty string"),
+    ],
+)
+def test_a2ui_validation_rejects_mixed_routed_button_without_user_action_context(
+    missing_field: str,
+    expected_error: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    button = {
+        "component": "Button",
+        "id": "root",
+        "label": "Inspect customer",
+        "action": {
+            "event": {
+                "name": "inspect_customer",
+                "context": {
+                    "type": "specialist_action",
+                    "surfaceId": "surface_mixed_invalid_button_action",
+                    "payload": {"action": "inspect_customer"},
+                },
+            },
+        },
+    }
+    button["action"]["event"]["context"].pop(missing_field)
+    payload = _a2ui_update(
+        surface_id="surface_mixed_invalid_button_action",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            button,
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(expected_error in error for error in result.validation_errors)
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_error"),
+    [
+        (
+            {
+                "component": "Text",
+                "id": "root",
+                "text": {"path": 123},
+            },
+            "updateComponents.components[1].text.path must be a string",
+        ),
+        (
+            {
+                "component": "TextField",
+                "id": "root",
+                "label": "Customer",
+                "value": {"path": 123},
+            },
+            "updateComponents.components[1].value.path must be a string",
+        ),
+        (
+            {
+                "component": "Button",
+                "id": "root",
+                "label": "Inspect customer",
+                "action": {
+                    "event": {
+                        "name": "inspect_customer",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_mixed_non_string_binding",
+                            "payload": {
+                                "action": "inspect_customer",
+                                "customerName": {"path": 123},
+                            },
+                        },
+                    },
+                },
+            },
+            (
+                "updateComponents.components[1].action.event.context.payload."
+                "customerName.path must be a string"
+            ),
+        ),
+    ],
+)
+def test_a2ui_validation_rejects_non_string_binding_paths_in_mixed_payload(
+    component: dict[str, Any],
+    expected_error: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_non_string_binding",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            component,
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert expected_error in result.validation_errors
+
+
+def test_a2ui_validation_allows_literal_path_fields_in_mixed_extension_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_literal_paths",
+        components=[
+            {
+                "component": "Column",
+                "id": "root",
+                "children": ["component_documents", "component_open_report"],
+            },
+            {
+                "component": "Table",
+                "id": "component_documents",
+                "columns": [
+                    {"key": "name", "label": "Name"},
+                    {"key": "path", "label": "Path"},
+                ],
+                "rows": [
+                    {
+                        "name": "Relationship summary",
+                        "path": "~/docs/report.pdf",
+                    }
+                ],
+            },
+            {
+                "component": "Button",
+                "id": "component_open_report",
+                "label": "Open report",
+                "action": {
+                    "event": {
+                        "name": "open_report",
+                        "context": {
+                            "type": "open_report",
+                            "surfaceId": "surface_mixed_literal_paths",
+                            "payload": {
+                                "path": "~/docs/report.pdf",
+                                "label": "Relationship summary",
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_allows_literal_single_key_path_rows_in_mixed_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_single_key_path_row",
+        components=[
+            {
+                "component": "Table",
+                "id": "root",
+                "columns": [{"key": "path", "label": "Path"}],
+                "rows": [{"path": "~/docs/report.pdf"}],
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_rejects_reference_cycles_in_mixed_extension_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_reference_cycle",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Row",
+                "id": "component_a",
+                "children": ["component_b"],
+            },
+            {
+                "component": "Row",
+                "id": "component_b",
+                "children": ["component_a"],
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(
+        "circular component references" in error for error in result.validation_errors
+    )
+
+
+def test_a2ui_validation_rejects_reference_cycles_in_basic_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_basic_reference_cycle",
+        components=[
+            {
+                "component": "Column",
+                "id": "root",
+                "children": ["root"],
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(
+        "circular component references" in error
+        or "must not reference itself" in error
+        for error in result.validation_errors
+    )
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_error"),
+    [
+        (
+            {
+                "component": "Column",
+                "id": "root",
+                "children": ["component_table", "component_missing"],
+            },
+            (
+                "updateComponents.components[1].children[1] references unknown "
+                "component 'component_missing'"
+            ),
+        ),
+        (
+            {
+                "component": "Card",
+                "id": "root",
+                "child": "component_missing",
+            },
+            (
+                "updateComponents.components[1].child references unknown component "
+                "'component_missing'"
+            ),
+        ),
+        (
+            {
+                "component": "Modal",
+                "id": "root",
+                "trigger": "component_missing",
+                "content": "component_table",
+            },
+            (
+                "updateComponents.components[1].trigger references unknown "
+                "component 'component_missing'"
+            ),
+        ),
+        (
+            {
+                "component": "Tabs",
+                "id": "root",
+                "tabs": [
+                    {
+                        "title": "Overview",
+                        "child": "component_missing",
+                    }
+                ],
+            },
+            (
+                "updateComponents.components[1].tabs[0].child references unknown "
+                "component 'component_missing'"
+            ),
+        ),
+    ],
+)
+def test_a2ui_validation_rejects_unknown_references_in_mixed_payload(
+    component: dict[str, Any],
+    expected_error: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_unknown_reference",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            component,
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert expected_error in result.validation_errors
+
+
+def test_a2ui_validation_rejects_string_reference_to_inline_only_id() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_inline_only_reference",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Column",
+                "id": "root",
+                "children": [
+                    {
+                        "component": "Text",
+                        "id": "component_inline_text",
+                        "text": "Inline summary.",
+                    },
+                    "component_inline_text",
+                ],
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert (
+        "updateComponents.components[1].children[1] references unknown "
+        "component 'component_inline_text'"
+    ) in result.validation_errors
+
+
+def test_a2ui_validation_allows_incremental_reference_to_existing_component() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    surface_id = "surface_incremental_reference"
+    payload = _a2ui_update(
+        surface_id=surface_id,
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Column",
+                "id": "root",
+                "children": ["component_existing_summary"],
+            },
+        ],
+    )
+    existing_components = {
+        surface_id: {
+            "component_existing_summary": {
+                "component": "Text",
+                "id": "component_existing_summary",
+                "text": "Existing summary.",
+            }
+        }
+    }
+
+    # Act
+    result = validate_outbound_a2ui(
+        payload,
+        existing_components_by_surface_id=existing_components,
+    )
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+
+
+@pytest.mark.parametrize(
+    "replacement_marker",
+    [
+        {"replace": True},
+        {"fullReplacement": True},
+        {"mode": "replace"},
+    ],
+)
+def test_a2ui_validation_rejects_full_replacement_reference_to_existing_component(
+    replacement_marker: dict[str, Any],
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    surface_id = "surface_full_replacement_reference"
+    payload = _a2ui_update(
+        surface_id=surface_id,
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Column",
+                "id": "root",
+                "children": ["component_existing_summary"],
+            },
+        ],
+    )
+    payload["updateComponents"].update(replacement_marker)
+    existing_components = {
+        surface_id: {
+            "component_existing_summary": {
+                "component": "Text",
+                "id": "component_existing_summary",
+                "text": "Existing summary.",
+            }
+        }
+    }
+
+    # Act
+    result = validate_outbound_a2ui(
+        payload,
+        existing_components_by_surface_id=existing_components,
+    )
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert (
+        "updateComponents.components[1].children[0] references unknown component "
+        "'component_existing_summary'"
+    ) in result.validation_errors
+
+
+def test_a2ui_validation_rejects_inline_child_cycle_in_mixed_extension_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_mixed_inline_reference_cycle",
+        components=[
+            {
+                "component": "Table",
+                "id": "component_table",
+                "columns": [{"key": "name", "label": "Name"}],
+                "rows": [{"name": "ABC Manufacturing"}],
+            },
+            {
+                "component": "Column",
+                "id": "root",
+                "children": [
+                    {
+                        "component": "Column",
+                        "id": "inline_column",
+                        "children": ["root"],
+                    }
+                ],
+            },
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any(
+        "circular component references" in error for error in result.validation_errors
+    )
 
 
 def test_a2ui_validation_preserves_specialist_payload_with_plan_metadata() -> None:
@@ -634,7 +1495,9 @@ def test_a2ui_validation_preserves_partial_update_without_root() -> None:
     assert result.renderer_part.data == payload
 
 
-def test_a2ui_validation_preserves_partial_update_with_existing_child_reference() -> None:
+def test_a2ui_validation_preserves_partial_update_with_existing_child_reference() -> (
+    None
+):
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
 
@@ -965,7 +1828,9 @@ def test_a2ui_validation_rejects_repaired_secret_bearing_payload() -> None:
         ]
     )
 
-    def repair_with_secret(payload: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    def repair_with_secret(
+        payload: dict[str, Any], errors: list[str]
+    ) -> dict[str, Any]:
         del errors
         repaired_payload = dict(payload)
         repaired_payload["updateComponents"] = {

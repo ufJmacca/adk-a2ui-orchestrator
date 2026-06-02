@@ -85,6 +85,53 @@ def test_app_module_entrypoint_starts_local_http_app_with_required_runtime_env()
     assert "test-openrouter-key" not in stderr
 
 
+def test_app_module_entrypoint_wires_configured_model_into_server(monkeypatch) -> None:
+    # Arrange
+    from orchestrator_demo.app import __main__ as app_main
+
+    fake_model = object()
+    captured = {}
+
+    class RecordingClassifier:
+        def __init__(self, *, model) -> None:
+            self.model = model
+
+    class FakeServer:
+        base_url = "http://127.0.0.1:0"
+
+        def serve_forever(self) -> None:
+            captured["served"] = True
+            raise KeyboardInterrupt
+
+        def stop(self) -> None:
+            captured["stopped"] = True
+
+    def fake_create_server(*, host, port, app):
+        captured["host"] = host
+        captured["port"] = port
+        captured["app"] = app
+        return FakeServer()
+
+    monkeypatch.setattr(app_main, "build_litellm_model", lambda: fake_model)
+    monkeypatch.setattr(app_main, "LiteLlmIntentClassifier", RecordingClassifier)
+    monkeypatch.setattr(app_main, "create_server", fake_create_server)
+    monkeypatch.setenv("ORCHESTRATOR_APP_HOST", "127.0.0.1")
+    monkeypatch.setenv("ORCHESTRATOR_APP_PORT", "0")
+
+    # Act
+    result = app_main.main()
+
+    # Assert
+    service = captured["app"]._service
+    classifier = service._router._intent_classifier
+    assert result == 0
+    assert classifier.model is fake_model
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 0
+    assert captured["served"] is True
+    assert captured["stopped"] is True
+
+
 def test_app_module_entrypoint_loads_local_dotenv_before_required_env_check(
     tmp_path: Path,
 ) -> None:

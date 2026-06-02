@@ -3,11 +3,13 @@ const state = {
   textSurfaceIds: new Map(),
   nextTextSurfaceIndex: 1,
   activeSurfaceIdForPayload: null,
+  activeDataContextForPayload: undefined,
 };
 
 const COMPONENT_RENDERERS = {
   Column: renderColumn,
   Row: renderRow,
+  List: renderList,
   Text: renderText,
   Button: renderButton,
   TextField: renderTextField,
@@ -17,22 +19,15 @@ const COMPONENT_RENDERERS = {
   Timeline: renderTimeline,
   Status: renderStatus,
 };
-const COMPONENT_NAMES = {
-  accordion: 'Accordion',
-  button: 'Button',
-  card: 'Card',
-  column: 'Column',
-  row: 'Row',
-  status: 'Status',
-  table: 'Table',
-  text: 'Text',
-  'text-field': 'TextField',
-  textfield: 'TextField',
-  text_field: 'TextField',
-  textField: 'TextField',
-  timeline: 'Timeline',
-};
+const COMPONENT_RENDERER_KEYS = new Map(
+  [
+    ...Object.keys(COMPONENT_RENDERERS).map((key) => [key.toLowerCase(), key]),
+    ['text-field', 'TextField'],
+    ['text_field', 'TextField'],
+  ],
+);
 const REQUIRED_PLAN_METADATA_KEYS = ['planId', 'planVersion', 'editedPlanVersion'];
+const BLOCKED_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
 
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('request-form').addEventListener('submit', submitRequest);
@@ -44,6 +39,9 @@ async function submitRequest(event) {
   event.preventDefault();
   const input = document.getElementById('request-input').value;
   const response = await submitRequestPayload(input);
+  if (response.httpOk !== false) {
+    clearA2uiSurfaces();
+  }
   handleTransportResponse(response);
 }
 
@@ -71,10 +69,55 @@ async function submitUserActionPayload(eventPayload) {
 }
 
 async function readJsonResponse(response) {
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+  let payload = {};
+  try {
+    payload = await response.json();
+  } catch (error) {
+    payload = {};
   }
-  return response.json();
+  if (response.ok) {
+    return payload;
+  }
+  return normalizeErrorResponse(response, payload);
+}
+
+function normalizeErrorResponse(response, payload) {
+  const normalized = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? { ...payload }
+    : {};
+  const errorEvent = statusEventForError(response.status, normalized.error);
+  const statusEvents = Array.isArray(normalized.statusEvents)
+    ? [...normalized.statusEvents]
+    : [];
+  if (errorEvent) {
+    statusEvents.push(errorEvent);
+  }
+  return {
+    ...normalized,
+    status: normalized.status || 'error',
+    statusEvents,
+    httpOk: false,
+    httpStatus: response.status,
+  };
+}
+
+function statusEventForError(httpStatus, error) {
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    return {
+      status: error.code || 'request_failed',
+      message: error.message || `Request failed with HTTP ${httpStatus}.`,
+    };
+  }
+  if (typeof error === 'string' && error) {
+    return {
+      status: 'request_failed',
+      message: error,
+    };
+  }
+  return {
+    status: 'request_failed',
+    message: `Request failed with HTTP ${httpStatus}.`,
+  };
 }
 
 async function refreshStatus() {
@@ -97,10 +140,15 @@ async function refreshArtifacts() {
 }
 
 function handleTransportResponse(response) {
-  renderA2uiParts(response.a2uiParts || []);
+  if (Object.prototype.hasOwnProperty.call(response, 'a2uiParts')) {
+    renderA2uiParts(response.a2uiParts || []);
+  }
   renderStatusUpdates(response.statusEvents || []);
   if (response.artifacts) {
     renderArtifacts(response.artifacts);
+  }
+  if (response.httpOk === false) {
+    return;
   }
   refreshStatus();
   refreshArtifacts();
@@ -125,6 +173,10 @@ function renderArtifacts(artifacts) {
 }
 
 function renderA2uiParts(parts) {
+  if (parts.length === 0) {
+    return;
+  }
+
   for (const part of parts) {
     if (part.type === 'text' && typeof part.text === 'string') {
       renderTextPart(part);
@@ -194,6 +246,15 @@ function textPartSurfaceId(part) {
   return state.textSurfaceIds.get(key);
 }
 
+function clearA2uiSurfaces() {
+  for (const surface of state.surfaces.values()) {
+    surface.element.remove();
+  }
+  state.surfaces.clear();
+  document.getElementById('approval-surfaces').replaceChildren();
+  document.getElementById('downstream-surfaces').replaceChildren();
+}
+
 function createSurface(message) {
   const surfaceId = message.surfaceId;
   if (!surfaceId) {
@@ -224,6 +285,8 @@ function createSurface(message) {
       components: new Map(),
       dataModel: {},
     });
+  } else if (isApprovalSurfaceId(surfaceId)) {
+    clearApprovalEditData(state.surfaces.get(surfaceId));
   }
 }
 
@@ -232,7 +295,31 @@ function updateDataModel(message) {
   if (!surface) {
     return;
   }
-  surface.dataModel = message.data || {};
+  applyDataModelUpdate(surface, message);
+  renderSurface(message.surfaceId);
+}
+
+function applyDataModelUpdate(surface, message) {
+  const hasPath = Object.prototype.hasOwnProperty.call(message, 'path');
+  const hasValue = Object.prototype.hasOwnProperty.call(message, 'value');
+  if (!hasPath && !hasValue) {
+    surface.dataModel = message.data || {};
+    return;
+  }
+
+  const parts = safePathParts(hasPath ? message.path : '/');
+  if (parts === null) {
+    return;
+  }
+  if (parts.length === 0) {
+    surface.dataModel = hasValue ? message.value : {};
+    return;
+  }
+  if (hasValue) {
+    setValueAtPathParts(surface, parts, message.value);
+    return;
+  }
+  deleteValueAtPathParts(surface, parts);
 }
 
 function updateComponents(message) {
@@ -240,13 +327,38 @@ function updateComponents(message) {
   if (!surface) {
     return;
   }
-  surface.components.clear();
+  if (isFullComponentReplacement(message)) {
+    surface.components.clear();
+  }
   for (const component of message.components || []) {
     if (component.id) {
       surface.components.set(component.id, component);
     }
   }
   renderSurface(message.surfaceId);
+}
+
+function isFullComponentReplacement(message) {
+  return (
+    message.replace === true
+    || message.fullReplacement === true
+    || message.mode === 'replace'
+  );
+}
+
+function isApprovalSurfaceId(surfaceId) {
+  return typeof surfaceId === 'string' && surfaceId.startsWith('surface_plan_');
+}
+
+function clearApprovalEditData(surface) {
+  if (
+    !surface
+    || typeof surface.dataModel !== 'object'
+    || Array.isArray(surface.dataModel)
+  ) {
+    return;
+  }
+  delete surface.dataModel.approvalEdits;
 }
 
 function deleteSurface(surfaceId) {
@@ -270,86 +382,174 @@ function renderSurface(surfaceId) {
   surface.element.replaceChildren(renderComponent(surfaceId, root));
 }
 
-function renderComponent(surfaceId, component) {
-  const componentName = normalizedComponentName(component);
-  const renderer = COMPONENT_RENDERERS[componentName];
-  if (!renderer) {
-    return renderUnsupportedComponent(component);
+function renderComponent(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
+  const componentId = component && component.id;
+  if (typeof componentId === 'string' && componentId) {
+    if (renderStack.has(componentId)) {
+      return renderRecursiveComponent(componentId);
+    }
+    renderStack.add(componentId);
   }
-  return renderer(surfaceId, component);
+  const rendererKey = normalizedComponentRendererKey(component);
+  const renderer = rendererKey ? COMPONENT_RENDERERS[rendererKey] : null;
+  let rendered;
+  if (renderer) {
+    rendered = renderer(surfaceId, component, dataContext, renderStack);
+  } else {
+    rendered = renderUnsupportedComponent(component);
+  }
+  if (typeof componentId === 'string' && componentId) {
+    renderStack.delete(componentId);
+  }
+  return rendered;
 }
 
-function normalizedComponentName(component) {
-  const rawName = component.component ?? component.type ?? '';
-  if (typeof rawName !== 'string') {
-    return '';
+function normalizedComponentRendererKey(component) {
+  const componentName = Object.prototype.hasOwnProperty.call(component, 'type')
+    ? component.type
+    : component.component;
+  if (typeof componentName !== 'string') {
+    return null;
   }
-  return COMPONENT_NAMES[rawName] || COMPONENT_NAMES[rawName.toLowerCase()] || rawName;
+  return COMPONENT_RENDERER_KEYS.get(componentName.toLowerCase()) || null;
 }
 
-function renderChildren(surfaceId, children) {
+function renderChildren(
+  surfaceId,
+  childIds,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
   const surface = surfaceFor(surfaceId);
   if (!surface) {
     return [];
   }
-  const childList = Array.isArray(children) ? children : children ? [children] : [];
-  return childList
-    .map((child) => {
-      if (typeof child === 'string') {
-        return surface.components.get(child);
-      }
-      if (child && typeof child === 'object') {
-        if (typeof child.componentId === 'string') {
-          return surface.components.get(child.componentId);
-        }
-        return child;
-      }
-      return null;
-    })
+
+  if (isChildTemplate(childIds)) {
+    const template = surface.components.get(childIds.componentId);
+    const items = valueAtPath(surfaceId, childIds.path, dataContext);
+    if (!template || !Array.isArray(items)) {
+      return [];
+    }
+    return items.map((item) => (
+      renderComponent(surfaceId, template, item, renderStack)
+    ));
+  }
+
+  if (!Array.isArray(childIds)) {
+    return [];
+  }
+
+  return childIds
+    .map((childId) => (
+      typeof childId === 'string'
+        ? surface.components.get(childId)
+        : childId
+    ))
     .filter(Boolean)
-    .map((component) => renderComponent(surfaceId, component));
+    .map((component) => (
+      renderComponent(surfaceId, component, dataContext, renderStack)
+    ));
 }
 
-function renderColumn(surfaceId, component) {
+function isChildTemplate(value) {
+  return (
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && typeof value.componentId === 'string'
+    && typeof value.path === 'string'
+  );
+}
+
+function renderColumn(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
   const element = document.createElement('div');
   element.className = 'a2ui-column';
-  element.replaceChildren(...renderChildren(surfaceId, component.children || []));
+  element.replaceChildren(
+    ...renderChildren(surfaceId, component.children || [], dataContext, renderStack),
+  );
   return element;
 }
 
-function renderRow(surfaceId, component) {
+function renderRow(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
   const element = document.createElement('div');
   element.className = 'a2ui-row';
-  element.replaceChildren(...renderChildren(surfaceId, component.children || []));
+  element.replaceChildren(
+    ...renderChildren(surfaceId, component.children || [], dataContext, renderStack),
+  );
   return element;
 }
 
-function renderText(_surfaceId, component) {
+function renderList(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
+  const element = document.createElement('ul');
+  element.className = 'a2ui-list';
+  for (const child of renderChildren(
+    surfaceId,
+    component.children || [],
+    dataContext,
+    renderStack,
+  )) {
+    const item = document.createElement('li');
+    item.appendChild(child);
+    element.appendChild(item);
+  }
+  return element;
+}
+
+function renderText(surfaceId, component, dataContext = undefined) {
   const variant = component.variant || 'body';
   const element = document.createElement(variant === 'h2' || variant === 'h3' ? 'h3' : 'p');
   element.className = variant === 'h2' ? 'a2ui-text-h2' : variant === 'h3' ? 'a2ui-text-h3' : 'a2ui-text';
-  element.textContent = String(component.text || '');
+  const text = resolveBoundValue(surfaceId, component.text, dataContext);
+  element.textContent = String(text ?? '');
   return element;
 }
 
-function renderButton(surfaceId, component) {
+function renderButton(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
   const button = document.createElement('button');
   button.type = 'button';
   button.dataset.variant = component.variant || 'default';
   const label = component.child
-    ? renderChildren(surfaceId, [component.child])[0]
+    ? renderChildren(surfaceId, [component.child], dataContext, renderStack)[0]
     : document.createTextNode(component.label || 'Action');
   button.replaceChildren(label);
   const context = component.action && component.action.event
     ? component.action.event.context
     : null;
   if (context) {
-    button.addEventListener('click', () => postUserAction(buildUserAction(context, surfaceId)));
+    button.addEventListener('click', () => (
+      postUserAction(buildUserAction(context, surfaceId, dataContext))
+    ));
   }
   return button;
 }
 
-function renderTextField(surfaceId, component) {
+function renderTextField(surfaceId, component, dataContext = undefined) {
   const wrapper = document.createElement('label');
   wrapper.className = 'a2ui-field';
   const label = document.createElement('span');
@@ -359,33 +559,44 @@ function renderTextField(surfaceId, component) {
     : document.createElement('input');
   const path = component.value && component.value.path;
   if (path) {
-    input.value = String(valueAtPath(surfaceId, path) || '');
-    input.addEventListener('input', () => setValueAtPath(surfaceId, path, input.value));
+    input.value = String(valueAtPath(surfaceId, path, dataContext) ?? '');
+    input.addEventListener('input', () => (
+      setValueAtPath(surfaceId, path, input.value, dataContext)
+    ));
   }
   wrapper.replaceChildren(label, input);
   return wrapper;
 }
 
-function renderCard(surfaceId, component) {
+function renderCard(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
   const element = document.createElement('article');
   element.className = 'a2ui-card';
-  const cardChildren = [];
+  const children = [];
   if (hasRenderableValue(component.title)) {
     const title = document.createElement('h3');
     title.className = 'a2ui-card-title';
     title.textContent = String(component.title);
-    cardChildren.push(title);
+    children.push(title);
   }
   if (hasRenderableValue(component.body)) {
     const body = document.createElement('p');
     body.className = 'a2ui-card-body';
     body.textContent = String(component.body);
-    cardChildren.push(body);
+    children.push(body);
   }
   if (component.child) {
-    cardChildren.push(...renderChildren(surfaceId, [component.child]));
+    children.push(
+      ...renderChildren(surfaceId, [component.child], dataContext, renderStack),
+    );
   }
-  element.replaceChildren(...cardChildren);
+  if (children.length > 0) {
+    element.replaceChildren(...children);
+  }
   return element;
 }
 
@@ -425,12 +636,22 @@ function renderTable(_surfaceId, component) {
   return table;
 }
 
-function renderAccordion(surfaceId, component) {
+function renderAccordion(
+  surfaceId,
+  component,
+  dataContext = undefined,
+  renderStack = new Set(),
+) {
   const details = document.createElement('details');
   const summary = document.createElement('summary');
   summary.textContent = component.title || 'Details';
   details.appendChild(summary);
-  for (const child of renderChildren(surfaceId, component.children || [])) {
+  for (const child of renderChildren(
+    surfaceId,
+    component.children || [],
+    dataContext,
+    renderStack,
+  )) {
     details.appendChild(child);
   }
   return details;
@@ -460,11 +681,19 @@ function renderUnsupportedComponent(component) {
   return element;
 }
 
-function buildUserAction(context, surfaceId) {
+function renderRecursiveComponent(componentId) {
+  const element = document.createElement('p');
+  element.className = 'a2ui-text';
+  element.textContent = `Circular component reference: ${componentId}`;
+  return element;
+}
+
+function buildUserAction(context, surfaceId, dataContext = undefined) {
   requireActionSurfaceContextMatchesRenderedSurface(context, surfaceId);
   state.activeSurfaceIdForPayload = surfaceId;
+  state.activeDataContextForPayload = dataContext;
   try {
-    requirePlanMetadataForPlanAction(context);
+    requirePlanMetadataForPlanAction(context, surfaceId);
     const userAction = {
       type: context.type,
       surfaceId,
@@ -473,6 +702,7 @@ function buildUserAction(context, surfaceId) {
     return { userAction };
   } finally {
     state.activeSurfaceIdForPayload = null;
+    state.activeDataContextForPayload = undefined;
   }
 }
 
@@ -482,8 +712,8 @@ function requireActionSurfaceContextMatchesRenderedSurface(context, surfaceId) {
   }
 }
 
-function requirePlanMetadataForPlanAction(context) {
-  if (!context.surfaceId || !context.surfaceId.startsWith('surface_plan_')) {
+function requirePlanMetadataForPlanAction(context, surfaceId) {
+  if (!surfaceId || !surfaceId.startsWith('surface_plan_')) {
     return;
   }
   const payload = context.payload || {};
@@ -501,8 +731,12 @@ function resolvePayload(value) {
     return value.map((item) => resolvePayload(item));
   }
   if (value && typeof value === 'object') {
-    if (typeof value.path === 'string') {
-      return valueAtPath(state.activeSurfaceIdForPayload, value.path);
+    if (Object.keys(value).length === 1 && typeof value.path === 'string') {
+      return valueAtPath(
+        state.activeSurfaceIdForPayload,
+        value.path,
+        state.activeDataContextForPayload,
+      );
     }
     const resolved = {};
     for (const [key, childValue] of Object.entries(value)) {
@@ -520,13 +754,31 @@ function surfaceFor(surfaceId) {
   return state.surfaces.get(surfaceId) || null;
 }
 
-function valueAtPath(surfaceId, path) {
+function resolveBoundValue(surfaceId, value, dataContext = undefined) {
+  if (
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.keys(value).length === 1
+    && typeof value.path === 'string'
+  ) {
+    return valueAtPath(surfaceId, value.path, dataContext);
+  }
+  return value;
+}
+
+function valueAtPath(surfaceId, path, dataContext = undefined) {
   const surface = surfaceFor(surfaceId);
   if (!surface) {
     return undefined;
   }
-  const parts = path.split('/').filter(Boolean);
-  let current = surface.dataModel;
+  const parts = safePathParts(path);
+  if (parts === null) {
+    return undefined;
+  }
+  let current = dataContext !== undefined && !path.startsWith('/')
+    ? dataContext
+    : surface.dataModel;
   for (const part of parts) {
     if (!current || typeof current !== 'object') {
       return undefined;
@@ -536,13 +788,37 @@ function valueAtPath(surfaceId, path) {
   return current;
 }
 
-function setValueAtPath(surfaceId, path, value) {
+function setValueAtPath(surfaceId, path, value, dataContext = undefined) {
   const surface = surfaceFor(surfaceId);
   if (!surface) {
     return;
   }
-  const parts = path.split('/').filter(Boolean);
-  let current = surface.dataModel;
+  const parts = safePathParts(path);
+  if (parts === null || parts.length === 0) {
+    return;
+  }
+  if (dataContext !== undefined && !path.startsWith('/')) {
+    if (!dataContext || typeof dataContext !== 'object') {
+      return;
+    }
+    setValueAtPathPartsOnObject(dataContext, parts, value);
+    return;
+  }
+  setValueAtPathParts(surface, parts, value);
+}
+
+function setValueAtPathParts(surface, parts, value) {
+  if (
+    !surface.dataModel
+    || typeof surface.dataModel !== 'object'
+  ) {
+    surface.dataModel = {};
+  }
+  setValueAtPathPartsOnObject(surface.dataModel, parts, value);
+}
+
+function setValueAtPathPartsOnObject(target, parts, value) {
+  let current = target;
   for (const part of parts.slice(0, -1)) {
     if (!current[part] || typeof current[part] !== 'object') {
       current[part] = {};
@@ -550,4 +826,38 @@ function setValueAtPath(surfaceId, path, value) {
     current = current[part];
   }
   current[parts[parts.length - 1]] = value;
+}
+
+function deleteValueAtPathParts(surface, parts) {
+  let current = surface.dataModel;
+  for (const part of parts.slice(0, -1)) {
+    if (!current || typeof current !== 'object') {
+      return;
+    }
+    current = current[part];
+  }
+  if (!current || typeof current !== 'object') {
+    return;
+  }
+  const lastPart = parts[parts.length - 1];
+  if (Array.isArray(current) && /^\d+$/.test(lastPart)) {
+    current.splice(Number(lastPart), 1);
+    return;
+  }
+  delete current[lastPart];
+}
+
+function safePathParts(path) {
+  if (typeof path !== 'string') {
+    return null;
+  }
+  const parts = path.split('/').filter(Boolean).map(decodeJsonPointerPart);
+  if (parts.some((part) => BLOCKED_PATH_SEGMENTS.has(part))) {
+    return null;
+  }
+  return parts;
+}
+
+function decodeJsonPointerPart(part) {
+  return part.replace(/~1/g, '/').replace(/~0/g, '~');
 }
