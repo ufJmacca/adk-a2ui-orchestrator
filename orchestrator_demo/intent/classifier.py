@@ -25,6 +25,22 @@ from orchestrator_demo.contracts import (
 CompletionCallable = Callable[[str], Awaitable[str | Mapping[str, Any]]]
 
 
+class ClassifierUnavailableAgentsError(ValueError):
+    """Raised when an assessment selects agents outside the current registry."""
+
+    def __init__(
+        self,
+        assessment: LlmIntentAssessment,
+        unavailable_agent_ids: Sequence[str],
+    ) -> None:
+        self.assessment = assessment
+        self.unavailable_agent_ids = list(unavailable_agent_ids)
+        unavailable = ", ".join(self.unavailable_agent_ids)
+        super().__init__(
+            f"classifier assessment requires unavailable agents: {unavailable}"
+        )
+
+
 @runtime_checkable
 class IntentClassifier(Protocol):
     """Common contract for deterministic and model-backed assessment."""
@@ -343,8 +359,7 @@ def _require_available_agents(
         if agent_id not in available_agent_ids
     ]
     if unavailable_agent_ids:
-        unavailable = ", ".join(unavailable_agent_ids)
-        raise ValueError(f"classifier assessment requires unavailable agents: {unavailable}")
+        raise ClassifierUnavailableAgentsError(assessment, unavailable_agent_ids)
 
 
 def _build_classifier_prompt(
@@ -547,6 +562,7 @@ def _extract_json_object(text: str) -> Mapping[str, Any]:
 
 
 __all__ = [
+    "ClassifierUnavailableAgentsError",
     "CompletionCallable",
     "DeterministicIntentClassifier",
     "IntentClassifier",
