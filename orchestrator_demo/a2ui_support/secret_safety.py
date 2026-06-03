@@ -9,6 +9,23 @@ REDACTED_SECRET = "<redacted-secret>"
 REDACTED_KEY = "<redacted-key>"
 
 _QUOTED_TOKEN_PATTERN = re.compile(r"(['\"])([^'\"]{1,120})(\1)")
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)"
+    r"(?:[_-][A-Za-z0-9]+)*"
+    r"\b\s*[:=]\s*\S{6,}",
+    re.IGNORECASE,
+)
+_SECRET_KEY_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"([A-Za-z0-9_-]*"
+    r"(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|"
+    r"credential|authorization)"
+    r"[A-Za-z0-9_-]*)"
+    r"(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
+)
 _SECRET_FIELD_MARKERS = (
     "api_key",
     "apikey",
@@ -67,9 +84,11 @@ def safe_path_component(value: str) -> str:
 
 def redact_secret_like_values(message: str) -> str:
     redacted = str(message)
+    redacted = _SECRET_ASSIGNMENT_PATTERN.sub(REDACTED_SECRET, redacted)
     for pattern in _SECRET_VALUE_PATTERNS:
         redacted = pattern.sub(REDACTED_SECRET, redacted)
-    return _QUOTED_TOKEN_PATTERN.sub(_redact_quoted_secret_key, redacted)
+    redacted = _QUOTED_TOKEN_PATTERN.sub(_redact_quoted_secret_key, redacted)
+    return _SECRET_KEY_TOKEN_PATTERN.sub(_redact_unquoted_secret_key, redacted)
 
 
 def _redact_quoted_secret_key(match: re.Match[str]) -> str:
@@ -77,6 +96,21 @@ def _redact_quoted_secret_key(match: re.Match[str]) -> str:
     token = match.group(2)
     if is_secret_like_key(token):
         return f"{quote}{REDACTED_KEY}{quote}"
+    return match.group(0)
+
+
+def _redact_unquoted_secret_key(match: re.Match[str]) -> str:
+    token = match.group(1)
+    normalized = token.casefold()
+    if normalized in {
+        REDACTED_SECRET.strip("<>"),
+        REDACTED_KEY.strip("<>"),
+        "secret-like",
+        "secret-bearing",
+    }:
+        return match.group(0)
+    if is_secret_like_key(token):
+        return REDACTED_KEY
     return match.group(0)
 
 

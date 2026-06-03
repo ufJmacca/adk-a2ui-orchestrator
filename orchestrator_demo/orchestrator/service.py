@@ -32,13 +32,17 @@ from orchestrator_demo.orchestrator.approval_state import (
     ApprovalActionResult,
     ApprovalRecord,
     ApprovalStateStore,
+    PlanMutationError,
 )
 from orchestrator_demo.orchestrator.graph_runtime import (
     AdkGraphRuntime,
     GraphExecutionResult,
     GraphRuntimeError,
 )
-from orchestrator_demo.orchestrator.planner import DraftExecutionPlanner
+from orchestrator_demo.orchestrator.planner import (
+    DraftExecutionPlanner,
+    PlanCreationError,
+)
 from orchestrator_demo.orchestrator.request_context import (
     RequestContext,
     SpecialistPreApprovalError,
@@ -105,7 +109,9 @@ class OrchestratorService:
         surface_registry: SurfaceRouteRegistry | None = None,
     ) -> None:
         self._registry = registry or AgentRegistry.from_default_config()
-        self._specialists = dict(specialists or build_default_specialists())
+        self._specialists = dict(
+            build_default_specialists() if specialists is None else specialists
+        )
         self._specialist_user_action_adapters = _default_user_action_adapters(
             self._specialists
         )
@@ -122,11 +128,12 @@ class OrchestratorService:
         )
         self._planner = DraftExecutionPlanner(registry=self._registry)
         self._approval_store = ApprovalStateStore(
-            agent_descriptors=self._registry.descriptors(),
+            agent_descriptors=self._registry.descriptors,
             graph_runtime=_GuardedGraphRuntime(
                 specialists=self._specialists,
                 contexts_by_plan_id=self._contexts_by_plan_id,
             ),
+            plan_validator=self._require_specialist_handlers_available,
         )
 
     async def handle_user_request(self, user_input: str) -> OrchestratorRequestResult:
@@ -155,14 +162,19 @@ class OrchestratorService:
             return self._handle_orchestrator_owned_user_action(user_action)
 
         specialist_response = _coerce_specialist_response(route_result.response)
-        prepared = self._prepare_specialist_response_for_delivery(
-            specialist_response
+        owner_agent_id = (
+            route_result.owner.owner_id if route_result.owner is not None else None
         )
-        specialist_responses = ((prepared.response,) if prepared.response else ())
+        prepared = self._prepare_specialist_response_for_delivery(
+            specialist_response,
+            owner_agent_id=owner_agent_id,
+        )
         return OrchestratorUserActionResult(
             status=route_result.status,
             surface_route_result=route_result,
-            specialist_responses=specialist_responses,
+            specialist_responses=(
+                (prepared.response,) if prepared.response is not None else ()
+            ),
             a2ui_parts=prepared.a2ui_parts,
             final_artifacts=_final_artifacts_for_response(prepared.response),
         )
@@ -207,25 +219,53 @@ class OrchestratorService:
         if selected_agent is None:
             raise SpecialistPreApprovalError("direct route is missing selected_agent")
 
-        specialist = self._specialists[selected_agent]
+        specialist = self._specialists.get(selected_agent)
+        if specialist is None:
+            decision = RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=context.decision.confidence,
+                reason=(
+                    "A safe direct route cannot be formed because no local "
+                    f"specialist handler is available for agent {selected_agent}."
+                ),
+            )
+            context.decision = decision
+            return OrchestratorRequestResult(
+                path=decision.path,
+                decision=decision,
+                context=context,
+            )
+
         request = SpecialistRequest(
-            request_id=f"request_direct_{selected_agent}_{context.plan_scope_id}",
+            request_id=(
+                f"request_direct_{context.plan_scope_id}_"
+                f"{_contract_id_token(selected_agent)}"
+            ),
             user_input=context.user_input,
             agent_id=selected_agent,
         )
-        response = await call_specialist_with_guard(
-            context,
-            request,
-            specialist.handle,
+        try:
+            response = await call_specialist_with_guard(
+                context,
+                request,
+                specialist.handle,
+                enforce_response_agent_id=False,
+            )
+        except Exception as exc:
+            raise GraphRuntimeError(
+                _direct_handler_failure_message(selected_agent, exc)
+            ) from None
+        prepared = self._prepare_specialist_response_for_delivery(
+            response,
+            owner_agent_id=selected_agent,
         )
-        prepared = self._prepare_specialist_response_for_delivery(response)
-        assert prepared.response is not None
 
         return OrchestratorRequestResult(
             path="direct",
             decision=context.decision,
             context=context,
-            specialist_responses=(prepared.response,),
+            specialist_responses=((prepared.response,) if prepared.response else ()),
             a2ui_parts=prepared.a2ui_parts,
             final_artifacts=_final_artifacts_for_response(prepared.response),
         )
@@ -234,7 +274,43 @@ class OrchestratorService:
         self,
         context: RequestContext,
     ) -> OrchestratorRequestResult:
-        plan = self._planner.create_plan(context)
+        try:
+            plan = self._planner.create_plan(context)
+        except PlanCreationError as exc:
+            decision = RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=context.decision.confidence,
+                reason=f"A safe approval plan cannot be formed: {exc}",
+            )
+            context.decision = decision
+            return OrchestratorRequestResult(
+                path=decision.path,
+                decision=decision,
+                context=context,
+            )
+        missing_agent_ids = _missing_specialist_handler_agent_ids(
+            plan,
+            self._specialists,
+        )
+        if missing_agent_ids:
+            decision = RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=context.decision.confidence,
+                reason=(
+                    "A safe approval plan cannot be formed because no local "
+                    "specialist handlers are available for agents: "
+                    f"{', '.join(missing_agent_ids)}."
+                ),
+            )
+            context.decision = decision
+            return OrchestratorRequestResult(
+                path=decision.path,
+                decision=decision,
+                context=context,
+            )
+
         self._approval_store.add_draft(plan)
         self._contexts_by_plan_id[plan.plan_id] = context
         a2ui_parts = prepare_approval_a2ui_for_renderer(
@@ -258,19 +334,22 @@ class OrchestratorService:
         self,
         user_action: Any,
     ) -> OrchestratorUserActionResult:
-        approval_result = self._approval_store.apply_user_action(user_action)
+        try:
+            approval_result = self._approval_store.apply_user_action(user_action)
+        except GraphRuntimeError as exc:
+            plan_id = _plan_id_from_graph_error(exc)
+            if plan_id is not None:
+                self._approval_store.reset_failed_approval(plan_id)
+                self._sync_context_draft(plan_id)
+            raise
         a2ui_parts = self._prepare_approval_result_a2ui(approval_result)
         graph_execution = approval_result.graph_execution
-        graph_specialist_responses = (
-            graph_execution.specialist_responses
-            if graph_execution is not None
-            else ()
-        )
         prepared_specialist_responses = self._prepare_graph_responses_for_delivery(
-            graph_specialist_responses,
+            graph_execution,
         )
         specialist_responses = tuple(
-            prepared.response for prepared in prepared_specialist_responses
+            prepared.response
+            for prepared in prepared_specialist_responses
             if prepared.response is not None
         )
         specialist_a2ui_parts = tuple(
@@ -346,18 +425,38 @@ class OrchestratorService:
 
     def _prepare_graph_responses_for_delivery(
         self,
-        responses: tuple[SpecialistResponse, ...],
+        graph_execution: GraphExecutionResult | None,
     ) -> tuple[_PreparedSpecialistResponse, ...]:
+        if graph_execution is None:
+            return ()
+
         return tuple(
-            self._prepare_specialist_response_for_delivery(response)
-            for response in responses
+            self._prepare_specialist_response_for_delivery(
+                response,
+                owner_agent_id=request.agent_id,
+            )
+            for response, request in zip(
+                graph_execution.specialist_responses,
+                graph_execution.specialist_response_requests,
+            )
         )
 
     def _prepare_specialist_response_for_delivery(
         self,
         response: SpecialistResponse | None,
+        *,
+        owner_agent_id: str | None,
     ) -> _PreparedSpecialistResponse:
-        if response is None or response.a2ui_payload is None:
+        if response is None:
+            return _PreparedSpecialistResponse(response=response)
+        if owner_agent_id is None:
+            return _PreparedSpecialistResponse(response=response)
+        if response.a2ui_payload is None:
+            if _has_a2ui_validation_diagnostic(response):
+                return self._prepare_fallback_specialist_response(
+                    response,
+                    owner_agent_id=owner_agent_id,
+                )
             return _PreparedSpecialistResponse(response=response)
 
         try:
@@ -366,29 +465,66 @@ class OrchestratorService:
                 a2ui_parts=tuple(
                     prepare_specialist_a2ui_for_renderer(
                         response.a2ui_payload,
-                        owner_agent_id=response.agent_id,
+                        owner_agent_id=owner_agent_id,
                         surface_registry=self._surface_registry,
                     )
                 ),
             )
         except (RendererContractError, SurfaceOwnershipError):
-            fallback_payload = _fallback_specialist_a2ui_payload(response)
-            fallback_response = response.model_copy(
-                update={
-                    "a2ui_payload": fallback_payload,
-                    "surface_id": _fallback_surface_id(response),
-                }
+            return self._prepare_fallback_specialist_response(
+                response,
+                owner_agent_id=owner_agent_id,
             )
-            return _PreparedSpecialistResponse(
-                response=fallback_response,
-                a2ui_parts=tuple(
-                    prepare_specialist_a2ui_for_renderer(
-                        fallback_payload,
-                        owner_agent_id=response.agent_id,
-                        surface_registry=self._surface_registry,
-                    )
-                ),
+
+    def _prepare_fallback_specialist_response(
+        self,
+        response: SpecialistResponse,
+        *,
+        owner_agent_id: str,
+    ) -> _PreparedSpecialistResponse:
+        fallback_payload = _fallback_specialist_a2ui_payload(response)
+        fallback_response = response.model_copy(
+            update={
+                "a2ui_payload": fallback_payload,
+                "surface_id": _fallback_surface_id(response),
+            }
+        )
+        return _PreparedSpecialistResponse(
+            response=fallback_response,
+            a2ui_parts=tuple(
+                prepare_specialist_a2ui_for_renderer(
+                    fallback_payload,
+                    owner_agent_id=owner_agent_id,
+                    surface_registry=self._surface_registry,
+                )
+            ),
+        )
+
+    def _prepare_graph_response_a2ui(
+        self,
+        graph_execution: GraphExecutionResult | None,
+    ) -> tuple[DataPart, ...]:
+        if graph_execution is None:
+            return ()
+
+        return tuple(
+            part
+            for prepared in self._prepare_graph_responses_for_delivery(
+                graph_execution
             )
+            for part in prepared.a2ui_parts
+        )
+
+    def _prepare_specialist_response_a2ui(
+        self,
+        response: SpecialistResponse | None,
+        *,
+        owner_agent_id: str | None,
+    ) -> tuple[DataPart, ...]:
+        return self._prepare_specialist_response_for_delivery(
+            response,
+            owner_agent_id=owner_agent_id,
+        ).a2ui_parts
 
     def _sync_context_draft(self, plan_id: str) -> None:
         context = self._contexts_by_plan_id.get(plan_id)
@@ -397,6 +533,17 @@ class OrchestratorService:
 
         record = self._approval_store.get(plan_id)
         context.record_draft_plan(record.draft_plan)
+
+    def _require_specialist_handlers_available(self, plan: ExecutionPlan) -> None:
+        missing_agent_ids = _missing_specialist_handler_agent_ids(
+            plan,
+            self._specialists,
+        )
+        if missing_agent_ids:
+            raise PlanMutationError(
+                "plan references agents without executable handlers: "
+                f"{', '.join(missing_agent_ids)}"
+            )
 
 
 class _GuardedGraphRuntime:
@@ -417,14 +564,12 @@ class _GuardedGraphRuntime:
             raise GraphRuntimeError(
                 f"no routed request context is registered for approved plan {plan.plan_id}"
             )
-        was_approved = context.approved_plan_id is not None
         context.mark_plan_approved(plan)
+        runtime = AdkGraphRuntime(specialist_handlers=self._guarded_handlers())
         try:
-            runtime = AdkGraphRuntime(specialist_handlers=self._guarded_handlers())
             return runtime.execute(plan)
         except Exception:
-            if not was_approved:
-                context.rollback_plan_approval(plan.plan_id)
+            context.reset_plan_approval(plan.plan_id)
             raise
 
     def _guarded_handlers(self) -> dict[str, Any]:
@@ -448,7 +593,12 @@ class _GuardedGraphRuntime:
                 raise SpecialistPreApprovalError(
                     f"handler {agent_id!r} cannot execute request for {request.agent_id!r}"
                 )
-            return await call_specialist_with_guard(context, request, specialist.handle)
+            return await call_specialist_with_guard(
+                context,
+                request,
+                specialist.handle,
+                enforce_response_agent_id=False,
+            )
 
         return handle
 
@@ -461,7 +611,7 @@ class _LocalSpecialistUserActionAdapter:
 
     async def handle_user_action(self, _user_action: Any) -> SpecialistResponse:
         return SpecialistResponse(
-            response_id=f"response_{self._agent_id}_user_action",
+            response_id=f"response_{_contract_id_token(self._agent_id)}_user_action",
             agent_id=self._agent_id,
             content=(
                 f"{self._agent_id.replace('_', ' ').title()} Agent: "
@@ -473,11 +623,48 @@ class _LocalSpecialistUserActionAdapter:
 
 def _default_user_action_adapters(
     specialists: Mapping[str, SpecialistAgent],
-) -> dict[str, _LocalSpecialistUserActionAdapter]:
-    return {
-        agent_id: _LocalSpecialistUserActionAdapter(agent_id=agent_id)
-        for agent_id in specialists
-    }
+) -> dict[str, Any]:
+    adapters: dict[str, Any] = {}
+    for agent_id, specialist in specialists.items():
+        handler = getattr(specialist, "handle_user_action", None)
+        adapters[agent_id] = (
+            specialist
+            if callable(handler)
+            else _LocalSpecialistUserActionAdapter(agent_id=agent_id)
+        )
+    return adapters
+
+
+def _missing_specialist_handler_agent_ids(
+    plan: ExecutionPlan,
+    specialists: Mapping[str, SpecialistAgent],
+) -> list[str]:
+    missing_agent_ids: list[str] = []
+    for step in plan.steps:
+        if step.agent_id not in specialists and step.agent_id not in missing_agent_ids:
+            missing_agent_ids.append(step.agent_id)
+    return missing_agent_ids
+
+
+def _plan_id_from_graph_error(exc: GraphRuntimeError) -> str | None:
+    graph = exc.graph
+    if graph is None:
+        return None
+    plan_id = getattr(graph, "plan_id", None)
+    return plan_id if isinstance(plan_id, str) else None
+
+
+def _direct_handler_failure_message(agent_id: str, exc: Exception) -> str:
+    return (
+        f"specialist handler for direct route agent {agent_id} failed: "
+        f"{type(exc).__name__}. Error details redacted."
+    )
+
+
+def _contract_id_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip().lower())
+    token = token.strip("_-")
+    return token or "unknown"
 
 
 def _coerce_specialist_response(value: Any) -> SpecialistResponse | None:
@@ -548,6 +735,11 @@ def _final_artifacts_for_graph(
     }
 
 
+def _has_a2ui_validation_diagnostic(response: SpecialistResponse) -> bool:
+    diagnostic = response.structured_output.get("a2ui_validation")
+    return isinstance(diagnostic, Mapping)
+
+
 def _fallback_specialist_a2ui_payload(
     response: SpecialistResponse,
 ) -> list[dict[str, Any]]:
@@ -580,14 +772,7 @@ def _fallback_specialist_a2ui_payload(
 
 
 def _fallback_surface_id(response: SpecialistResponse) -> str:
-    return f"surface_fallback_{_safe_identifier(response.response_id)}"
-
-
-def _safe_identifier(value: str) -> str:
-    identifier = re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
-    if not identifier or not identifier[0].isalnum():
-        identifier = f"generated_{identifier}"
-    return identifier
+    return f"surface_fallback_{_contract_id_token(response.response_id)}"
 
 
 __all__ = [

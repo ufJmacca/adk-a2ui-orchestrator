@@ -163,6 +163,9 @@ class BasicCatalogSchema:
         is_full_replacement = _is_full_component_replacement(update_components)
         if is_full_replacement:
             existing_components = {}
+        validate_unknown_references = (
+            existing_components_by_surface_id is not None or is_full_replacement
+        )
         uses_renderer_extension_components = _uses_renderer_extension_components(
             components
         )
@@ -181,11 +184,15 @@ class BasicCatalogSchema:
                 errors,
                 path=f"{UPDATE_COMPONENTS_MESSAGE}.components",
                 existing_components=existing_components,
-                validate_unknown_references=(
-                    existing_components_by_surface_id is not None
-                    or is_full_replacement
-                ),
+                validate_unknown_references=validate_unknown_references,
             )
+            if not validate_unknown_references:
+                _validate_routed_action_component_references(
+                    components,
+                    errors,
+                    path=f"{UPDATE_COMPONENTS_MESSAGE}.components",
+                    existing_components=existing_components,
+                )
         _validate_generic_components(
             components,
             errors,
@@ -1152,6 +1159,43 @@ def _validate_update_component_references(
                 errors.append(
                     f"{reference_path} references unknown component {referenced_id!r}"
                 )
+
+
+def _validate_routed_action_component_references(
+    components: list[Any],
+    errors: list[str],
+    *,
+    path: str,
+    existing_components: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
+    component_tree = _iter_update_component_tree(components, path=path)
+    known_component_ids = _top_level_component_ids(components) | set(
+        (existing_components or {}).keys()
+    )
+
+    for component, component_path in component_tree:
+        if not _has_routed_component_action(component):
+            continue
+        for referenced_id, reference_path in _iter_component_id_references(
+            component,
+            component_path,
+            include_inline_objects=False,
+        ):
+            if referenced_id not in known_component_ids:
+                errors.append(
+                    f"{reference_path} references unknown component {referenced_id!r}"
+                )
+
+
+def _has_routed_component_action(component: Mapping[str, Any]) -> bool:
+    action = component.get("action")
+    if not isinstance(action, Mapping):
+        return False
+    event = action.get("event")
+    if not isinstance(event, Mapping):
+        return False
+    context = event.get("context")
+    return isinstance(context, Mapping) and _has_routed_user_action_context(context)
 
 
 def _top_level_component_ids(components: list[Any]) -> set[str]:

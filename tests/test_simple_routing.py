@@ -237,6 +237,44 @@ async def test_unavailable_classifier_agent_returns_clarification_required() -> 
 
 
 @pytest.mark.asyncio
+async def test_unavailable_sensitive_guardrail_returns_clarification_required() -> None:
+    # Arrange
+    user_input = "Assess credit risk and compliance guardrails for this customer."
+    slm_suggestion = IntentSuggestion(intent="credit_risk", confidence=0.82)
+    slm_client = _RecordingSlmClient(slm_suggestion)
+    classifier = _RecordingClassifier(
+        LlmIntentAssessment(
+            intents=["credit_risk", "compliance_policy"],
+            confidence=0.91,
+            complexity="complex",
+            required_agents=["credit_risk", "compliance_policy", "synthesis"],
+            rationale="Credit and compliance review requires guardrails.",
+        ),
+        slm_client,
+    )
+    default_registry = AgentRegistry.from_default_config()
+    available_descriptors = [
+        descriptor
+        for descriptor in default_registry.descriptors()
+        if descriptor.agent_id != "compliance_policy"
+    ]
+    router = RequestRouter(
+        slm_client=slm_client,
+        intent_classifier=classifier,
+        registry=_StaticRegistry(available_descriptors),
+    )
+
+    # Act
+    context = await router.route_request(user_input)
+
+    # Assert
+    assert context.decision.path == "clarification_required"
+    assert context.decision.selected_agent is None
+    assert "compliance_policy" in context.decision.reason
+    assert "unavailable" in context.decision.reason.casefold()
+
+
+@pytest.mark.asyncio
 async def test_high_confidence_single_agent_complex_assessment_requires_plan() -> None:
     # Arrange
     user_input = "Summarize the internal notes and prepare a follow-up workflow."
@@ -319,7 +357,7 @@ async def test_high_confidence_simple_assessment_with_multiple_intents_or_agents
 
 
 @pytest.mark.asyncio
-async def test_high_confidence_simple_synthesis_only_assessment_requires_plan() -> None:
+async def test_high_confidence_simple_synthesis_only_assessment_requires_clarification() -> None:
     # Arrange
     user_input = "Summarize the available outputs into a final brief."
     slm_suggestion = IntentSuggestion(intent="meeting_prep", confidence=0.95)
@@ -347,9 +385,10 @@ async def test_high_confidence_simple_synthesis_only_assessment_requires_plan() 
     assert context.decision.confidence >= 0.85
     assert context.llm_assessment.complexity == "simple"
     assert context.llm_assessment.required_agents == ["synthesis"]
-    assert context.decision.path == "plan_required"
+    assert context.decision.path == "clarification_required"
     assert context.decision.selected_agent is None
     assert "synthesis" in context.decision.reason.casefold()
+    assert "specialist workstream" in context.decision.reason.casefold()
 
 
 @pytest.mark.asyncio

@@ -41,11 +41,8 @@ def prepare_specialist_a2ui_for_renderer(
     staged_owners = dict(surface_registry._owners_by_surface_id)
     for part in parts:
         for surface_id in deleted_surface_ids_from_a2ui_payload(part.data):
-            surface_registry._clear_surface_from(
-                staged_owners,
-                surface_id,
-                owner_type="specialist",
-                owner_id=owner_agent_id,
+            surface_registry._clear_specialist_surface_from(
+                staged_owners, surface_id, agent_id=owner_agent_id
             )
         for surface_id in surface_ids_from_a2ui_payload(part.data):
             surface_registry._register_owner(

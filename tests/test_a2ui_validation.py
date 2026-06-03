@@ -303,11 +303,104 @@ def test_a2ui_validation_preserves_create_surface_envelope() -> None:
     assert result.renderer_part.data == payload
 
 
+def test_a2ui_validation_emits_each_specialist_a2ui_message_from_list() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = [
+        {
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": "surface_product_card",
+                "catalogId": BASIC_CATALOG_ID,
+            },
+        },
+        _a2ui_update(surface_id="surface_product_card"),
+    ]
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert len(result.renderer_parts) == 2
+    assert result.renderer_part == result.renderer_parts[0]
+    assert all(isinstance(part, DataPart) for part in result.renderer_parts)
+    assert [part.data for part in result.renderer_parts] == payload
+    assert all(
+        part.metadata["mimeType"] == A2UI_MIME_TYPE
+        for part in result.renderer_parts
+        if isinstance(part, DataPart)
+    )
+
+
 def test_a2ui_validation_preserves_non_plan_specialist_a2ui_payload() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
 
     payload = _a2ui_update()
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+
+
+def test_a2ui_validation_preserves_structured_specialist_user_action() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_product_card",
+        components=[
+            {
+                "component": "Card",
+                "id": "root",
+                "child": "component_product_content",
+            },
+            {
+                "component": "Column",
+                "id": "component_product_content",
+                "children": [
+                    "component_product_summary",
+                    "component_product_details",
+                ],
+            },
+            {
+                "component": "Text",
+                "id": "component_product_summary",
+                "text": "Treasury services fit the stated need.",
+            },
+            {
+                "component": "Button",
+                "id": "component_product_details",
+                "child": "component_product_details_label",
+                "action": {
+                    "event": {
+                        "name": "specialist_action",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_product_card",
+                            "payload": {
+                                "agentId": "product_opportunity",
+                                "action": "show_detail",
+                            },
+                        },
+                    }
+                },
+            },
+            {
+                "component": "Text",
+                "id": "component_product_details_label",
+                "text": "Show more detail",
+            },
+        ],
+    )
 
     # Act
     result = validate_outbound_a2ui(payload)
@@ -1325,6 +1418,40 @@ def test_a2ui_validation_falls_back_for_malformed_generic_component() -> None:
     assert any("action" in error for error in result.validation_errors)
 
 
+def test_a2ui_validation_falls_back_for_missing_specialist_component_reference() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_specialist_actions",
+        components=[
+            {
+                "component": "Button",
+                "id": "root",
+                "child": "component_missing_label",
+                "action": {
+                    "event": {
+                        "name": "specialist_action",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_specialist_actions",
+                            "payload": {"agentId": "product_opportunity"},
+                        },
+                    }
+                },
+            }
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any("references unknown component" in error for error in result.validation_errors)
+
+
 @pytest.mark.parametrize(
     ("missing_field", "expected_error"),
     [
@@ -1821,6 +1948,34 @@ def test_a2ui_validation_rejects_schema_valid_secret_like_keys() -> None:
     assert "OPENROUTER_API_KEY" not in exposed_diagnostic_text
     assert "<redacted-key>" in exposed_diagnostic_text
     assert "secret-like key" in exposed_diagnostic_text
+
+
+def test_a2ui_validation_redacts_secret_like_data_part_error_locations() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = {
+        "type": "data",
+        "data": _a2ui_update(),
+        "metadata": {"mimeType": A2UI_MIME_TYPE},
+        "OPENROUTER_API_KEY": "configured",
+    }
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+        }
+    )
+    assert "OPENROUTER_API_KEY" not in exposed_diagnostic_text
+    assert "<redacted-key>" in exposed_diagnostic_text
+    assert "Extra inputs" in exposed_diagnostic_text
 
 
 def test_a2ui_validation_rejects_secret_bearing_data_part_metadata() -> None:

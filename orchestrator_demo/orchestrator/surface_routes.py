@@ -214,7 +214,6 @@ class SurfaceRouteRegistry:
                     surface_id=None,
                     message=str(exc),
                 ),
-                original_payload=candidate,
             )
 
         owner = self.owner_for(action.surface_id)
@@ -227,7 +226,6 @@ class SurfaceRouteRegistry:
                     surface_id=None,
                     message="No owner is registered for the requested A2UI surface.",
                 ),
-                original_payload=candidate,
             )
 
         if owner.owner_type == "orchestrator":
@@ -256,9 +254,22 @@ class SurfaceRouteRegistry:
                 original_payload=candidate,
             )
 
-        response = handler(candidate)
-        if isawaitable(response):
-            response = await response
+        try:
+            response = handler(candidate)
+            if isawaitable(response):
+                response = await response
+        except Exception as exc:
+            return SurfaceRouteResult(
+                status="error",
+                surface_id=action.surface_id,
+                owner=owner,
+                error=_routing_error(
+                    code="owner_handler_failed",
+                    surface_id=action.surface_id,
+                    message=_owner_handler_failure_message(exc),
+                ),
+                original_payload=candidate,
+            )
 
         try:
             self._register_specialist_response_surfaces(response, owner=owner)
@@ -375,11 +386,8 @@ class SurfaceRouteRegistry:
         staged_owners = dict(self._owners_by_surface_id)
         for data in validated_payloads:
             for surface_id in _deleted_surface_ids_from_validated_a2ui(data):
-                self._clear_surface_from(
-                    staged_owners,
-                    surface_id,
-                    owner_type="specialist",
-                    owner_id=owner.owner_id,
+                self._clear_specialist_owned_surface(
+                    staged_owners, surface_id, owner=owner
                 )
             for surface_id in _surface_ids_from_validated_a2ui(data):
                 self._register_owner(
@@ -392,6 +400,48 @@ class SurfaceRouteRegistry:
 
         self._owners_by_surface_id = staged_owners
         self._components_by_surface_id = staged_components
+
+    def _clear_specialist_owned_surface(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        owner: SurfaceOwner,
+    ) -> SurfaceOwner | None:
+        return self._clear_specialist_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            agent_id=owner.owner_id,
+        )
+
+    def _clear_specialist_surface_from(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        agent_id: str,
+    ) -> SurfaceOwner | None:
+        surface_id = _validated_surface_id(surface_id)
+        existing = owners_by_surface_id.get(surface_id)
+        if existing is not None and (
+            existing.owner_type != "specialist" or existing.owner_id != agent_id
+        ):
+            raise SurfaceOwnershipError(
+                f"specialist {agent_id} cannot delete surface {surface_id} "
+                f"owned by {existing.owner_type}:{existing.owner_id}"
+            )
+        if existing is None and surface_id.startswith(PLAN_APPROVAL_SURFACE_PREFIX):
+            raise SurfaceOwnershipError(
+                f"specialist {agent_id} cannot delete reserved approval "
+                f"surface {surface_id}"
+            )
+
+        return self._clear_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            owner_type="specialist",
+            owner_id=agent_id,
+        )
 
 
 def _validated_surface_id(surface_id: str) -> str:
@@ -412,6 +462,13 @@ def _routing_error(
         "message": message,
         "ownerInferenceAttempted": False,
     }
+
+
+def _owner_handler_failure_message(exc: Exception) -> str:
+    return (
+        "A2UI surface owner handler failed: "
+        f"{type(exc).__name__}. Error details redacted."
+    )
 
 
 def _response_a2ui_payload(response: Any) -> Any | None:

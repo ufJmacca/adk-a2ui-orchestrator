@@ -244,6 +244,7 @@ class PlanStep(ContractModel):
     agent_id: str = Field(min_length=1)
     instruction: str = Field(min_length=1)
     depends_on: list[str] = Field(default_factory=list)
+    condition: str | None = None
     expected_output: str = Field(min_length=1)
     data_source_categories: list[str] = Field(default_factory=list)
     parallel_group: str | None = None
@@ -431,9 +432,6 @@ class UserAction(ContractModel):
             for top_level_plan_id in top_level_plan_ids[1:]
         ):
             raise ValueError("top-level planId aliases must match")
-        if top_level_plan_ids:
-            normalized["planId"] = top_level_plan_ids[0]
-        normalized.pop("plan_id", None)
 
         payload_plan_ids = [
             value
@@ -457,22 +455,7 @@ class UserAction(ContractModel):
         if top_level_plan_id is None and payload_plan_id is not None:
             normalized["planId"] = payload_plan_id
 
-        top_level_plan_versions = [
-            value
-            for value in (normalized.get("planVersion"), normalized.get("plan_version"))
-            if value is not None
-        ]
-        if top_level_plan_versions and any(
-            top_level_plan_version != top_level_plan_versions[0]
-            for top_level_plan_version in top_level_plan_versions[1:]
-        ):
-            raise ValueError("top-level planVersion aliases must match")
-        top_level_plan_version = (
-            top_level_plan_versions[0] if top_level_plan_versions else None
-        )
-        if top_level_plan_version is not None:
-            normalized["planVersion"] = top_level_plan_version
-        normalized.pop("plan_version", None)
+        top_level_plan_version = normalized.get("planVersion", normalized.get("plan_version"))
         payload_plan_versions = [
             value
             for value in (

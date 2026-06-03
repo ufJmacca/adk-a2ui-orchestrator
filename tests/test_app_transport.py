@@ -785,7 +785,7 @@ def test_user_action_endpoint_sanitizes_specialist_handler_failures() -> None:
         )
 
         # Act
-        status, failed = _request_error_json(
+        failed = _request_json(
             base_url,
             "/api/user-action",
             method="POST",
@@ -799,19 +799,28 @@ def test_user_action_endpoint_sanitizes_specialist_handler_failures() -> None:
         )
 
         # Assert
-        assert status == 500
-        assert failed == {
-            "status": "error",
-            "error": {
-                "code": "runtime_error",
+        route_error = failed["surfaceRouteResult"]["error"]
+        assert failed["status"] == "error"
+        assert route_error["code"] == "owner_handler_failed"
+        assert route_error["message"] == (
+            "A2UI surface owner handler failed: ValueError. Error details redacted."
+        )
+        assert failed["statusEvents"] == [
+            {
+                "status": "error",
                 "message": (
-                    "Request failed while processing. Retry after checking local "
-                    "service logs."
+                    "A2UI surface owner handler failed: ValueError. "
+                    "Error details redacted."
                 ),
-                "retryable": True,
-            },
-            "statusEvents": [],
-        }
+                "taskId": None,
+                "planId": None,
+                "details": {
+                    "code": "owner_handler_failed",
+                    "surfaceId": route_error["surfaceId"],
+                    "ownerInferenceAttempted": False,
+                },
+            }
+        ]
         assert "OPENROUTER_API_KEY" not in json.dumps(failed)
         assert "sk-live-user-action-secret-123456789" not in json.dumps(failed)
 

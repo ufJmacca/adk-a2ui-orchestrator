@@ -129,7 +129,7 @@ def _agent_payload(
 
 
 def _step_payload(step: PlanStep) -> dict[str, Any]:
-    return {
+    payload = {
         "stepId": step.step_id,
         "agentId": step.agent_id,
         "instruction": step.instruction,
@@ -138,6 +138,9 @@ def _step_payload(step: PlanStep) -> dict[str, Any]:
         "dataSourceCategories": list(step.data_source_categories),
         "parallelGroup": step.parallel_group,
     }
+    if step.condition is not None:
+        payload["condition"] = step.condition
+    return payload
 
 
 def _parallel_group_payloads(steps: Sequence[PlanStep]) -> list[dict[str, Any]]:
@@ -267,10 +270,19 @@ def _steps_text(steps: Sequence[PlanStep]) -> str:
 
 def _dependencies_text(steps: Sequence[PlanStep]) -> str:
     lines = [
-        f"{step.step_id} dependsOn: {', '.join(step.depends_on) or 'none'}"
+        (
+            f"{step.step_id} dependsOn: {', '.join(step.depends_on) or 'none'}"
+            f"{_condition_text(step)}"
+        )
         for step in steps
     ]
     return "Dependencies:\n" + "\n".join(lines)
+
+
+def _condition_text(step: PlanStep) -> str:
+    if step.condition is None:
+        return ""
+    return f" condition: {step.condition}"
 
 
 def _parallel_groups_text(steps: Sequence[PlanStep]) -> str:
