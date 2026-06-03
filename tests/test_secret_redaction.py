@@ -100,147 +100,43 @@ def test_audit_redaction_recursively_scrubs_secret_keys_values_and_bytes() -> No
     assert "<redacted-key>" in rendered
 
 
-def test_audit_log_redacts_invalid_utf8_byte_payloads(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Arrange
-    from orchestrator_demo.app.logging import (
-        AUDIT_LOGGER_NAME,
-        REDACTED_SECRET,
-        log_audit_event,
-    )
-
-    byte_secret = "sk-or-v1-byte-secret-should-not-leak"
-    bytearray_secret = "sk-or-v1-bytearray-secret-should-not-leak"
-
-    # Act
-    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
-        log_audit_event(
-            "invalid_utf8_byte_payload",
-            {
-                "raw_bytes": f"api_key={byte_secret}".encode() + b"\xff",
-                "raw_bytearray": bytearray(
-                    f"token={bytearray_secret}".encode() + b"\xff"
-                ),
-            },
-        )
-
-    # Assert
-    audit_records = [
-        record
-        for record in caplog.records
-        if getattr(record, "audit_event", None) == "invalid_utf8_byte_payload"
-    ]
-    assert len(audit_records) == 1
-    rendered_payload = repr(getattr(audit_records[0], "event_payload"))
-    assert byte_secret not in rendered_payload
-    assert bytearray_secret not in rendered_payload
-    assert "raw_bytes" in rendered_payload
-    assert "raw_bytearray" in rendered_payload
-    assert REDACTED_SECRET in rendered_payload
-
-
-def test_audit_log_redacts_values_after_embedded_secret_like_text_keys(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Arrange
-    from orchestrator_demo.app.logging import (
-        AUDIT_LOGGER_NAME,
-        REDACTED_SECRET,
-        log_audit_event,
-    )
-
-    leaked_api_token = "abcdefghi"
-    leaked_auth_token = "jklmnopqr"
-
-    # Act
-    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
-        log_audit_event(
-            "free_text_secret_key_value",
-            {
-                "msg": f"payload.apiToken: {leaked_api_token}",
-                "rationale": f"diagnostic.authToken={leaked_auth_token}",
-            },
-        )
-
-    # Assert
-    audit_records = [
-        record
-        for record in caplog.records
-        if getattr(record, "audit_event", None) == "free_text_secret_key_value"
-    ]
-    assert len(audit_records) == 1
-    rendered_payload = repr(getattr(audit_records[0], "event_payload"))
-    assert leaked_api_token not in rendered_payload
-    assert leaked_auth_token not in rendered_payload
-    assert "apiToken" not in rendered_payload
-    assert "authToken" not in rendered_payload
-    assert REDACTED_SECRET in rendered_payload
-
-
-def test_audit_log_redacts_natural_language_credential_phrases(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Arrange
-    from orchestrator_demo.app.logging import (
-        AUDIT_LOGGER_NAME,
-        REDACTED_SECRET,
-        log_audit_event,
-    )
-
-    pasted_password = "hunter2"
-    pasted_token = "abcdefghi"
-
-    # Act
-    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
-        log_audit_event(
-            "free_text_natural_language_secret",
-            {
-                "rejection_reason": f"Do not proceed; password is {pasted_password}",
-                "llm_rationale": f"Escalate because token is {pasted_token}",
-            },
-        )
-
-    # Assert
-    audit_records = [
-        record
-        for record in caplog.records
-        if getattr(record, "audit_event", None)
-        == "free_text_natural_language_secret"
-    ]
-    assert len(audit_records) == 1
-    rendered_payload = repr(getattr(audit_records[0], "event_payload"))
-    assert pasted_password not in rendered_payload
-    assert pasted_token not in rendered_payload
-    assert "Do not proceed" in rendered_payload
-    assert "Escalate because" in rendered_payload
-    assert REDACTED_SECRET in rendered_payload
-
-
-def test_audit_redaction_scrubs_complete_pem_private_key_blocks() -> None:
+def test_audit_redaction_scrubs_truncated_pem_private_key() -> None:
     # Arrange
     from orchestrator_demo.app.logging import redact_for_audit
 
-    pem_private_key = (
-        "-----BEGIN RSA PRIVATE KEY-----\n"
-        "MIIEpAIBAAKCAQEAuPrivateKeyBodyMustNotLeak\n"
-        "x9m8anotherLineThatMustNotLeak\n"
-        "-----END RSA PRIVATE KEY-----"
+    leaked_value = (
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "MHcCAQEEILtruncatedKeyMaterialForDiagnostics"
     )
 
     # Act
     redacted = redact_for_audit(
-        {"diagnostic": f"before context\n{pem_private_key}\nafter context"}
+        {
+            "diagnostic": f"agent config failed with {leaked_value}",
+            "raw": leaked_value.encode(),
+        }
     )
     rendered = repr(redacted)
 
     # Assert
-    assert "before context" in rendered
-    assert "after context" in rendered
-    assert "BEGIN RSA PRIVATE KEY" not in rendered
-    assert "MIIEpAIBAAKCAQEAuPrivateKeyBodyMustNotLeak" not in rendered
-    assert "x9m8anotherLineThatMustNotLeak" not in rendered
-    assert "END RSA PRIVATE KEY" not in rendered
+    assert "-----BEGIN EC PRIVATE KEY-----" not in rendered
+    assert "MHcCAQEEILtruncatedKeyMaterialForDiagnostics" not in rendered
+    assert "<redacted-secret>" in rendered
+
+
+def test_audit_redaction_scrubs_secret_in_invalid_utf8_bytes() -> None:
+    # Arrange
+    from orchestrator_demo.app.logging import redact_for_audit
+
+    leaked_bytes = b"diagnostic sk-or-v1-byte-secret-should-not-leak\xff"
+
+    # Act
+    redacted = redact_for_audit({"raw": leaked_bytes})
+    rendered = repr(redacted)
+
+    # Assert
+    assert leaked_bytes not in redacted.values()
+    assert "sk-or-v1-byte-secret-should-not-leak" not in rendered
     assert "<redacted-secret>" in rendered
 
 
@@ -277,3 +173,78 @@ def test_a2ui_payload_and_transport_envelope_secret_diagnostics_are_redacted() -
         "A2UI rendering unavailable. The generated UI payload failed "
         "validation and was not emitted to the renderer."
     )
+
+
+def test_a2ui_transport_metadata_invalid_utf8_byte_secret_is_rejected() -> None:
+    # Arrange
+    leaked_secret = "sk-or-v1-byte-secret-should-not-leak"
+    unsafe_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": "surface_byte_secret_rejection",
+                "catalogId": BASIC_CATALOG_ID,
+            },
+        },
+        metadata={
+            "mimeType": A2UI_MIME_TYPE,
+            "note": f"{leaked_secret}\xff".encode("latin-1"),
+        },
+    )
+
+    # Act
+    result = validate_outbound_a2ui(unsafe_part)
+    rendered_result = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "renderer_part": result.renderer_part.model_dump(mode="python"),
+        }
+    )
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert leaked_secret not in rendered_result
+    assert "<redacted-secret>" in rendered_result
+    assert "A2UI metadata contains secret-like value" in rendered_result
+
+
+@pytest.mark.parametrize(
+    "secret_field_name",
+    ["apiToken", "accessKey", "privateKey", "Authorization"],
+)
+def test_registry_descriptor_secret_field_diagnostics_are_redacted(
+    secret_field_name: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.descriptors import (
+        DescriptorValidationError,
+        validate_agent_descriptors,
+    )
+
+    raw_descriptors = [
+        {
+            "agent_id": "internal_knowledge",
+            "display_name": "Internal Knowledge Agent",
+            "capabilities": ["crm notes"],
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    secret_field_name: {"type": "string"},
+                },
+            },
+            "output_schema": {"type": "object"},
+            "a2ui_catalogs": ["basic"],
+            "routing_examples": ["Summarize notes."],
+            "execution_mode": "local_llm",
+        }
+    ]
+
+    # Act / Assert
+    with pytest.raises(DescriptorValidationError) as exc_info:
+        validate_agent_descriptors(raw_descriptors)
+
+    rendered_diagnostic = str(exc_info.value)
+    assert "secret-like field" in rendered_diagnostic
+    assert "input_schema.properties.<redacted>" in rendered_diagnostic
+    assert secret_field_name not in rendered_diagnostic

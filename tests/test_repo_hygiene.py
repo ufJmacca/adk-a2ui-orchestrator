@@ -203,15 +203,18 @@ def test_dockerignore_excludes_runtime_secrets_and_local_venv() -> None:
     dockerignore_path = ROOT / ".dockerignore"
 
     # Act
-    ignore_rules = {
+    ignore_lines = [
         line.strip()
         for line in dockerignore_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
-    }
+    ]
+    ignore_rules = set(ignore_lines)
 
     # Assert
     assert ".env" in ignore_rules
     assert ".env.*" in ignore_rules
+    assert "!.env.example" in ignore_rules
+    assert ignore_lines.index("!.env.example") > ignore_lines.index(".env.*")
     assert ".venv/" in ignore_rules
 
 

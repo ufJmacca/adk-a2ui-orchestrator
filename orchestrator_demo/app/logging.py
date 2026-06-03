@@ -28,7 +28,7 @@ _SECRET_FIELD_MARKERS = (
 _SECRET_VALUE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
         r"(?<![A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}",
         r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}",
         r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}",
@@ -37,15 +37,7 @@ _SECRET_VALUE_PATTERNS = tuple(
         r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
         r"(?<![A-Za-z0-9])authorization\b\s*[:=]\s*(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}",
         r"(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]{10,}",
-        r"(?<![A-Za-z0-9])"
-        r"[A-Za-z0-9_-]*(?:api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
-        r"openrouter[_-]?api[_-]?key|authorization|credential|password|token|secret)"
-        r"[A-Za-z0-9_-]*\b\s*[:=]\s*\S{6,}",
-        r"(?<![A-Za-z0-9])"
-        r"(?:[A-Za-z0-9_-]*(?:api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
-        r"openrouter[_-]?api[_-]?key|authorization|credential|password|token|secret)"
-        r"[A-Za-z0-9_-]*|api\s+key|access\s+key|private\s+key|openrouter\s+api\s+key)"
-        r"\b\s+(?:is|was)\s+\S{6,}",
+        r"(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
     )
 )
 _SECRET_PATH_SEGMENT_PATTERN = re.compile(

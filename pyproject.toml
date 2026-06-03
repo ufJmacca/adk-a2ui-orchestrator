@@ -41,6 +41,9 @@ warn_unused_ignores = true
 include = ["orchestrator_demo*"]
 exclude = ["prds*", "tests*"]
 
+[tool.setuptools.package-data]
+"orchestrator_demo.app" = ["static/*", "static/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ADK A2UI Orchestrator Demo</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="request-panel" aria-labelledby="request-title">
+        <h1 id="request-title">Business Banking Orchestrator</h1>
+        <form id="request-form">
+          <label for="request-input">Request</label>
+          <textarea id="request-input" name="request" rows="4">Prepare me for tomorrow's meeting with ABC Manufacturing.</textarea>
+          <button type="submit">Submit</button>
+        </form>
+      </section>
+
+      <section class="workspace" aria-label="A2UI workspace">
+        <section id="approval-surfaces" class="surface-region" aria-label="Approval plans"></section>
+        <section id="downstream-surfaces" class="surface-region" aria-label="Downstream A2UI surfaces"></section>
+      </section>
+
+      <aside class="side-panel">
+        <section aria-labelledby="status-title">
+          <h2 id="status-title">Status</h2>
+          <ol id="status-updates"></ol>
+        </section>
+        <section aria-labelledby="artifact-title">
+          <h2 id="artifact-title">Artifacts</h2>
+          <pre id="artifact-list"></pre>
+        </section>
+      </aside>
+    </main>
+    <script src="/static/renderer.js"></script>
+  </body>
+</html>

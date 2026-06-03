@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from inspect import isawaitable
 from typing import Any, Literal
 
-from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.a2ui_support.event_parser import (
     PlanUserActionParseError,
     StructuredUserActionRequiredError,
@@ -21,7 +20,13 @@ from orchestrator_demo.a2ui_support.schema_manager import (
     UPDATE_COMPONENTS_MESSAGE,
     UPDATE_DATA_MODEL_MESSAGE,
 )
-from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+from orchestrator_demo.a2ui_support.validation import (
+    SurfaceComponentGraphs,
+    apply_validated_a2ui_component_graph,
+    clone_surface_component_graphs,
+    validate_outbound_a2ui,
+)
+from orchestrator_demo.app.logging import log_audit_event
 
 
 SurfaceOwnerType = Literal["orchestrator", "specialist"]
@@ -55,11 +60,20 @@ class SurfaceRouteResult:
     original_payload: Any | None = None
 
 
+@dataclass(frozen=True)
+class SurfaceRegistrySnapshot:
+    """Snapshot of renderer surface ownership and component validation state."""
+
+    owners_by_surface_id: dict[str, SurfaceOwner]
+    components_by_surface_id: SurfaceComponentGraphs
+
+
 class SurfaceRouteRegistry:
     """Track A2UI surface ownership and route future UI events by surfaceId."""
 
     def __init__(self) -> None:
         self._owners_by_surface_id: dict[str, SurfaceOwner] = {}
+        self._components_by_surface_id: SurfaceComponentGraphs = {}
 
     def register_approval_surface(
         self,
@@ -125,12 +139,43 @@ class SurfaceRouteRegistry:
     ) -> SurfaceOwner | None:
         """Remove ownership for a deleted surface when the expected owner matches."""
 
-        return self._clear_surface_from(
+        removed = self._clear_surface_from(
             self._owners_by_surface_id,
             surface_id,
             owner_type=owner_type,
             owner_id=owner_id,
         )
+        if removed is not None:
+            self._components_by_surface_id.pop(surface_id, None)
+        return removed
+
+    def clear_all(self) -> SurfaceRegistrySnapshot:
+        """Remove all registered renderer surface ownership and return a snapshot."""
+
+        snapshot = SurfaceRegistrySnapshot(
+            owners_by_surface_id=dict(self._owners_by_surface_id),
+            components_by_surface_id=clone_surface_component_graphs(
+                self._components_by_surface_id
+            ),
+        )
+        self._owners_by_surface_id.clear()
+        self._components_by_surface_id.clear()
+        return snapshot
+
+    def restore_all(
+        self,
+        snapshot: Mapping[str, SurfaceOwner] | SurfaceRegistrySnapshot,
+    ) -> None:
+        """Restore a previously captured renderer surface ownership snapshot."""
+
+        if isinstance(snapshot, SurfaceRegistrySnapshot):
+            self._owners_by_surface_id = dict(snapshot.owners_by_surface_id)
+            self._components_by_surface_id = clone_surface_component_graphs(
+                snapshot.components_by_surface_id
+            )
+            return
+
+        self._owners_by_surface_id = dict(snapshot)
 
     def _clear_surface_from(
         self,
@@ -162,109 +207,109 @@ class SurfaceRouteRegistry:
         try:
             action = parse_user_action(candidate)
         except (PlanUserActionParseError, StructuredUserActionRequiredError) as exc:
-            result = SurfaceRouteResult(
-                status="error",
-                surface_id=None,
-                error=_routing_error(
-                    code="invalid_user_action",
+            return _logged_route_result(
+                SurfaceRouteResult(
+                    status="error",
                     surface_id=None,
-                    message=str(exc),
-                ),
-                original_payload=candidate,
+                    error=_routing_error(
+                        code="invalid_user_action",
+                        surface_id=None,
+                        message=str(exc),
+                    ),
+                )
             )
-            _log_ui_event_routed(result)
-            return result
 
         owner = self.owner_for(action.surface_id)
         if owner is None:
-            result = SurfaceRouteResult(
-                status="error",
-                surface_id=None,
-                error=_routing_error(
-                    code="unknown_surface",
+            return _logged_route_result(
+                SurfaceRouteResult(
+                    status="error",
                     surface_id=None,
-                    message="No owner is registered for the requested A2UI surface.",
-                ),
-                original_payload=candidate,
+                    error=_routing_error(
+                        code="unknown_surface",
+                        surface_id=None,
+                        message=(
+                            "No owner is registered for the requested A2UI surface."
+                        ),
+                    ),
+                )
             )
-            _log_ui_event_routed(result)
-            return result
 
         if owner.owner_type == "orchestrator":
-            result = SurfaceRouteResult(
-                status="orchestrator_owned",
-                surface_id=action.surface_id,
-                owner=owner,
-                original_payload=candidate,
+            return _logged_route_result(
+                SurfaceRouteResult(
+                    status="orchestrator_owned",
+                    surface_id=action.surface_id,
+                    owner=owner,
+                    original_payload=candidate,
+                )
             )
-            _log_ui_event_routed(result)
-            return result
 
         adapter = specialist_adapters.get(owner.owner_id)
         handler = getattr(adapter, "handle_user_action", None)
         if adapter is None or not callable(handler):
-            result = SurfaceRouteResult(
-                status="error",
-                surface_id=action.surface_id,
-                owner=owner,
-                error=_routing_error(
-                    code="owner_unavailable",
+            return _logged_route_result(
+                SurfaceRouteResult(
+                    status="error",
                     surface_id=action.surface_id,
-                    message=(
-                        "No userAction handler is available for A2UI surface "
-                        f"{action.surface_id} owner {owner.owner_id}."
+                    owner=owner,
+                    error=_routing_error(
+                        code="owner_unavailable",
+                        surface_id=action.surface_id,
+                        message=(
+                            "No userAction handler is available for A2UI surface "
+                            f"{action.surface_id} owner {owner.owner_id}."
+                        ),
                     ),
-                ),
-                original_payload=candidate,
+                    original_payload=candidate,
+                )
             )
-            _log_ui_event_routed(result)
-            return result
 
         try:
             response = handler(candidate)
             if isawaitable(response):
                 response = await response
         except Exception as exc:
-            result = SurfaceRouteResult(
-                status="error",
-                surface_id=action.surface_id,
-                owner=owner,
-                error=_routing_error(
-                    code="owner_handler_failed",
+            return _logged_route_result(
+                SurfaceRouteResult(
+                    status="error",
                     surface_id=action.surface_id,
-                    message=f"Specialist userAction handler failed: {exc}",
-                ),
-                original_payload=candidate,
+                    owner=owner,
+                    error=_routing_error(
+                        code="owner_handler_failed",
+                        surface_id=action.surface_id,
+                        message=_owner_handler_failure_message(exc),
+                    ),
+                    original_payload=candidate,
+                )
             )
-            _log_ui_event_routed(result)
-            raise
 
         try:
             self._register_specialist_response_surfaces(response, owner=owner)
         except SurfaceOwnershipError as exc:
-            result = SurfaceRouteResult(
-                status="error",
+            return _logged_route_result(
+                SurfaceRouteResult(
+                    status="error",
+                    surface_id=action.surface_id,
+                    owner=owner,
+                    error=_routing_error(
+                        code="surface_registration_rejected",
+                        surface_id=action.surface_id,
+                        message=str(exc),
+                    ),
+                    original_payload=candidate,
+                )
+            )
+
+        return _logged_route_result(
+            SurfaceRouteResult(
+                status="forwarded",
                 surface_id=action.surface_id,
                 owner=owner,
-                error=_routing_error(
-                    code="surface_registration_rejected",
-                    surface_id=action.surface_id,
-                    message=str(exc),
-                ),
+                response=response,
                 original_payload=candidate,
             )
-            _log_ui_event_routed(result)
-            return result
-
-        result = SurfaceRouteResult(
-            status="forwarded",
-            surface_id=action.surface_id,
-            owner=owner,
-            response=response,
-            original_payload=candidate,
         )
-        _log_ui_event_routed(result)
-        return result
 
     def _register(self, owner: SurfaceOwner) -> SurfaceOwner:
         return self._register_owner(self._owners_by_surface_id, owner)
@@ -338,20 +383,28 @@ class SurfaceRouteRegistry:
         if payload is None:
             return
 
-        staged_owners = dict(self._owners_by_surface_id)
+        validated_payloads: list[Mapping[str, Any]] = []
+        staged_components = clone_surface_component_graphs(
+            self._components_by_surface_id
+        )
         for candidate in _iter_a2ui_messages(payload):
-            result = validate_outbound_a2ui(candidate)
+            result = validate_outbound_a2ui(
+                candidate,
+                existing_components_by_surface_id=staged_components,
+            )
             if not result.valid:
-                continue
+                return
             data = getattr(result.renderer_part, "data", None)
             if not isinstance(data, Mapping):
-                continue
+                return
+            validated_payloads.append(data)
+            apply_validated_a2ui_component_graph(staged_components, data)
+
+        staged_owners = dict(self._owners_by_surface_id)
+        for data in validated_payloads:
             for surface_id in _deleted_surface_ids_from_validated_a2ui(data):
-                self._clear_surface_from(
-                    staged_owners,
-                    surface_id,
-                    owner_type="specialist",
-                    owner_id=owner.owner_id,
+                self._clear_specialist_owned_surface(
+                    staged_owners, surface_id, owner=owner
                 )
             for surface_id in _surface_ids_from_validated_a2ui(data):
                 self._register_owner(
@@ -363,6 +416,49 @@ class SurfaceRouteRegistry:
                 )
 
         self._owners_by_surface_id = staged_owners
+        self._components_by_surface_id = staged_components
+
+    def _clear_specialist_owned_surface(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        owner: SurfaceOwner,
+    ) -> SurfaceOwner | None:
+        return self._clear_specialist_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            agent_id=owner.owner_id,
+        )
+
+    def _clear_specialist_surface_from(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        agent_id: str,
+    ) -> SurfaceOwner | None:
+        surface_id = _validated_surface_id(surface_id)
+        existing = owners_by_surface_id.get(surface_id)
+        if existing is not None and (
+            existing.owner_type != "specialist" or existing.owner_id != agent_id
+        ):
+            raise SurfaceOwnershipError(
+                f"specialist {agent_id} cannot delete surface {surface_id} "
+                f"owned by {existing.owner_type}:{existing.owner_id}"
+            )
+        if existing is None and surface_id.startswith(PLAN_APPROVAL_SURFACE_PREFIX):
+            raise SurfaceOwnershipError(
+                f"specialist {agent_id} cannot delete reserved approval "
+                f"surface {surface_id}"
+            )
+
+        return self._clear_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            owner_type="specialist",
+            owner_id=agent_id,
+        )
 
 
 def _validated_surface_id(surface_id: str) -> str:
@@ -385,6 +481,11 @@ def _routing_error(
     }
 
 
+def _logged_route_result(result: SurfaceRouteResult) -> SurfaceRouteResult:
+    _log_ui_event_routed(result)
+    return result
+
+
 def _log_ui_event_routed(result: SurfaceRouteResult) -> None:
     owner = result.owner
     error = result.error or {}
@@ -395,10 +496,18 @@ def _log_ui_event_routed(result: SurfaceRouteResult) -> None:
             "surface_id": result.surface_id,
             "owner_type": owner.owner_type if owner is not None else None,
             "owner_id": owner.owner_id if owner is not None else None,
-            "plan_id": owner.plan_id if owner is not None else None,
             "error_code": error.get("code"),
-            "owner_inference_attempted": False,
+            "owner_inference_attempted": bool(
+                error.get("ownerInferenceAttempted", False)
+            ),
         },
+    )
+
+
+def _owner_handler_failure_message(exc: Exception) -> str:
+    return (
+        "A2UI surface owner handler failed: "
+        f"{type(exc).__name__}. Error details redacted."
     )
 
 
@@ -447,4 +556,5 @@ __all__ = [
     "SurfaceOwnershipError",
     "SurfaceRouteRegistry",
     "SurfaceRouteResult",
+    "SurfaceRegistrySnapshot",
 ]

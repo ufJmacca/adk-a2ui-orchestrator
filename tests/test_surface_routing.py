@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import logging
 from pathlib import Path
 import subprocess
 import sys
@@ -23,7 +22,6 @@ from orchestrator_demo.contracts import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-AUDIT_LOGGER_NAME = "orchestrator_demo.audit"
 
 
 def _specialist_a2ui(surface_id: str) -> list[dict[str, Any]]:
@@ -146,12 +144,10 @@ class RecordingSpecialistAdapter:
 
 
 class FailingSpecialistAdapter:
-    def __init__(self) -> None:
-        self.received_user_actions: list[Any] = []
-
-    async def handle_user_action(self, user_action: Any) -> None:
-        self.received_user_actions.append(user_action)
-        raise RuntimeError("specialist handler unavailable")
+    async def handle_user_action(self, _user_action: Any) -> dict[str, str]:
+        raise RuntimeError(
+            "Authorization: Bearer sk-or-v1-handler-secret-should-not-appear"
+        )
 
 
 class SurfaceReturningSpecialistAdapter:
@@ -375,6 +371,116 @@ def test_failed_specialist_renderer_preparation_leaves_registry_unchanged() -> N
     assert registry.owner_for("surface_plan_specialist_claim") is None
 
 
+def test_specialist_renderer_delete_rejects_plan_approval_surface() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import (
+        SurfaceOwnershipError,
+        SurfaceRouteRegistry,
+    )
+
+    registry = SurfaceRouteRegistry()
+    product_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    approval_owner = registry.register_approval_surface(
+        "surface_plan_meeting_prep",
+        plan_id="plan_meeting_prep",
+    )
+
+    # Act / Assert
+    with pytest.raises(
+        SurfaceOwnershipError,
+        match=(
+            "specialist product_opportunity cannot delete surface "
+            "surface_plan_meeting_prep owned by orchestrator:orchestrator"
+        ),
+    ):
+        prepare_specialist_a2ui_for_renderer(
+            _delete_surface_a2ui("surface_plan_meeting_prep"),
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+
+    assert registry.owner_for("surface_product_recommendation") == product_owner
+    assert registry.owner_for("surface_plan_meeting_prep") == approval_owner
+
+
+def test_specialist_renderer_delete_rejects_other_agent_surface() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import (
+        SurfaceOwnershipError,
+        SurfaceRouteRegistry,
+    )
+
+    registry = SurfaceRouteRegistry()
+    product_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    internal_owner = registry.register_specialist_surface(
+        "surface_internal_context",
+        agent_id="internal_knowledge",
+    )
+
+    # Act / Assert
+    with pytest.raises(
+        SurfaceOwnershipError,
+        match=(
+            "specialist product_opportunity cannot delete surface "
+            "surface_internal_context owned by specialist:internal_knowledge"
+        ),
+    ):
+        prepare_specialist_a2ui_for_renderer(
+            _delete_surface_a2ui("surface_internal_context"),
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+
+    assert registry.owner_for("surface_product_recommendation") == product_owner
+    assert registry.owner_for("surface_internal_context") == internal_owner
+
+
+def test_specialist_renderer_delete_rejects_unregistered_reserved_surface() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.renderer_contract import (
+        prepare_specialist_a2ui_for_renderer,
+    )
+    from orchestrator_demo.orchestrator.surface_routes import (
+        SurfaceOwnershipError,
+        SurfaceRouteRegistry,
+    )
+
+    registry = SurfaceRouteRegistry()
+    product_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+
+    # Act / Assert
+    with pytest.raises(
+        SurfaceOwnershipError,
+        match=(
+            "specialist product_opportunity cannot delete reserved approval "
+            "surface surface_plan_unregistered"
+        ),
+    ):
+        prepare_specialist_a2ui_for_renderer(
+            _delete_surface_a2ui("surface_plan_unregistered"),
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+
+    assert registry.owner_for("surface_product_recommendation") == product_owner
+    assert registry.owner_for("surface_plan_unregistered") is None
+
+
 def test_failed_approval_renderer_preparation_leaves_registry_unchanged() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.renderer_contract import (
@@ -568,9 +674,7 @@ async def test_specialist_owned_user_action_is_forwarded_with_original_payload()
 
 
 @pytest.mark.asyncio
-async def test_failed_specialist_user_action_handler_is_audit_logged(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def test_specialist_owned_user_action_handler_failure_is_redacted() -> None:
     # Arrange
     from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
 
@@ -579,39 +683,31 @@ async def test_failed_specialist_user_action_handler_is_audit_logged(
         "surface_product_recommendation",
         agent_id="product_opportunity",
     )
-    adapter = FailingSpecialistAdapter()
     user_action = {
         "userAction": {
             "type": "specialist_action",
             "surfaceId": "surface_product_recommendation",
-            "payload": {"buttonId": "show_more_detail"},
+            "payload": {"token": "sk-or-v1-payload-secret-should-not-appear"},
         }
     }
 
     # Act
-    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
-        with pytest.raises(RuntimeError, match="specialist handler unavailable"):
-            await registry.route_user_action(
-                user_action,
-                specialist_adapters={"product_opportunity": adapter},
-            )
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": FailingSpecialistAdapter()},
+    )
 
     # Assert
-    audit_payloads = [
-        getattr(record, "event_payload")
-        for record in caplog.records
-        if getattr(record, "audit_event", None) == "ui_event_routed"
-    ]
-    assert audit_payloads[-1] == {
-        "status": "error",
-        "surface_id": "surface_product_recommendation",
-        "owner_type": "specialist",
-        "owner_id": "product_opportunity",
-        "plan_id": None,
-        "error_code": "owner_handler_failed",
-        "owner_inference_attempted": False,
-    }
-    assert adapter.received_user_actions == [user_action]
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error["code"] == "owner_handler_failed"
+    assert result.error["surfaceId"] == "surface_product_recommendation"
+    assert result.error["ownerInferenceAttempted"] is False
+    assert "RuntimeError" in result.error["message"]
+    assert "Error details redacted" in result.error["message"]
+    assert "sk-or-v1-handler-secret-should-not-appear" not in result.error["message"]
+    assert "sk-or-v1-payload-secret-should-not-appear" not in result.error["message"]
+    assert result.response is None
 
 
 @pytest.mark.asyncio
@@ -778,6 +874,47 @@ async def test_forwarded_specialist_response_rejects_reserved_plan_surface() -> 
 
 
 @pytest.mark.asyncio
+async def test_forwarded_specialist_response_rejects_invalid_a2ui_without_forwarding() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    leaked_value = "OPENROUTER_API_KEY=sk-live-specialist-a2ui-secret-token-123456789"
+    invalid_payload = _specialist_a2ui("surface_product_recommendation_detail")
+    invalid_payload[1]["updateComponents"]["components"][0]["text"] = leaked_value
+
+    registry = SurfaceRouteRegistry()
+    registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    adapter = SurfaceReturningSpecialistAdapter("surface_product_recommendation_detail")
+    adapter.response = adapter.response.model_copy(
+        update={"a2ui_payload": invalid_payload},
+        deep=True,
+    )
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"buttonId": "show_more_detail"},
+        }
+    }
+
+    # Act
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": adapter},
+    )
+
+    # Assert
+    assert result.status == "forwarded"
+    assert result.response is adapter.response
+    assert result.error is None
+    assert registry.owner_for("surface_product_recommendation_detail") is None
+    assert adapter.received_user_actions == [user_action]
+
+
+@pytest.mark.asyncio
 async def test_failed_multi_message_response_registration_leaves_registry_unchanged() -> None:
     # Arrange
     from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
@@ -822,6 +959,92 @@ async def test_failed_multi_message_response_registration_leaves_registry_unchan
     assert registry.owner_for("surface_product_recommendation") == original_owner
     assert registry.owner_for("surface_product_recommendation_detail") is None
     assert registry.owner_for("surface_plan_specialist_claim") is None
+    assert adapter.received_user_actions == [user_action]
+
+
+@pytest.mark.asyncio
+async def test_forwarded_specialist_delete_surface_rejects_plan_approval_surface() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    product_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    approval_owner = registry.register_approval_surface(
+        "surface_plan_meeting_prep",
+        plan_id="plan_meeting_prep",
+    )
+    adapter = SurfaceDeletingSpecialistAdapter("surface_plan_meeting_prep")
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"buttonId": "close"},
+        }
+    }
+
+    # Act
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": adapter},
+    )
+
+    # Assert
+    assert result.status == "error"
+    assert result.response is None
+    assert result.error is not None
+    assert result.error["code"] == "surface_registration_rejected"
+    assert (
+        "specialist product_opportunity cannot delete surface "
+        "surface_plan_meeting_prep owned by orchestrator:orchestrator"
+    ) == result.error["message"]
+    assert registry.owner_for("surface_product_recommendation") == product_owner
+    assert registry.owner_for("surface_plan_meeting_prep") == approval_owner
+    assert adapter.received_user_actions == [user_action]
+
+
+@pytest.mark.asyncio
+async def test_forwarded_specialist_delete_surface_rejects_other_agent_surface() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    product_owner = registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    internal_owner = registry.register_specialist_surface(
+        "surface_internal_context",
+        agent_id="internal_knowledge",
+    )
+    adapter = SurfaceDeletingSpecialistAdapter("surface_internal_context")
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"buttonId": "close"},
+        }
+    }
+
+    # Act
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": adapter},
+    )
+
+    # Assert
+    assert result.status == "error"
+    assert result.response is None
+    assert result.error is not None
+    assert result.error["code"] == "surface_registration_rejected"
+    assert (
+        "specialist product_opportunity cannot delete surface "
+        "surface_internal_context owned by specialist:internal_knowledge"
+    ) == result.error["message"]
+    assert registry.owner_for("surface_product_recommendation") == product_owner
+    assert registry.owner_for("surface_internal_context") == internal_owner
     assert adapter.received_user_actions == [user_action]
 
 
@@ -892,7 +1115,9 @@ async def test_invalid_user_action_routing_error_redacts_secret_like_field_names
     assert result.error is not None
     assert result.error["code"] == "invalid_user_action"
     assert result.error["ownerInferenceAttempted"] is False
+    assert result.original_payload is None
     assert secret_field_name not in result.error["message"]
+    assert secret_field_name not in repr(result)
     assert "<redacted-key>" in result.error["message"]
     assert adapter.received_user_actions == []
 
@@ -964,8 +1189,11 @@ async def test_unknown_surface_routing_error_omits_secret_like_surface_id(
     assert result.error["code"] == "unknown_surface"
     assert result.error["surfaceId"] is None
     assert result.error["ownerInferenceAttempted"] is False
+    assert result.original_payload is None
     assert leaked_surface_id not in str(result.error)
+    assert leaked_surface_id not in repr(result)
     assert "sk-or-v1-renderer-secret-should-not-appear" not in str(result.error)
+    assert "sk-or-v1-renderer-secret-should-not-appear" not in repr(result)
     assert leaked_surface_id not in caplog.text
     assert "sk-or-v1-renderer-secret-should-not-appear" not in caplog.text
     assert adapter.received_user_actions == []

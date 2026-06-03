@@ -193,44 +193,6 @@ def _dump_sdk_model(value: Any) -> Any:
     return value
 
 
-def _normalize_sdk_message(
-    value: Any,
-    *,
-    task_id: Any,
-    context_id: Any,
-    timestamp: Any,
-) -> Any:
-    value = _dump_sdk_model(value)
-    if not isinstance(value, dict):
-        return value
-
-    normalized = dict(value)
-    kind = normalized.pop("kind", None)
-    if kind is not None and kind != "message":
-        raise ValueError("message kind must be message")
-
-    normalized.pop("extensions", None)
-    normalized.pop("referenceTaskIds", None)
-    normalized.pop("reference_task_ids", None)
-
-    if (
-        task_id is not None
-        and "taskId" not in normalized
-        and "task_id" not in normalized
-    ):
-        normalized["taskId"] = task_id
-    if (
-        context_id is not None
-        and "contextId" not in normalized
-        and "context_id" not in normalized
-    ):
-        normalized["contextId"] = context_id
-    if timestamp is not None:
-        normalized.setdefault("timestamp", timestamp)
-
-    return normalized
-
-
 A2APartPayload = Annotated[
     Annotated[TextPart, Tag("text")] | Annotated[DataPart, Tag("data")],
     Discriminator(_part_discriminator),
@@ -448,7 +410,9 @@ class A2ATask(TransportModel):
     @classmethod
     def normalize_task_wire_fields(cls, value: Any) -> Any:
         if not isinstance(value, dict):
-            value = _dump_sdk_model(value)
+            model_dump = getattr(value, "model_dump", None)
+            if callable(model_dump):
+                value = model_dump(by_alias=True, mode="json")
 
         if not isinstance(value, dict):
             return value
@@ -466,7 +430,9 @@ class A2ATask(TransportModel):
 
         status = normalized.get("status")
         if status is not None and not isinstance(status, dict):
-            status = _dump_sdk_model(status)
+            model_dump = getattr(status, "model_dump", None)
+            if callable(model_dump):
+                status = model_dump(by_alias=True, mode="json")
 
         task_id = _first_present(normalized, "id", "taskId", "task_id")
         context_id = _first_present(normalized, "contextId", "context_id")
@@ -576,9 +542,16 @@ def _normalize_sdk_message_fields(
     kind = normalized.pop("kind", None)
     if kind is not None and kind != "message":
         raise ValueError("message kind must be message")
-    normalized.pop("extensions", None)
-    normalized.pop("referenceTaskIds", None)
-    normalized.pop("reference_task_ids", None)
+    _pop_empty_unsupported_sdk_field(
+        normalized,
+        field_label="message extensions",
+        keys=("extensions",),
+    )
+    _pop_empty_unsupported_sdk_field(
+        normalized,
+        field_label="message referenceTaskIds",
+        keys=("referenceTaskIds", "reference_task_ids"),
+    )
     if normalized.get("timestamp") is None and fallback_timestamp is not None:
         normalized["timestamp"] = fallback_timestamp
     _coalesce_alias_pair(
