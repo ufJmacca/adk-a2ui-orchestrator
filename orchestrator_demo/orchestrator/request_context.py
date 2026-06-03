@@ -180,6 +180,16 @@ class RequestContext:
         self._approved_plan_step_agents[plan.plan_id] = approved_step_agents
         self._approved_plan_step_payloads[plan.plan_id] = approved_step_payloads
 
+    def reset_plan_approval(self, plan_id: str) -> None:
+        """Clear approval guard state after graph execution fails before commit."""
+
+        if self.approved_plan_id != plan_id:
+            return
+
+        self.approved_plan_id = None
+        self._approved_plan_step_agents.pop(plan_id, None)
+        self._approved_plan_step_payloads.pop(plan_id, None)
+
     def _require_plan_matches_current_draft(
         self,
         plan: ExecutionPlan,
@@ -483,11 +493,17 @@ async def call_specialist_with_guard(
     context: RequestContext,
     request: SpecialistRequest,
     specialist: SpecialistLike,
+    *,
+    enforce_response_agent_id: bool = True,
 ) -> SpecialistResponse:
     """Apply request guardrails before invoking a specialist."""
 
     context.require_specialist_call_allowed(request)
-    response = await invoke_specialist(specialist, request)
+    response = await invoke_specialist(
+        specialist,
+        request,
+        enforce_response_agent_id=enforce_response_agent_id,
+    )
     context.record_specialist_surface_owner(
         surface_id=response.surface_id,
         agent_id=request.agent_id,

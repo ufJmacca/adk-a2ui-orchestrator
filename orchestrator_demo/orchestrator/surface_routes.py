@@ -206,11 +206,25 @@ class SurfaceRouteRegistry:
                         f"{action.surface_id} owner {owner.owner_id}."
                     ),
                 ),
+                original_payload=candidate,
             )
 
-        response = handler(candidate)
-        if isawaitable(response):
-            response = await response
+        try:
+            response = handler(candidate)
+            if isawaitable(response):
+                response = await response
+        except Exception as exc:
+            return SurfaceRouteResult(
+                status="error",
+                surface_id=action.surface_id,
+                owner=owner,
+                error=_routing_error(
+                    code="owner_handler_failed",
+                    surface_id=action.surface_id,
+                    message=_owner_handler_failure_message(exc),
+                ),
+                original_payload=candidate,
+            )
 
         try:
             self._register_specialist_response_surfaces(response, owner=owner)
@@ -224,6 +238,7 @@ class SurfaceRouteRegistry:
                     surface_id=action.surface_id,
                     message=str(exc),
                 ),
+                original_payload=candidate,
             )
 
         return SurfaceRouteResult(
@@ -394,6 +409,13 @@ def _routing_error(
         "message": message,
         "ownerInferenceAttempted": False,
     }
+
+
+def _owner_handler_failure_message(exc: Exception) -> str:
+    return (
+        "A2UI surface owner handler failed: "
+        f"{type(exc).__name__}. Error details redacted."
+    )
 
 
 def _validation_error_message(validation_errors: list[str]) -> str:

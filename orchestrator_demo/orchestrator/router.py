@@ -102,8 +102,8 @@ class RequestRouter:
                 selected_agent=None,
                 confidence=confidence,
                 reason=(
-                    "A safe route or plan cannot be formed because synthesis "
-                    "requires at least one concrete specialist workstream."
+                    "A safe route or plan cannot be formed because no available "
+                    "non-synthesis specialist workstream remains."
                 ),
             )
 

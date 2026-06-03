@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -115,22 +115,23 @@ class ApprovalStateStore:
     def __init__(
         self,
         *,
-        agent_descriptors: Sequence[AgentDescriptor],
+        agent_descriptors: Sequence[AgentDescriptor]
+        | Callable[[], Sequence[AgentDescriptor]],
         graph_runtime: GraphRuntime | None = None,
+        plan_validator: Callable[[ExecutionPlan], None] | None = None,
     ) -> None:
-        self._agent_descriptors = [
-            descriptor.model_copy(deep=True) for descriptor in agent_descriptors
-        ]
-        self._agent_descriptors_by_id = {
-            descriptor.agent_id: descriptor for descriptor in self._agent_descriptors
-        }
-        self._agent_ids = {
-            descriptor.agent_id for descriptor in self._agent_descriptors
-        }
+        if callable(agent_descriptors):
+            self._agent_descriptor_provider = agent_descriptors
+        else:
+            static_agent_descriptors = tuple(
+                descriptor.model_copy(deep=True)
+                for descriptor in agent_descriptors
+            )
+            self._agent_descriptor_provider = lambda: static_agent_descriptors
+
         self._records: dict[str, ApprovalRecord] = {}
-        self._graph_runtime = graph_runtime or AdkGraphRuntime(
-            specialist_handlers=default_specialist_handlers(self._agent_ids)
-        )
+        self._graph_runtime = graph_runtime
+        self._plan_validator = plan_validator
 
     def add_draft(self, plan: ExecutionPlan) -> ApprovalRecord:
         """Store a deep copy of a draft plan without owning the caller's object."""
@@ -150,6 +151,17 @@ class ApprovalStateStore:
         """Return a defensive snapshot of a plan record for inspection."""
 
         return _record_snapshot(self._get_live_record(plan_id))
+
+    def reset_failed_approval(self, plan_id: str) -> ApprovalRecord:
+        """Restore a failed approval attempt to its editable draft state."""
+
+        record = self._get_live_record(plan_id)
+        if record.status == "approved_execution_failed":
+            record.status = "draft"
+            record.approved_plan = None
+            record.approved_version = None
+            record.execution_failure_reason = None
+        return _record_snapshot(record)
 
     def _get_live_record(self, plan_id: str) -> ApprovalRecord:
         try:
@@ -186,6 +198,13 @@ class ApprovalStateStore:
         self._require_current_version(record, action)
         _require_approved_step_ids(record.draft_plan, action.payload)
         _require_immutable_after_approval(record.draft_plan)
+        try:
+            self._require_plan_agents_available(record.draft_plan)
+            self._require_plan_executable(record.draft_plan)
+        except PlanMutationError:
+            if self._graph_runtime is None and self._plan_validator is None:
+                self._record_default_runtime_preflight_failure(record)
+            raise
 
         frozen_plan = record.draft_plan.model_copy(deep=True)
         record.status = "approved"
@@ -193,8 +212,16 @@ class ApprovalStateStore:
         record.approved_version = frozen_plan.plan_version
         record.execution_failure_reason = None
 
+        graph_runtime = self._graph_runtime
+        if graph_runtime is None:
+            graph_runtime = AdkGraphRuntime(
+                specialist_handlers=default_specialist_handlers(
+                    self._current_agent_ids()
+                )
+            )
+
         try:
-            graph_execution = self._graph_runtime.execute(frozen_plan)
+            graph_execution = graph_runtime.execute(frozen_plan)
         except Exception as exc:
             record.status = "approved_execution_failed"
             record.execution_failure_reason = f"{type(exc).__name__}: {exc}"
@@ -256,9 +283,10 @@ class ApprovalStateStore:
 
         candidate_plan = _with_next_version(next_plan)
         _require_final_synthesis_preserved(plan, candidate_plan)
+        self._require_plan_executable(candidate_plan)
         refreshed_parts = approval_canvas_data_parts(
             candidate_plan,
-            agent_descriptors=self._agent_descriptors,
+            agent_descriptors=self._current_agent_descriptors(),
         )
         record.draft_plan = candidate_plan
         return ApprovalActionResult(
@@ -286,7 +314,7 @@ class ApprovalStateStore:
             "agentId",
             "agent_id",
         )
-        replacement_descriptor = self._agent_descriptors_by_id.get(
+        replacement_descriptor = self._current_agent_descriptors_by_id().get(
             replacement_agent_id
         )
         if replacement_descriptor is None:
@@ -360,9 +388,89 @@ class ApprovalStateStore:
             f"{expected_surface_id!r}"
         )
 
+    def _current_agent_descriptors(self) -> list[AgentDescriptor]:
+        return [
+            descriptor.model_copy(deep=True)
+            for descriptor in self._agent_descriptor_provider()
+        ]
+
+    def _current_agent_descriptors_by_id(self) -> dict[str, AgentDescriptor]:
+        return {
+            descriptor.agent_id: descriptor
+            for descriptor in self._current_agent_descriptors()
+        }
+
+    def _current_agent_ids(self) -> set[str]:
+        return set(self._current_agent_descriptors_by_id())
+
+    def _require_plan_agents_available(self, plan: ExecutionPlan) -> None:
+        current_agent_ids = self._current_agent_ids()
+        unavailable_agent_ids = [
+            agent_id
+            for agent_id in _plan_agent_ids(plan)
+            if agent_id not in current_agent_ids
+        ]
+        if unavailable_agent_ids:
+            unavailable = ", ".join(unavailable_agent_ids)
+            raise PlanMutationError(
+                f"plan references unavailable agents: {unavailable}"
+            )
+
+    def _require_plan_executable(self, plan: ExecutionPlan) -> None:
+        if self._plan_validator is None:
+            return
+        self._plan_validator(plan)
+
+    def _record_default_runtime_preflight_failure(
+        self,
+        record: ApprovalRecord,
+    ) -> None:
+        frozen_plan = record.draft_plan.model_copy(deep=True)
+        record.status = "approved_execution_failed"
+        record.approved_plan = frozen_plan
+        record.approved_version = frozen_plan.plan_version
+        record.execution_failure_reason = _missing_handler_failure_reason(
+            frozen_plan,
+            unavailable_agent_ids=[
+                agent_id
+                for agent_id in _plan_agent_ids(frozen_plan)
+                if agent_id not in self._current_agent_ids()
+            ],
+        )
+
 
 def _approval_surface_id(plan: ExecutionPlan) -> str:
     return plan.approval_surface_id or f"surface_{plan.plan_id}"
+
+
+def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
+    agent_ids: list[str] = []
+    for agent_id in plan.selected_agents:
+        if agent_id not in agent_ids:
+            agent_ids.append(agent_id)
+    for step in plan.steps:
+        if step.agent_id not in agent_ids:
+            agent_ids.append(step.agent_id)
+    return agent_ids
+
+
+def _missing_handler_failure_reason(
+    plan: ExecutionPlan,
+    *,
+    unavailable_agent_ids: Sequence[str],
+) -> str:
+    unavailable_agent_ids = list(unavailable_agent_ids)
+    for step in plan.steps:
+        if step.agent_id in unavailable_agent_ids:
+            return (
+                "GraphRuntimeError: no specialist handler registered for approved "
+                f"plan step {step.step_id} agent {step.agent_id}"
+            )
+    agent_id = unavailable_agent_ids[0] if unavailable_agent_ids else "unknown"
+    return (
+        "GraphRuntimeError: no specialist handler registered for approved "
+        f"plan agent {agent_id}"
+    )
 
 
 def _require_approved_step_ids(

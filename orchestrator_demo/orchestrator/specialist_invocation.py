@@ -48,6 +48,8 @@ SURFACE_ID_ENVELOPE_KEYS = (
 async def invoke_specialist(
     specialist: SpecialistLike,
     request: SpecialistRequest,
+    *,
+    enforce_response_agent_id: bool = True,
 ) -> SpecialistResponse:
     """Invoke callable specialists or SpecialistAgent-style handlers."""
 
@@ -64,7 +66,7 @@ async def invoke_specialist(
         result = await result
 
     response = SpecialistResponse.model_validate(result)
-    if response.agent_id != request.agent_id:
+    if enforce_response_agent_id and response.agent_id != request.agent_id:
         raise RuntimeError(
             "specialist response agent_id must match requested agent_id: "
             f"expected {request.agent_id!r}, got {response.agent_id!r}"

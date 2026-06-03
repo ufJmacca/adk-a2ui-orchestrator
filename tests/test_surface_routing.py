@@ -143,6 +143,13 @@ class RecordingSpecialistAdapter:
         return {"status": "handled", "agent_id": "product_opportunity"}
 
 
+class FailingSpecialistAdapter:
+    async def handle_user_action(self, _user_action: Any) -> dict[str, str]:
+        raise RuntimeError(
+            "Authorization: Bearer sk-or-v1-handler-secret-should-not-appear"
+        )
+
+
 class SurfaceReturningSpecialistAdapter:
     def __init__(self, surface_id: str) -> None:
         self.surface_id = surface_id
@@ -664,6 +671,43 @@ async def test_specialist_owned_user_action_is_forwarded_with_original_payload()
     assert adapter.received_user_actions == [user_action]
     assert adapter.received_user_actions[0] is user_action
     assert user_action == original_user_action
+
+
+@pytest.mark.asyncio
+async def test_specialist_owned_user_action_handler_failure_is_redacted() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
+
+    registry = SurfaceRouteRegistry()
+    registry.register_specialist_surface(
+        "surface_product_recommendation",
+        agent_id="product_opportunity",
+    )
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": "surface_product_recommendation",
+            "payload": {"token": "sk-or-v1-payload-secret-should-not-appear"},
+        }
+    }
+
+    # Act
+    result = await registry.route_user_action(
+        user_action,
+        specialist_adapters={"product_opportunity": FailingSpecialistAdapter()},
+    )
+
+    # Assert
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error["code"] == "owner_handler_failed"
+    assert result.error["surfaceId"] == "surface_product_recommendation"
+    assert result.error["ownerInferenceAttempted"] is False
+    assert "RuntimeError" in result.error["message"]
+    assert "Error details redacted" in result.error["message"]
+    assert "sk-or-v1-handler-secret-should-not-appear" not in result.error["message"]
+    assert "sk-or-v1-payload-secret-should-not-appear" not in result.error["message"]
+    assert result.response is None
 
 
 @pytest.mark.asyncio

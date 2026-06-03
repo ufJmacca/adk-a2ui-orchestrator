@@ -1903,10 +1903,12 @@ def test_approval_freezes_referenced_plan_version_and_rejects_future_mutation() 
         )
 
 
-def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
+def test_approve_plan_rejects_unavailable_step_agent_before_execution() -> None:
     # Arrange
-    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
-    from orchestrator_demo.orchestrator.graph_runtime import GraphRuntimeError
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanMutationError,
+    )
 
     plan = ExecutionPlan(
         plan_id="plan_typo_agent",
@@ -1928,11 +1930,8 @@ def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
 
     # Act / Assert
     with pytest.raises(
-        GraphRuntimeError,
-        match=(
-            "no specialist handler registered for approved plan step "
-            "step_typo_agent agent relationship_summarry"
-        ),
+        PlanMutationError,
+        match="plan references unavailable agents: relationship_summarry",
     ):
         store.apply_user_action(
             {
@@ -1956,6 +1955,37 @@ def test_default_approval_runtime_fails_for_unregistered_step_agent() -> None:
         "GraphRuntimeError: no specialist handler registered for approved plan "
         "step step_typo_agent agent relationship_summarry"
     )
+
+
+def test_default_graph_runtime_refreshes_handlers_for_live_registry_additions() -> None:
+    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+
+    current_descriptors = [
+        descriptor
+        for descriptor in _agent_descriptors()
+        if descriptor.agent_id != "industry_research"
+    ]
+    store = ApprovalStateStore(agent_descriptors=lambda: current_descriptors)
+    plan = _meeting_plan()
+    store.add_draft(plan)
+
+    current_descriptors = _agent_descriptors()
+
+    result = store.apply_user_action(
+        _action(
+            "approve_plan",
+            {"approvedStepIds": [step.step_id for step in plan.steps]},
+        )
+    )
+
+    assert result.status == "approved"
+    assert result.graph_execution is not None
+    assert {
+        request.agent_id for request in result.graph_execution.specialist_requests
+    } == set(plan.selected_agents)
+    record = store.get(plan.plan_id)
+    assert record.status == "approved"
+    assert record.approved_plan is not None
 
 
 def test_graph_runtime_awaits_async_specialist_handlers() -> None:
