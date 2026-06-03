@@ -204,6 +204,24 @@ async def test_specialist_a2ui_surfaces_use_stable_surface_ids_when_produced(
     )
     assert first_updates[1]["updateComponents"]["components"][0]["id"] == "root"
 
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    button_component = next(
+        component
+        for component in first_payload[1]["updateComponents"]["components"]
+        if component["component"] == "Button"
+    )
+    user_action = parse_user_action(button_component["action"])
+    assert user_action.type == "specialist_action"
+    assert user_action.surface_id == first_response.surface_id
+    assert user_action.payload == {
+        "agentId": agent_id,
+        "action": "show_more_detail",
+        "componentId": f"component_{agent_id}_details",
+    }
+    event_action = parse_user_action(button_component["action"]["event"])
+    assert event_action == user_action
+
     validator = _basic_a2ui_validator()
     validator.validate(first_updates)
     validator.validate(second_updates)

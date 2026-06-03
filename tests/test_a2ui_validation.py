@@ -262,35 +262,6 @@ def test_a2ui_validation_accepts_sdk_kind_data_part_payload() -> None:
     assert result.renderer_part.metadata["mimeType"] == A2UI_MIME_TYPE
 
 
-def test_a2ui_validation_redacts_secret_like_sdk_data_part_error_locations() -> None:
-    # Arrange
-    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
-
-    sdk_data_part = {
-        "kind": "data",
-        "mimeType": A2UI_MIME_TYPE,
-        "data": _valid_canvas_payload(),
-        "OPENROUTER_API_KEY": "accidentally copied envelope key",
-        "Authorization": "accidentally copied header key",
-    }
-
-    # Act
-    result = validate_outbound_a2ui(sdk_data_part)
-
-    # Assert
-    assert result.valid is False
-    assert isinstance(result.renderer_part, TextPart)
-    exposed_diagnostic_text = repr(
-        {
-            "validation_errors": result.validation_errors,
-            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
-        }
-    )
-    assert "OPENROUTER_API_KEY" not in exposed_diagnostic_text
-    assert "Authorization" not in exposed_diagnostic_text
-    assert "<redacted-key>" in exposed_diagnostic_text
-
-
 def test_a2ui_validation_accepts_sdk_created_a2ui_part_instance() -> None:
     # Arrange
     from a2ui.a2a.parts import create_a2ui_part
@@ -332,6 +303,38 @@ def test_a2ui_validation_preserves_create_surface_envelope() -> None:
     assert result.renderer_part.data == payload
 
 
+def test_a2ui_validation_emits_each_specialist_a2ui_message_from_list() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = [
+        {
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": "surface_product_card",
+                "catalogId": BASIC_CATALOG_ID,
+            },
+        },
+        _a2ui_update(surface_id="surface_product_card"),
+    ]
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert len(result.renderer_parts) == 2
+    assert result.renderer_part == result.renderer_parts[0]
+    assert all(isinstance(part, DataPart) for part in result.renderer_parts)
+    assert [part.data for part in result.renderer_parts] == payload
+    assert all(
+        part.metadata["mimeType"] == A2UI_MIME_TYPE
+        for part in result.renderer_parts
+        if isinstance(part, DataPart)
+    )
+
+
 def test_a2ui_validation_preserves_non_plan_specialist_a2ui_payload() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
@@ -348,39 +351,53 @@ def test_a2ui_validation_preserves_non_plan_specialist_a2ui_payload() -> None:
     assert result.renderer_part.data == payload
 
 
-def test_a2ui_validation_accepts_renderer_mapped_downstream_components() -> None:
+def test_a2ui_validation_preserves_structured_specialist_user_action() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
 
     payload = _a2ui_update(
-        surface_id="surface_product_downstream",
+        surface_id="surface_product_card",
         components=[
             {
-                "component": "Table",
-                "id": "component_table",
-                "columns": [{"key": "product", "label": "Product"}],
-                "rows": [{"product": "Treasury services"}],
+                "component": "Card",
+                "id": "root",
+                "child": "component_product_content",
             },
             {
-                "component": "Accordion",
-                "id": "component_accordion",
-                "title": "Rationale",
-                "children": ["component_status"],
-            },
-            {
-                "component": "Timeline",
-                "id": "component_timeline",
-                "items": [
-                    {
-                        "label": "Review",
-                        "detail": "RM validates synthetic demo findings.",
-                    }
+                "component": "Column",
+                "id": "component_product_content",
+                "children": [
+                    "component_product_summary",
+                    "component_product_details",
                 ],
             },
             {
-                "component": "Status",
-                "id": "component_status",
-                "message": "Ready for RM review.",
+                "component": "Text",
+                "id": "component_product_summary",
+                "text": "Treasury services fit the stated need.",
+            },
+            {
+                "component": "Button",
+                "id": "component_product_details",
+                "child": "component_product_details_label",
+                "action": {
+                    "event": {
+                        "name": "specialist_action",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_product_card",
+                            "payload": {
+                                "agentId": "product_opportunity",
+                                "action": "show_detail",
+                            },
+                        },
+                    }
+                },
+            },
+            {
+                "component": "Text",
+                "id": "component_product_details_label",
+                "text": "Show more detail",
             },
         ],
     )
@@ -867,40 +884,6 @@ def test_a2ui_validation_rejects_mixed_routed_button_without_user_action_context
     assert result.valid is False
     assert isinstance(result.renderer_part, TextPart)
     assert any(expected_error in error for error in result.validation_errors)
-
-
-def test_a2ui_validation_rejects_non_object_button_event_in_mixed_payload() -> None:
-    # Arrange
-    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
-
-    payload = _a2ui_update(
-        surface_id="surface_mixed_invalid_button_event",
-        components=[
-            {
-                "component": "Table",
-                "id": "component_table",
-                "columns": [{"key": "name", "label": "Name"}],
-                "rows": [{"name": "ABC Manufacturing"}],
-            },
-            {
-                "component": "Button",
-                "id": "root",
-                "label": "Inspect customer",
-                "action": {"event": "inspect_customer"},
-            },
-        ],
-    )
-
-    # Act
-    result = validate_outbound_a2ui(payload)
-
-    # Assert
-    assert result.valid is False
-    assert isinstance(result.renderer_part, TextPart)
-    assert any(
-        "updateComponents.components[1].action.event must be an object" in error
-        for error in result.validation_errors
-    )
 
 
 @pytest.mark.parametrize(
@@ -1435,6 +1418,40 @@ def test_a2ui_validation_falls_back_for_malformed_generic_component() -> None:
     assert any("action" in error for error in result.validation_errors)
 
 
+def test_a2ui_validation_falls_back_for_missing_specialist_component_reference() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _a2ui_update(
+        surface_id="surface_specialist_actions",
+        components=[
+            {
+                "component": "Button",
+                "id": "root",
+                "child": "component_missing_label",
+                "action": {
+                    "event": {
+                        "name": "specialist_action",
+                        "context": {
+                            "type": "specialist_action",
+                            "surfaceId": "surface_specialist_actions",
+                            "payload": {"agentId": "product_opportunity"},
+                        },
+                    }
+                },
+            }
+        ],
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    assert any("references unknown component" in error for error in result.validation_errors)
+
+
 @pytest.mark.parametrize(
     ("missing_field", "expected_error"),
     [
@@ -1752,6 +1769,43 @@ def test_a2ui_validation_rejects_schema_valid_secret_bearing_payload() -> None:
     assert "secret-like value" in exposed_diagnostic_text
 
 
+def test_a2ui_validation_rejects_truncated_pem_private_key_before_renderer() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    leaked_value = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"
+    )
+    payload = _a2ui_update(
+        components=[
+            {
+                "component": "Text",
+                "id": "root",
+                "text": f"Copied diagnostic: {leaked_value}",
+            }
+        ]
+    )
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+            "renderer_part": result.renderer_part.model_dump(mode="json"),
+        }
+    )
+    assert "-----BEGIN PRIVATE KEY-----" not in exposed_diagnostic_text
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" not in exposed_diagnostic_text
+    assert "<redacted-secret>" in exposed_diagnostic_text
+    assert "secret-like value" in exposed_diagnostic_text
+
+
 @pytest.mark.parametrize(
     ("surface_id", "component_id", "leaked_fragment"),
     [
@@ -1931,6 +1985,34 @@ def test_a2ui_validation_rejects_schema_valid_secret_like_keys() -> None:
     assert "OPENROUTER_API_KEY" not in exposed_diagnostic_text
     assert "<redacted-key>" in exposed_diagnostic_text
     assert "secret-like key" in exposed_diagnostic_text
+
+
+def test_a2ui_validation_redacts_secret_like_data_part_error_locations() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = {
+        "type": "data",
+        "data": _a2ui_update(),
+        "metadata": {"mimeType": A2UI_MIME_TYPE},
+        "OPENROUTER_API_KEY": "configured",
+    }
+
+    # Act
+    result = validate_outbound_a2ui(payload)
+
+    # Assert
+    assert result.valid is False
+    assert isinstance(result.renderer_part, TextPart)
+    exposed_diagnostic_text = repr(
+        {
+            "validation_errors": result.validation_errors,
+            "diagnostics": result.renderer_part.metadata["developerDiagnostic"],
+        }
+    )
+    assert "OPENROUTER_API_KEY" not in exposed_diagnostic_text
+    assert "<redacted-key>" in exposed_diagnostic_text
+    assert "Extra inputs" in exposed_diagnostic_text
 
 
 def test_a2ui_validation_rejects_secret_bearing_data_part_metadata() -> None:

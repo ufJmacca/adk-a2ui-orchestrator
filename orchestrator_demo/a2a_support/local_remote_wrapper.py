@@ -81,17 +81,9 @@ class LocalRemoteAgentWrapper:
     def call_count(self) -> int:
         return self._local_agent.call_count
 
-    @call_count.setter
-    def call_count(self, value: int) -> None:
-        self._local_agent.call_count = value
-
     @property
     def calls(self) -> list[SpecialistRequest]:
         return self._local_agent.calls
-
-    @calls.setter
-    def calls(self, value: list[SpecialistRequest]) -> None:
-        self._local_agent.calls = value
 
     async def run(self, request: SpecialistRequest) -> SpecialistResponse:
         forwarded_request = _request_without_secrets(request)

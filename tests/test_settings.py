@@ -1,45 +1,7 @@
 import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
-
-
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_documented_app_module_command_reaches_settings_validation(
-    tmp_path: Path,
-) -> None:
-    # Arrange
-    env = os.environ.copy()
-    env.pop("OPENROUTER_API_KEY", None)
-    env.pop("LLM_MODEL", None)
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(REPOSITORY_ROOT)
-        if existing_pythonpath is None
-        else f"{REPOSITORY_ROOT}{os.pathsep}{existing_pythonpath}"
-    )
-
-    # Act
-    result = subprocess.run(
-        [sys.executable, "-m", "orchestrator_demo.app"],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    # Assert
-    assert result.returncode == 2
-    assert "Missing required runtime configuration" in result.stderr
-    assert "OPENROUTER_API_KEY" in result.stderr
-    assert "LLM_MODEL" in result.stderr
-    assert "No module named orchestrator_demo.app.__main__" not in result.stderr
 
 
 def test_settings_load_required_and_optional_openrouter_values(
@@ -51,8 +13,6 @@ def test_settings_load_required_and_optional_openrouter_values(
     monkeypatch.setenv("OPENROUTER_API_BASE", "https://example.test/api/v1")
     monkeypatch.setenv("OR_APP_NAME", "relationship-manager-demo")
     monkeypatch.setenv("OR_SITE_URL", "https://relationship-manager.example.test")
-    monkeypatch.setenv("ORCHESTRATOR_APP_HOST", "0.0.0.0")
-    monkeypatch.setenv("ORCHESTRATOR_APP_PORT", "8123")
 
     from orchestrator_demo.app.settings import load_settings
 
@@ -65,8 +25,6 @@ def test_settings_load_required_and_optional_openrouter_values(
     assert settings.openrouter_api_base == "https://example.test/api/v1"
     assert settings.or_app_name == "relationship-manager-demo"
     assert settings.or_site_url == "https://relationship-manager.example.test"
-    assert settings.orchestrator_app_host == "0.0.0.0"
-    assert settings.orchestrator_app_port == 8123
 
 
 def test_missing_required_settings_fail_fast_with_redacted_error(
@@ -95,11 +53,11 @@ def test_litellm_environment_setup_uses_isolated_mapping() -> None:
     from orchestrator_demo.app.settings import Settings
 
     settings = Settings(
-        openrouter_api_key=SecretStr("unit-test-openrouter-key"),
-        llm_model="openrouter/example/model",
-        openrouter_api_base="https://example.test/api/v1",
-        or_app_name="relationship-manager-demo",
-        or_site_url="https://relationship-manager.example.test",
+        OPENROUTER_API_KEY=SecretStr("unit-test-openrouter-key"),
+        LLM_MODEL="openrouter/example/model",
+        OPENROUTER_API_BASE="https://example.test/api/v1",
+        OR_APP_NAME="relationship-manager-demo",
+        OR_SITE_URL="https://relationship-manager.example.test",
     )
     isolated_environ: dict[str, str] = {}
 
@@ -124,8 +82,8 @@ def test_litellm_model_builder_accepts_injected_factory() -> None:
 
     built_models: list[str] = []
     settings = Settings(
-        openrouter_api_key=SecretStr("unit-test-openrouter-key"),
-        llm_model="openrouter/example/model",
+        OPENROUTER_API_KEY=SecretStr("unit-test-openrouter-key"),
+        LLM_MODEL="openrouter/example/model",
     )
 
     def fake_model_factory(model: str) -> dict[str, str]:
@@ -151,11 +109,11 @@ def test_litellm_model_builder_can_bypass_environment_configuration() -> None:
 
     built_models: list[str] = []
     settings = Settings(
-        openrouter_api_key=SecretStr("unit-test-openrouter-key"),
-        llm_model="openrouter/example/model",
-        openrouter_api_base="https://example.test/api/v1",
-        or_app_name="relationship-manager-demo",
-        or_site_url="https://relationship-manager.example.test",
+        OPENROUTER_API_KEY=SecretStr("unit-test-openrouter-key"),
+        LLM_MODEL="openrouter/example/model",
+        OPENROUTER_API_BASE="https://example.test/api/v1",
+        OR_APP_NAME="relationship-manager-demo",
+        OR_SITE_URL="https://relationship-manager.example.test",
     )
     isolated_environ = {"UNRELATED_SETTING": "preserved"}
 

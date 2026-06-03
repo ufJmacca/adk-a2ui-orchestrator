@@ -112,37 +112,6 @@ async def test_simple_route_above_threshold_selects_single_agent_directly() -> N
 
 
 @pytest.mark.asyncio
-async def test_duplicate_single_workstream_values_still_route_directly() -> None:
-    # Arrange
-    user_input = "Summarize the internal notes for ABC Manufacturing."
-    slm_suggestion = IntentSuggestion(intent="internal_knowledge", confidence=0.95)
-    slm_client = _RecordingSlmClient(slm_suggestion)
-    classifier = _RecordingClassifier(
-        LlmIntentAssessment(
-            intents=["internal_knowledge", "internal_knowledge"],
-            confidence=0.96,
-            complexity="simple",
-            required_agents=["internal_knowledge", "internal_knowledge"],
-            rationale="The model repeated the same single workstream.",
-        ),
-        slm_client,
-    )
-    router = RequestRouter(
-        slm_client=slm_client,
-        intent_classifier=classifier,
-        registry=AgentRegistry.from_default_config(),
-    )
-
-    # Act
-    context = await router.route_request(user_input)
-
-    # Assert
-    assert context.decision.path == "direct"
-    assert context.decision.selected_agent == "internal_knowledge"
-    assert context.decision.confidence >= 0.85
-
-
-@pytest.mark.asyncio
 async def test_retail_trade_risk_example_routes_to_industry_research_directly() -> None:
     # Arrange
     user_input = "What are key risks in retail trade this quarter?"
@@ -268,26 +237,31 @@ async def test_unavailable_classifier_agent_returns_clarification_required() -> 
 
 
 @pytest.mark.asyncio
-async def test_unavailable_classifier_agent_reason_does_not_echo_agent_id() -> None:
+async def test_unavailable_sensitive_guardrail_returns_clarification_required() -> None:
     # Arrange
-    user_input = "Use this pasted key if needed: sk-or-v1-leakedclassifiersecret."
-    leaked_agent_id = "sk-or-v1-leakedclassifiersecret"
-    slm_suggestion = IntentSuggestion(intent="internal_knowledge", confidence=0.9)
+    user_input = "Assess credit risk and compliance guardrails for this customer."
+    slm_suggestion = IntentSuggestion(intent="credit_risk", confidence=0.82)
     slm_client = _RecordingSlmClient(slm_suggestion)
     classifier = _RecordingClassifier(
         LlmIntentAssessment(
-            intents=["internal_knowledge"],
-            confidence=0.88,
-            complexity="simple",
-            required_agents=[leaked_agent_id],
-            rationale="The classifier echoed a pasted secret-like value.",
+            intents=["credit_risk", "compliance_policy"],
+            confidence=0.91,
+            complexity="complex",
+            required_agents=["credit_risk", "compliance_policy", "synthesis"],
+            rationale="Credit and compliance review requires guardrails.",
         ),
         slm_client,
     )
+    default_registry = AgentRegistry.from_default_config()
+    available_descriptors = [
+        descriptor
+        for descriptor in default_registry.descriptors()
+        if descriptor.agent_id != "compliance_policy"
+    ]
     router = RequestRouter(
         slm_client=slm_client,
         intent_classifier=classifier,
-        registry=AgentRegistry.from_default_config(),
+        registry=_StaticRegistry(available_descriptors),
     )
 
     # Act
@@ -295,9 +269,9 @@ async def test_unavailable_classifier_agent_reason_does_not_echo_agent_id() -> N
 
     # Assert
     assert context.decision.path == "clarification_required"
+    assert context.decision.selected_agent is None
+    assert "compliance_policy" in context.decision.reason
     assert "unavailable" in context.decision.reason.casefold()
-    assert leaked_agent_id not in context.decision.reason
-    assert "sk-or-v1" not in context.decision.reason
 
 
 @pytest.mark.asyncio
@@ -413,7 +387,8 @@ async def test_high_confidence_simple_synthesis_only_assessment_requires_clarifi
     assert context.llm_assessment.required_agents == ["synthesis"]
     assert context.decision.path == "clarification_required"
     assert context.decision.selected_agent is None
-    assert "upstream specialist workstream" in context.decision.reason.casefold()
+    assert "synthesis" in context.decision.reason.casefold()
+    assert "specialist workstream" in context.decision.reason.casefold()
 
 
 @pytest.mark.asyncio

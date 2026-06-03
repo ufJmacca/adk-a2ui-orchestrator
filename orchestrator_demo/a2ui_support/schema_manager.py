@@ -84,16 +84,6 @@ SUPPORTED_BASIC_COMPONENT_TYPES = {
     "timeline",
     "video",
 }
-RENDERER_EXTENSION_COMPONENT_TYPES = {
-    "Accordion",
-    "Status",
-    "Table",
-    "Timeline",
-    "accordion",
-    "status",
-    "table",
-    "timeline",
-}
 ALLOWED_CONTROL_ACTIONS = {
     "approve_plan",
     "reject_plan",
@@ -173,6 +163,9 @@ class BasicCatalogSchema:
         is_full_replacement = _is_full_component_replacement(update_components)
         if is_full_replacement:
             existing_components = {}
+        validate_unknown_references = (
+            existing_components_by_surface_id is not None or is_full_replacement
+        )
         uses_renderer_extension_components = _uses_renderer_extension_components(
             components
         )
@@ -191,11 +184,15 @@ class BasicCatalogSchema:
                 errors,
                 path=f"{UPDATE_COMPONENTS_MESSAGE}.components",
                 existing_components=existing_components,
-                validate_unknown_references=(
-                    existing_components_by_surface_id is not None
-                    or is_full_replacement
-                ),
+                validate_unknown_references=validate_unknown_references,
             )
+            if not validate_unknown_references:
+                _validate_routed_action_component_references(
+                    components,
+                    errors,
+                    path=f"{UPDATE_COMPONENTS_MESSAGE}.components",
+                    existing_components=existing_components,
+                )
         _validate_generic_components(
             components,
             errors,
@@ -480,15 +477,6 @@ def _validate_generic_components(
         _validate_generic_component(component, f"{path}[{index}]", errors)
 
 
-def _has_renderer_extension_components(components: list[Any]) -> bool:
-    return any(
-        isinstance(component, Mapping)
-        and component.get("type", component.get("component"))
-        in RENDERER_EXTENSION_COMPONENT_TYPES
-        for component in components
-    )
-
-
 def _validate_generic_component(
     component: Any,
     path: str,
@@ -746,8 +734,6 @@ def _validate_button_action(value: Any, path: str, errors: list[str]) -> None:
 
     event = value.get("event")
     if not isinstance(event, Mapping):
-        if "event" in value:
-            errors.append(f"{path}.event must be an object")
         return
 
     plan_action_event = _is_plan_action_event(event, None)
@@ -1175,6 +1161,43 @@ def _validate_update_component_references(
                 )
 
 
+def _validate_routed_action_component_references(
+    components: list[Any],
+    errors: list[str],
+    *,
+    path: str,
+    existing_components: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
+    component_tree = _iter_update_component_tree(components, path=path)
+    known_component_ids = _top_level_component_ids(components) | set(
+        (existing_components or {}).keys()
+    )
+
+    for component, component_path in component_tree:
+        if not _has_routed_component_action(component):
+            continue
+        for referenced_id, reference_path in _iter_component_id_references(
+            component,
+            component_path,
+            include_inline_objects=False,
+        ):
+            if referenced_id not in known_component_ids:
+                errors.append(
+                    f"{reference_path} references unknown component {referenced_id!r}"
+                )
+
+
+def _has_routed_component_action(component: Mapping[str, Any]) -> bool:
+    action = component.get("action")
+    if not isinstance(action, Mapping):
+        return False
+    event = action.get("event")
+    if not isinstance(event, Mapping):
+        return False
+    context = event.get("context")
+    return isinstance(context, Mapping) and _has_routed_user_action_context(context)
+
+
 def _top_level_component_ids(components: list[Any]) -> set[str]:
     return {
         component["id"]
@@ -1451,51 +1474,6 @@ def _validate_tabs(value: Any, path: str, errors: list[str]) -> None:
         )
 
 
-def _validate_table(
-    component: Mapping[str, Any],
-    path: str,
-    errors: list[str],
-) -> None:
-    columns = component.get("columns")
-    if columns is not None:
-        if not isinstance(columns, list):
-            errors.append(f"{path}.columns must be a list")
-        else:
-            for index, column in enumerate(columns):
-                column_path = f"{path}.columns[{index}]"
-                if not isinstance(column, Mapping):
-                    errors.append(f"{column_path} must be an object")
-                    continue
-                _require_string(column, "key", errors, path=column_path)
-                _validate_optional_string(column, "label", errors, path=column_path)
-
-    rows = component.get("rows")
-    if rows is not None:
-        if not isinstance(rows, list):
-            errors.append(f"{path}.rows must be a list")
-        else:
-            for index, row in enumerate(rows):
-                if not isinstance(row, Mapping):
-                    errors.append(f"{path}.rows[{index}] must be an object")
-
-
-def _validate_timeline_items(value: Any, path: str, errors: list[str]) -> None:
-    if value is None:
-        return
-    if not isinstance(value, list):
-        errors.append(f"{path} must be a list")
-        return
-
-    for index, item in enumerate(value):
-        item_path = f"{path}[{index}]"
-        if not isinstance(item, Mapping):
-            errors.append(f"{item_path} must be an object")
-            continue
-        _validate_optional_string(item, "label", errors, path=item_path)
-        _validate_optional_string(item, "title", errors, path=item_path)
-        _validate_optional_string(item, "detail", errors, path=item_path)
-
-
 def _validate_workflow_canvas_component(
     component: Mapping[str, Any],
     path: str,
@@ -1686,18 +1664,6 @@ def _require_string(
         return
     if expected_value is not None and value != expected_value:
         errors.append(f"{field_path} must be {expected_value!r}")
-
-
-def _validate_optional_string(
-    payload: Mapping[str, Any],
-    field_name: str,
-    errors: list[str],
-    *,
-    path: str,
-) -> None:
-    value = payload.get(field_name)
-    if value is not None and not isinstance(value, str):
-        errors.append(f"{path}.{field_name} must be a string")
 
 
 def _require_non_empty_field(

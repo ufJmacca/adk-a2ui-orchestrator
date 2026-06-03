@@ -1,7 +1,5 @@
 const state = {
   surfaces: new Map(),
-  textSurfaceIds: new Map(),
-  nextTextSurfaceIndex: 1,
   activeSurfaceIdForPayload: null,
   activeDataContextForPayload: undefined,
 };
@@ -20,11 +18,7 @@ const COMPONENT_RENDERERS = {
   Status: renderStatus,
 };
 const COMPONENT_RENDERER_KEYS = new Map(
-  [
-    ...Object.keys(COMPONENT_RENDERERS).map((key) => [key.toLowerCase(), key]),
-    ['text-field', 'TextField'],
-    ['text_field', 'TextField'],
-  ],
+  Object.keys(COMPONENT_RENDERERS).map((key) => [key.toLowerCase(), key]),
 );
 const REQUIRED_PLAN_METADATA_KEYS = ['planId', 'planVersion', 'editedPlanVersion'];
 const BLOCKED_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -178,10 +172,6 @@ function renderA2uiParts(parts) {
   }
 
   for (const part of parts) {
-    if (part.type === 'text' && typeof part.text === 'string') {
-      renderTextPart(part);
-      continue;
-    }
     const payload = part.data || part;
     if (payload.createSurface) {
       createSurface(payload.createSurface);
@@ -196,54 +186,6 @@ function renderA2uiParts(parts) {
       deleteSurface(payload.deleteSurface.surfaceId);
     }
   }
-}
-
-function renderTextPart(part) {
-  const text = part.text;
-  if (!text.trim()) {
-    return;
-  }
-  const region = document.getElementById('downstream-surfaces');
-  const surfaceId = textPartSurfaceId(part);
-  const existing = document.getElementById(surfaceId);
-  const element = existing || document.createElement('section');
-  element.id = surfaceId;
-  element.className = 'a2ui-surface a2ui-text-fallback';
-  element.dataset.surfaceId = surfaceId;
-
-  const body = document.createElement('p');
-  body.className = 'a2ui-text';
-  body.textContent = text;
-
-  const diagnostic = part.metadata && part.metadata.developerDiagnostic;
-  const diagnosticText = diagnostic ? JSON.stringify(diagnostic, null, 2) : '';
-  if (diagnosticText) {
-    const details = document.createElement('pre');
-    details.className = 'a2ui-diagnostic';
-    details.textContent = diagnosticText;
-    element.replaceChildren(body, details);
-  } else {
-    element.replaceChildren(body);
-  }
-
-  if (!existing) {
-    region.appendChild(element);
-  }
-}
-
-function textPartSurfaceId(part) {
-  const key = JSON.stringify({
-    text: part.text,
-    metadata: part.metadata || {},
-  });
-  if (!state.textSurfaceIds.has(key)) {
-    state.textSurfaceIds.set(
-      key,
-      `surface_text_fallback_${state.nextTextSurfaceIndex}`,
-    );
-    state.nextTextSurfaceIndex += 1;
-  }
-  return state.textSurfaceIds.get(key);
 }
 
 function clearA2uiSurfaces() {
@@ -270,14 +212,6 @@ function createSurface(message) {
   element.dataset.surfaceId = surfaceId;
   if (!existing) {
     region.appendChild(element);
-  }
-  if (existing && surfaceId.startsWith('surface_plan_')) {
-    state.surfaces.set(surfaceId, {
-      element,
-      components: new Map(),
-      dataModel: {},
-    });
-    return;
   }
   if (!state.surfaces.has(surfaceId)) {
     state.surfaces.set(surfaceId, {
@@ -577,15 +511,13 @@ function renderCard(
   const element = document.createElement('article');
   element.className = 'a2ui-card';
   const children = [];
-  if (hasRenderableValue(component.title)) {
+  if (component.title) {
     const title = document.createElement('h3');
-    title.className = 'a2ui-card-title';
     title.textContent = String(component.title);
     children.push(title);
   }
-  if (hasRenderableValue(component.body)) {
+  if (component.body) {
     const body = document.createElement('p');
-    body.className = 'a2ui-card-body';
     body.textContent = String(component.body);
     children.push(body);
   }
@@ -598,10 +530,6 @@ function renderCard(
     element.replaceChildren(...children);
   }
   return element;
-}
-
-function hasRenderableValue(value) {
-  return value !== undefined && value !== null && String(value) !== '';
 }
 
 function renderTable(_surfaceId, component) {
@@ -689,7 +617,6 @@ function renderRecursiveComponent(componentId) {
 }
 
 function buildUserAction(context, surfaceId, dataContext = undefined) {
-  requireActionSurfaceContextMatchesRenderedSurface(context, surfaceId);
   state.activeSurfaceIdForPayload = surfaceId;
   state.activeDataContextForPayload = dataContext;
   try {
@@ -703,12 +630,6 @@ function buildUserAction(context, surfaceId, dataContext = undefined) {
   } finally {
     state.activeSurfaceIdForPayload = null;
     state.activeDataContextForPayload = undefined;
-  }
-}
-
-function requireActionSurfaceContextMatchesRenderedSurface(context, surfaceId) {
-  if (context.surfaceId !== surfaceId) {
-    throw new Error('A2UI action surfaceId does not match rendered surface');
   }
 }
 

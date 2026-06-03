@@ -282,4 +282,4 @@ def test_rejected_registry_descriptor_audit_log_redacts_secret_like_fields(
     assert SECRET_VALUE not in rendered_payload
     assert "apiToken" not in caplog.text
     assert "apiToken" not in rendered_payload
-    assert "<redacted-secret>" in rendered_payload or "<redacted-key>" in rendered_payload
+    assert "<redacted>" in rendered_payload

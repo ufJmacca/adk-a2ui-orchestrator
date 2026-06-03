@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from orchestrator_demo.contracts import AGENT_ID_PATTERN, AgentDescriptor
+from orchestrator_demo.contracts import AgentDescriptor
 
 
 REQUIRED_SPECIALIST_AGENT_IDS = frozenset(
@@ -57,7 +57,6 @@ JSON_SCHEMA_VALUE_CONTAINERS = (
     "unevaluatedItems",
     "unevaluatedProperties",
 )
-AGENT_ID_TOKEN_RE = re.compile(AGENT_ID_PATTERN)
 SECRET_FIELD_MARKERS = (
     "api_key",
     "apikey",
@@ -73,7 +72,7 @@ SECRET_FIELD_MARKERS = (
 SECRET_VALUE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)",
         r"(?<![A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}",
         r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}",
         r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}",
@@ -133,11 +132,6 @@ def _validate_descriptor_shape(
     descriptor: AgentDescriptor,
     location: str,
 ) -> None:
-    if AGENT_ID_TOKEN_RE.fullmatch(descriptor.agent_id) is None:
-        raise DescriptorValidationError(
-            f"{location}.agent_id must match {AGENT_ID_PATTERN}"
-        )
-
     list_fields = {
         "capabilities": descriptor.capabilities,
         "a2ui_catalogs": descriptor.a2ui_catalogs,
@@ -243,7 +237,6 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
             )
 
         for property_name, field_names in dependent_required.items():
-            safe_property_name = _safe_path_component(property_name)
             if not isinstance(property_name, str):
                 raise DescriptorValidationError(
                     f"{location}.dependentRequired must map strings to string lists"
@@ -257,7 +250,7 @@ def _validate_required_fields(schema: Mapping[str, Any], location: str) -> None:
             if _is_secret_like_field_name(property_name):
                 raise DescriptorValidationError(
                     f"descriptor config contains secret-like field: "
-                    f"{location}.dependentRequired.{safe_property_name}"
+                    f"{location}.dependentRequired.{REDACTED_SCHEMA_PATH_SEGMENT}"
                 )
             if (
                 not isinstance(field_names, Sequence)
@@ -413,17 +406,12 @@ def _reject_secret_like_fields(
         for key, child_value in value.items():
             safe_key = _validated_mapping_key_path_segment(path, key)
             child_path = f"{path}.{safe_key}"
-            key_text = str(key)
-            if _is_secret_like_field_name(key_text):
-                raise DescriptorValidationError(
-                    f"descriptor config contains secret-like field: {child_path}"
-                )
             _reject_secret_like_fields(
                 child_value,
                 child_path,
                 schema_scan_context=_schema_secret_scan_child_context(
                     schema_scan_context,
-                    key_text,
+                    str(key),
                     child_path,
                 ),
             )
@@ -513,6 +501,14 @@ def _validated_mapping_key_path_segment(path: str, key: Any) -> str:
             f"{redacted_path} ({legacy_redacted_path})"
         )
 
+    if _is_secret_like_field_name(key_text):
+        redacted_path = f"{path}.{REDACTED_SCHEMA_PATH_SEGMENT}"
+        legacy_redacted_path = f"{path}.[REDACTED]"
+        raise DescriptorValidationError(
+            f"descriptor config contains {_secret_like_mapping_key_label(path)}: "
+            f"{redacted_path} ({legacy_redacted_path})"
+        )
+
     return _safe_mapping_path_segment(path, key_text)
 
 
@@ -561,6 +557,9 @@ def _safe_path_component(value: Any) -> str:
         return type(value).__name__
 
     if _is_secret_like_value(value):
+        return "<redacted-key>"
+
+    if _is_secret_like_field_name(value):
         return "<redacted-key>"
 
     return value

@@ -4,41 +4,27 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from threading import RLock
+import threading
 from typing import Any, Literal
 
 from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.approval_canvas import approval_canvas_data_parts
 from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
 from orchestrator_demo.app.logging import log_audit_event
-from orchestrator_demo.contracts import (
-    AgentDescriptor,
-    ExecutionPlan,
-    PlanStep,
-    StatusEvent,
-    UserAction,
-)
+from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep, UserAction
 from orchestrator_demo.orchestrator.graph_runtime import (
     AdkGraphRuntime,
     GraphExecutionResult,
     GraphRuntime,
-    GraphRuntimeError,
     default_specialist_handlers,
 )
-from orchestrator_demo.orchestrator.planner import (
-    normalize_parallel_groups,
-    step_metadata_for_agent,
-)
+from orchestrator_demo.orchestrator.planner import step_metadata_for_agent
 
 
-PlanState = Literal["draft", "approving", "approved", "rejected"]
-ApprovalActionStatus = Literal[
-    "ignored",
-    "draft_updated",
-    "approved",
-    "rejected",
-    "failed",
-]
+PlanState = Literal["draft", "approved", "approved_execution_failed", "rejected"]
+ApprovalActionStatus = Literal["ignored", "draft_updated", "approved", "rejected"]
+CONDITIONAL_DATA_QUALITY_AGENT_ID = "data_quality"
+CONDITIONAL_DATA_QUALITY_ROUTE = "missing_internal_data"
 
 
 class ApprovalStateError(ValueError):
@@ -50,7 +36,7 @@ class PlanNotFoundError(ApprovalStateError):
 
 
 class PlanAlreadyFinalError(ApprovalStateError):
-    """Raised when a mutation targets a non-draft plan."""
+    """Raised when a mutation targets an approved or rejected plan."""
 
 
 class PlanVersionConflictError(ApprovalStateError):
@@ -73,6 +59,7 @@ class ApprovalRecord:
     status: PlanState = "draft"
     approved_version: int | None = None
     rejection_reason: str | None = None
+    execution_failure_reason: str | None = None
     _approved_plan: ExecutionPlan | None = field(default=None, repr=False)
 
     @property
@@ -94,6 +81,7 @@ def _record_snapshot(record: ApprovalRecord) -> ApprovalRecord:
         status=record.status,
         approved_version=record.approved_version,
         rejection_reason=record.rejection_reason,
+        execution_failure_reason=record.execution_failure_reason,
     )
     snapshot.approved_plan = record.approved_plan
     return snapshot
@@ -107,11 +95,10 @@ class ApprovalActionResult:
     plan_id: str | None = None
     plan_version: int | None = None
     refreshed_a2ui_parts: list[DataPart] = field(default_factory=list)
+    draft_plan: ExecutionPlan | None = None
     approved_plan: ExecutionPlan | None = None
     rejection_reason: str | None = None
-    failure_reason: str | None = None
     graph_execution: GraphExecutionResult | None = None
-    graph_status_events: tuple[StatusEvent, ...] = ()
     graph_created: bool = False
     specialists_called: bool = False
 
@@ -130,31 +117,24 @@ class ApprovalStateStore:
     def __init__(
         self,
         *,
-        agent_descriptors: Sequence[AgentDescriptor] | Callable[
-            [],
-            Sequence[AgentDescriptor],
-        ],
+        agent_descriptors: Sequence[AgentDescriptor]
+        | Callable[[], Sequence[AgentDescriptor]],
         graph_runtime: GraphRuntime | None = None,
+        plan_validator: Callable[[ExecutionPlan], None] | None = None,
     ) -> None:
-        self._lock = RLock()
         if callable(agent_descriptors):
-            self._agent_descriptor_source = agent_descriptors
+            self._agent_descriptor_provider = agent_descriptors
         else:
-            static_agent_descriptors = tuple(agent_descriptors)
+            static_agent_descriptors = tuple(
+                descriptor.model_copy(deep=True)
+                for descriptor in agent_descriptors
+            )
+            self._agent_descriptor_provider = lambda: static_agent_descriptors
 
-            def static_agent_descriptor_source() -> Sequence[AgentDescriptor]:
-                return static_agent_descriptors
-
-            self._agent_descriptor_source = static_agent_descriptor_source
-
-        self._agent_descriptors: list[AgentDescriptor] = []
-        self._agent_descriptors_by_id: dict[str, AgentDescriptor] = {}
-        self._agent_ids: set[str] = set()
-        self._refresh_agent_descriptors()
         self._records: dict[str, ApprovalRecord] = {}
-        self._graph_runtime = graph_runtime or AdkGraphRuntime(
-            specialist_handlers=default_specialist_handlers(self._agent_ids)
-        )
+        self._graph_runtime = graph_runtime
+        self._plan_validator = plan_validator
+        self._lock = threading.RLock()
 
     def add_draft(self, plan: ExecutionPlan) -> ApprovalRecord:
         """Store a deep copy of a draft plan without owning the caller's object."""
@@ -177,6 +157,18 @@ class ApprovalStateStore:
         with self._lock:
             return _record_snapshot(self._get_live_record(plan_id))
 
+    def reset_failed_approval(self, plan_id: str) -> ApprovalRecord:
+        """Restore a failed approval attempt to its editable draft state."""
+
+        with self._lock:
+            record = self._get_live_record(plan_id)
+            if record.status == "approved_execution_failed":
+                record.status = "draft"
+                record.approved_plan = None
+                record.approved_version = None
+                record.execution_failure_reason = None
+            return _record_snapshot(record)
+
     def _get_live_record(self, plan_id: str) -> ApprovalRecord:
         try:
             return self._records[plan_id]
@@ -193,14 +185,12 @@ class ApprovalStateStore:
 
         action = parse_plan_user_action(candidate)
         assert action.plan_id is not None
-
-        if action.type == "approve_plan":
-            return self._approve(action)
-
         with self._lock:
             record = self._get_live_record(action.plan_id)
             self._require_matching_surface(record, action)
 
+            if action.type == "approve_plan":
+                return self._approve(record, action)
             if action.type == "reject_plan":
                 return self._reject(record, action)
 
@@ -208,55 +198,42 @@ class ApprovalStateStore:
 
     def _approve(
         self,
+        record: ApprovalRecord,
         action: UserAction,
     ) -> ApprovalActionResult:
-        assert action.plan_id is not None
-        with self._lock:
-            record = self._get_live_record(action.plan_id)
-            self._require_matching_surface(record, action)
-            self._require_draft(record)
-            self._require_current_version(record, action)
-            _require_approved_step_ids(record.draft_plan, action.payload)
-
-            frozen_plan = record.draft_plan.model_copy(deep=True)
-            record.status = "approving"
-
+        self._require_draft(record)
+        self._require_current_version(record, action)
+        _require_approved_step_ids(record.draft_plan, action.payload)
+        _require_immutable_after_approval(record.draft_plan)
         try:
-            graph_execution = self._graph_runtime.execute(frozen_plan)
-        except GraphRuntimeError as exc:
-            self._rollback_approval_attempt(frozen_plan)
-            log_audit_event(
-                "approval_failed",
-                {
-                    "status": "failed",
-                    "plan_id": frozen_plan.plan_id,
-                    "plan_version": frozen_plan.plan_version,
-                    "graph_created": exc.graph is not None,
-                    "specialists_called": bool(exc.specialist_requests),
-                    "status_event_count": len(exc.status_events),
-                    "request_count": len(exc.specialist_requests),
-                    "response_count": len(exc.specialist_responses),
-                    "error_type": type(exc).__name__,
-                },
-            )
-            return ApprovalActionResult(
-                status="failed",
-                plan_id=frozen_plan.plan_id,
-                plan_version=frozen_plan.plan_version,
-                failure_reason=str(exc),
-                graph_status_events=tuple(exc.status_events),
-                graph_created=exc.graph is not None,
-                specialists_called=bool(exc.specialist_requests),
-            )
-        except Exception:
-            self._rollback_approval_attempt(frozen_plan)
+            self._require_plan_agents_available(record.draft_plan)
+            self._require_plan_executable(record.draft_plan)
+        except PlanMutationError:
+            if self._graph_runtime is None and self._plan_validator is None:
+                self._record_default_runtime_preflight_failure(record)
             raise
 
-        with self._lock:
-            record = self._get_live_record(frozen_plan.plan_id)
-            record.status = "approved"
-            record.approved_plan = frozen_plan
-            record.approved_version = frozen_plan.plan_version
+        frozen_plan = record.draft_plan.model_copy(deep=True)
+        record.status = "approved"
+        record.approved_plan = frozen_plan
+        record.approved_version = frozen_plan.plan_version
+        record.execution_failure_reason = None
+
+        graph_runtime = self._graph_runtime
+        if graph_runtime is None:
+            graph_runtime = AdkGraphRuntime(
+                specialist_handlers=default_specialist_handlers(
+                    self._current_agent_ids()
+                )
+            )
+
+        try:
+            graph_execution = graph_runtime.execute(frozen_plan)
+        except Exception as exc:
+            record.status = "approved_execution_failed"
+            record.execution_failure_reason = f"{type(exc).__name__}: {exc}"
+            raise
+
         log_audit_event(
             "approval_approved",
             {
@@ -268,7 +245,6 @@ class ApprovalStateStore:
                 "specialists_called": bool(graph_execution.specialist_requests),
             },
         )
-
         return ApprovalActionResult(
             status="approved",
             plan_id=frozen_plan.plan_id,
@@ -278,17 +254,6 @@ class ApprovalStateStore:
             graph_created=True,
             specialists_called=bool(graph_execution.specialist_requests),
         )
-
-    def _rollback_approval_attempt(self, frozen_plan: ExecutionPlan) -> None:
-        with self._lock:
-            record = self._get_live_record(frozen_plan.plan_id)
-            if (
-                record.status == "approving"
-                and record.draft_plan.plan_version == frozen_plan.plan_version
-            ):
-                record.status = "draft"
-                record.approved_plan = None
-                record.approved_version = None
 
     def _reject(
         self,
@@ -302,6 +267,7 @@ class ApprovalStateStore:
         reason = _optional_string(action.payload, "reason", empty_as_none=True)
         record.status = "rejected"
         record.rejection_reason = reason
+
         log_audit_event(
             "approval_rejected",
             {
@@ -313,7 +279,6 @@ class ApprovalStateStore:
                 "specialists_called": False,
             },
         )
-
         return ApprovalActionResult(
             status="rejected",
             plan_id=record.draft_plan.plan_id,
@@ -330,7 +295,6 @@ class ApprovalStateStore:
     ) -> ApprovalActionResult:
         self._require_draft(record)
         self._require_current_version(record, action)
-        self._refresh_agent_descriptors()
 
         plan = record.draft_plan
         if action.type == "edit_plan":
@@ -346,11 +310,12 @@ class ApprovalStateStore:
         else:
             raise PlanMutationError(f"unsupported draft mutation: {action.type}")
 
-        candidate_plan = _with_next_version(normalize_parallel_groups(next_plan))
+        candidate_plan = _with_next_version(next_plan)
         _require_final_synthesis_preserved(plan, candidate_plan)
+        self._require_plan_executable(candidate_plan)
         refreshed_parts = approval_canvas_data_parts(
             candidate_plan,
-            agent_descriptors=self._agent_descriptors,
+            agent_descriptors=self._current_agent_descriptors(),
         )
         record.draft_plan = candidate_plan
         log_audit_event(
@@ -371,6 +336,7 @@ class ApprovalStateStore:
             plan_id=candidate_plan.plan_id,
             plan_version=candidate_plan.plan_version,
             refreshed_a2ui_parts=refreshed_parts,
+            draft_plan=candidate_plan.model_copy(deep=True),
             graph_created=False,
             specialists_called=False,
         )
@@ -390,7 +356,7 @@ class ApprovalStateStore:
             "agentId",
             "agent_id",
         )
-        replacement_descriptor = self._agent_descriptors_by_id.get(
+        replacement_descriptor = self._current_agent_descriptors_by_id().get(
             replacement_agent_id
         )
         if replacement_descriptor is None:
@@ -407,6 +373,7 @@ class ApprovalStateStore:
                 steps.append(step)
                 continue
             replaced = True
+            _require_replaceable_step(step)
             steps.append(
                 _step_copy(
                     step,
@@ -430,18 +397,6 @@ class ApprovalStateStore:
             selected_agents=_selected_agents(steps),
             data_source_categories=_data_source_categories(steps),
         )
-
-    def _refresh_agent_descriptors(self) -> None:
-        self._agent_descriptors = [
-            descriptor.model_copy(deep=True)
-            for descriptor in self._agent_descriptor_source()
-        ]
-        self._agent_descriptors_by_id = {
-            descriptor.agent_id: descriptor for descriptor in self._agent_descriptors
-        }
-        self._agent_ids = {
-            descriptor.agent_id for descriptor in self._agent_descriptors
-        }
 
     def _require_draft(self, record: ApprovalRecord) -> None:
         if record.status == "draft":
@@ -475,9 +430,89 @@ class ApprovalStateStore:
             f"{expected_surface_id!r}"
         )
 
+    def _current_agent_descriptors(self) -> list[AgentDescriptor]:
+        return [
+            descriptor.model_copy(deep=True)
+            for descriptor in self._agent_descriptor_provider()
+        ]
+
+    def _current_agent_descriptors_by_id(self) -> dict[str, AgentDescriptor]:
+        return {
+            descriptor.agent_id: descriptor
+            for descriptor in self._current_agent_descriptors()
+        }
+
+    def _current_agent_ids(self) -> set[str]:
+        return set(self._current_agent_descriptors_by_id())
+
+    def _require_plan_agents_available(self, plan: ExecutionPlan) -> None:
+        current_agent_ids = self._current_agent_ids()
+        unavailable_agent_ids = [
+            agent_id
+            for agent_id in _plan_agent_ids(plan)
+            if agent_id not in current_agent_ids
+        ]
+        if unavailable_agent_ids:
+            unavailable = ", ".join(unavailable_agent_ids)
+            raise PlanMutationError(
+                f"plan references unavailable agents: {unavailable}"
+            )
+
+    def _require_plan_executable(self, plan: ExecutionPlan) -> None:
+        if self._plan_validator is None:
+            return
+        self._plan_validator(plan)
+
+    def _record_default_runtime_preflight_failure(
+        self,
+        record: ApprovalRecord,
+    ) -> None:
+        frozen_plan = record.draft_plan.model_copy(deep=True)
+        record.status = "approved_execution_failed"
+        record.approved_plan = frozen_plan
+        record.approved_version = frozen_plan.plan_version
+        record.execution_failure_reason = _missing_handler_failure_reason(
+            frozen_plan,
+            unavailable_agent_ids=[
+                agent_id
+                for agent_id in _plan_agent_ids(frozen_plan)
+                if agent_id not in self._current_agent_ids()
+            ],
+        )
+
 
 def _approval_surface_id(plan: ExecutionPlan) -> str:
     return plan.approval_surface_id or f"surface_{plan.plan_id}"
+
+
+def _plan_agent_ids(plan: ExecutionPlan) -> list[str]:
+    agent_ids: list[str] = []
+    for agent_id in plan.selected_agents:
+        if agent_id not in agent_ids:
+            agent_ids.append(agent_id)
+    for step in plan.steps:
+        if step.agent_id not in agent_ids:
+            agent_ids.append(step.agent_id)
+    return agent_ids
+
+
+def _missing_handler_failure_reason(
+    plan: ExecutionPlan,
+    *,
+    unavailable_agent_ids: Sequence[str],
+) -> str:
+    unavailable_agent_ids = list(unavailable_agent_ids)
+    for step in plan.steps:
+        if step.agent_id in unavailable_agent_ids:
+            return (
+                "GraphRuntimeError: no specialist handler registered for approved "
+                f"plan step {step.step_id} agent {step.agent_id}"
+            )
+    agent_id = unavailable_agent_ids[0] if unavailable_agent_ids else "unknown"
+    return (
+        "GraphRuntimeError: no specialist handler registered for approved "
+        f"plan agent {agent_id}"
+    )
 
 
 def _require_approved_step_ids(
@@ -496,6 +531,13 @@ def _require_approved_step_ids(
     ) != len(approved_step_ids):
         raise PlanMutationError(
             "approvedStepIds must match current draft plan steps"
+        )
+
+
+def _require_immutable_after_approval(plan: ExecutionPlan) -> None:
+    if plan.immutable_after_approval is not True:
+        raise PlanMutationError(
+            "approve_plan requires immutable_after_approval=True before graph execution"
         )
 
 
@@ -525,6 +567,7 @@ def _remove_step(plan: ExecutionPlan, payload: Mapping[str, Any]) -> ExecutionPl
     )
     if removed_step is None:
         raise PlanMutationError("unknown stepId")
+    _require_removal_preserves_conditional_sources(plan.steps, removed_step)
 
     steps = [
         _step_copy(
@@ -552,6 +595,28 @@ def _remove_step(plan: ExecutionPlan, payload: Mapping[str, Any]) -> ExecutionPl
         selected_agents=_selected_agents(steps),
         data_source_categories=_data_source_categories(steps),
     )
+
+
+def _require_removal_preserves_conditional_sources(
+    steps: Sequence[PlanStep],
+    removed_step: PlanStep,
+) -> None:
+    if (
+        removed_step.agent_id == CONDITIONAL_DATA_QUALITY_AGENT_ID
+        and removed_step.condition == CONDITIONAL_DATA_QUALITY_ROUTE
+    ):
+        raise PlanMutationError(
+            "remove_step cannot remove a conditional data_quality step"
+        )
+
+    for step in steps:
+        if step.step_id == removed_step.step_id or step.condition is None:
+            continue
+        if removed_step.step_id in step.depends_on:
+            raise PlanMutationError(
+                "remove_step cannot remove the source dependency for "
+                f"conditional step {step.step_id}"
+            )
 
 
 def _rewired_dependencies(
@@ -656,6 +721,16 @@ def _data_source_categories(steps: Sequence[PlanStep]) -> list[str]:
 
 def _has_non_synthesis_step(steps: Sequence[PlanStep]) -> bool:
     return any(step.agent_id != "synthesis" for step in steps)
+
+
+def _require_replaceable_step(step: PlanStep) -> None:
+    if (
+        step.agent_id == CONDITIONAL_DATA_QUALITY_AGENT_ID
+        and step.condition == CONDITIONAL_DATA_QUALITY_ROUTE
+    ):
+        raise PlanMutationError(
+            "replace_agent cannot replace a conditional data_quality step"
+        )
 
 
 def _require_final_synthesis_preserved(

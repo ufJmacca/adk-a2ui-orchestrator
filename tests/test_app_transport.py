@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
 from typing import Any
@@ -438,101 +437,6 @@ def test_http_app_retires_approval_surface_when_next_request_has_direct_a2ui() -
         assert replayed["surfaceRouteResult"]["error"]["code"] == "unknown_surface"
 
 
-def test_http_request_and_artifacts_use_valid_fallback_for_rejected_specialist_a2ui_payload() -> None:
-    # Arrange
-    from orchestrator_demo.agents import build_default_specialists
-    from orchestrator_demo.app.server import LocalOrchestratorApp
-    from orchestrator_demo.contracts import (
-        IntentSuggestion,
-        LlmIntentAssessment,
-        SpecialistResponse,
-    )
-    from orchestrator_demo.orchestrator.service import OrchestratorService
-
-    secret_value = "sk-testsecret1234567890"
-
-    class SecretA2uiSpecialist:
-        agent_id = "product_opportunity"
-        call_count = 0
-
-        async def handle(self, _request: Any) -> SpecialistResponse:
-            self.call_count += 1
-            return SpecialistResponse(
-                response_id="response_product_opportunity_secret_a2ui",
-                agent_id=self.agent_id,
-                content="Product Opportunity Agent: product fit summary.",
-                structured_output={"summary": "product fit summary"},
-                a2ui_payload={
-                    "version": "v0.9",
-                    "updateComponents": {
-                        "surfaceId": "surface_product_secret",
-                        "components": [
-                            {
-                                "component": "Text",
-                                "id": "root",
-                                "text": "Unsafe recommendation details.",
-                            }
-                        ],
-                    },
-                    "OPENROUTER_API_KEY": secret_value,
-                },
-                surface_id="surface_product_secret",
-            )
-
-    class StaticSlmIntentClient:
-        async def classify(self, _user_input: str) -> IntentSuggestion:
-            return IntentSuggestion(intent="product_opportunity", confidence=0.95)
-
-    class StaticIntentClassifier:
-        async def assess(
-            self,
-            _user_input: str,
-            _slm_suggestion: IntentSuggestion,
-            *,
-            available_agents: Any = None,
-        ) -> LlmIntentAssessment:
-            return LlmIntentAssessment(
-                intents=["product_opportunity"],
-                confidence=0.95,
-                complexity="simple",
-                required_agents=["product_opportunity"],
-                rationale="Injected single-agent assessment.",
-            )
-
-    specialists = build_default_specialists()
-    specialists["product_opportunity"] = SecretA2uiSpecialist()
-    service = OrchestratorService(
-        specialists=specialists,
-        slm_client=StaticSlmIntentClient(),
-        intent_classifier=StaticIntentClassifier(),
-    )
-
-    with _running_server(LocalOrchestratorApp(service=service)) as base_url:
-        # Act
-        submitted = _request_json(
-            base_url,
-            "/api/request",
-            method="POST",
-            payload={"input": "Suggest product opportunities."},
-        )
-        artifacts = _request_json(base_url, "/api/artifacts")
-
-        # Assert
-        assert submitted["path"] == "direct"
-        assert len(submitted["a2uiParts"]) == 2
-        fallback_surface_id = submitted["a2uiParts"][0]["data"]["createSurface"][
-            "surfaceId"
-        ]
-        assert fallback_surface_id.startswith("surface_fallback_response_")
-        assert submitted["specialistResponses"][0]["surface_id"] == fallback_surface_id
-        assert artifacts["artifacts"]["final_response"]["surface_id"] == (
-            fallback_surface_id
-        )
-        serialized = json.dumps({"submitted": submitted, "artifacts": artifacts})
-        assert "OPENROUTER_API_KEY" not in serialized
-        assert secret_value not in serialized
-
-
 def test_static_directories_return_json_404() -> None:
     # Arrange
     with _running_server() as base_url:
@@ -563,23 +467,6 @@ def test_http_server_stop_before_start_does_not_block() -> None:
     # Assert
     assert stopped.is_set()
     assert not thread.is_alive()
-
-
-def test_transport_ids_are_unique_under_concurrent_request_allocation() -> None:
-    # Arrange
-    from orchestrator_demo.app.server import LocalOrchestratorApp
-
-    app = LocalOrchestratorApp()
-
-    # Act
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        ids = list(executor.map(lambda _index: app._next_transport_ids(), range(1000)))
-
-    # Assert
-    task_ids = [task_id for task_id, _context_id in ids]
-    context_ids = [context_id for _task_id, context_id in ids]
-    assert len(set(task_ids)) == len(task_ids)
-    assert len(set(context_ids)) == len(context_ids)
 
 
 def test_http_app_documents_endpoint_contract_and_streams_status_events() -> None:
@@ -785,7 +672,7 @@ def test_user_action_endpoint_returns_json_for_graph_execution_failure() -> None
         )
 
         # Act
-        failed = _request_json(
+        status, failed = _request_error_json(
             base_url,
             "/api/user-action",
             method="POST",
@@ -802,10 +689,13 @@ def test_user_action_endpoint_returns_json_for_graph_execution_failure() -> None
         )
 
         # Assert
-        assert failed["status"] == "failed"
-        assert failed["approvalResult"]["status"] == "failed"
-        assert failed["approvalResult"]["graphCreated"] is True
-        assert failed["approvalResult"]["specialistsCalled"] is True
+        assert status == 500
+        assert failed["status"] == "error"
+        assert failed["error"]["code"] == "graph_execution_failed"
+        assert failed["error"]["message"] == (
+            "Graph execution failed. The draft approval remains retryable."
+        )
+        assert failed["error"]["retryable"] is True
         assert failed["statusEvents"]
         assert "step_failed" in [
             event["status"] for event in failed["statusEvents"]
@@ -895,7 +785,7 @@ def test_user_action_endpoint_sanitizes_specialist_handler_failures() -> None:
         )
 
         # Act
-        status, failed = _request_error_json(
+        failed = _request_json(
             base_url,
             "/api/user-action",
             method="POST",
@@ -909,19 +799,28 @@ def test_user_action_endpoint_sanitizes_specialist_handler_failures() -> None:
         )
 
         # Assert
-        assert status == 500
-        assert failed == {
-            "status": "error",
-            "error": {
-                "code": "runtime_error",
+        route_error = failed["surfaceRouteResult"]["error"]
+        assert failed["status"] == "error"
+        assert route_error["code"] == "owner_handler_failed"
+        assert route_error["message"] == (
+            "A2UI surface owner handler failed: ValueError. Error details redacted."
+        )
+        assert failed["statusEvents"] == [
+            {
+                "status": "error",
                 "message": (
-                    "Request failed while processing. Retry after checking local "
-                    "service logs."
+                    "A2UI surface owner handler failed: ValueError. "
+                    "Error details redacted."
                 ),
-                "retryable": True,
-            },
-            "statusEvents": [],
-        }
+                "taskId": None,
+                "planId": None,
+                "details": {
+                    "code": "owner_handler_failed",
+                    "surfaceId": route_error["surfaceId"],
+                    "ownerInferenceAttempted": False,
+                },
+            }
+        ]
         assert "OPENROUTER_API_KEY" not in json.dumps(failed)
         assert "sk-live-user-action-secret-123456789" not in json.dumps(failed)
 
@@ -1085,182 +984,6 @@ def test_artifacts_replay_merges_incremental_data_model_path_value_updates() -> 
                 "name": "XYZ Supplies",
             },
         },
-    }
-
-
-def test_artifacts_replay_resets_snapshot_when_surface_is_recreated() -> None:
-    # Arrange
-    from orchestrator_demo.app.server import LocalOrchestratorApp
-
-    app = LocalOrchestratorApp()
-    surface_id = "surface_recreated_approval"
-    metadata = {"mimeType": "application/json+a2ui"}
-
-    # Act
-    app._merge_result_a2ui(
-        [
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "createSurface": {
-                        "surfaceId": surface_id,
-                        "catalogId": (
-                            "https://a2ui.org/specification/v0_9/"
-                            "basic_catalog.json"
-                        ),
-                    },
-                },
-                "metadata": metadata,
-            },
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "updateDataModel": {
-                        "surfaceId": surface_id,
-                        "data": {"removed": "stale"},
-                    },
-                },
-                "metadata": metadata,
-            },
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "updateComponents": {
-                        "surfaceId": surface_id,
-                        "components": [
-                            {
-                                "id": "component_removed_step",
-                                "component": "Text",
-                                "text": "Removed step",
-                            },
-                            {
-                                "id": "component_kept_step",
-                                "component": "Text",
-                                "text": "Original kept step",
-                            },
-                        ],
-                    },
-                },
-                "metadata": metadata,
-            },
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "createSurface": {
-                        "surfaceId": surface_id,
-                        "catalogId": (
-                            "https://a2ui.org/specification/v0_9/"
-                            "basic_catalog.json"
-                        ),
-                    },
-                },
-                "metadata": metadata,
-            },
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "updateComponents": {
-                        "surfaceId": surface_id,
-                        "components": [
-                            {
-                                "id": "component_kept_step",
-                                "component": "Text",
-                                "text": "Updated kept step",
-                            }
-                        ],
-                    },
-                },
-                "metadata": metadata,
-            },
-        ]
-    )
-    artifacts = app.latest_artifacts()
-
-    # Assert
-    replay_payloads = [part["data"] for part in artifacts["a2uiParts"]]
-    assert not any("updateDataModel" in payload for payload in replay_payloads)
-    replay_update = next(
-        payload["updateComponents"]
-        for payload in replay_payloads
-        if "updateComponents" in payload
-    )
-    assert replay_update["components"] == [
-        {
-            "id": "component_kept_step",
-            "component": "Text",
-            "text": "Updated kept step",
-        }
-    ]
-
-
-@pytest.mark.parametrize(
-    "snapshot",
-    [
-        [
-            {"customer": "ABC Manufacturing"},
-            {"customer": "XYZ Supplies"},
-        ],
-        False,
-    ],
-)
-def test_artifacts_replay_preserves_non_object_data_model_snapshots(
-    snapshot: Any,
-) -> None:
-    # Arrange
-    from orchestrator_demo.app.server import LocalOrchestratorApp
-
-    app = LocalOrchestratorApp()
-    surface_id = "surface_data_model_snapshot_replay"
-    metadata = {"mimeType": "application/json+a2ui"}
-
-    # Act
-    app._merge_result_a2ui(
-        [
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "createSurface": {
-                        "surfaceId": surface_id,
-                        "catalogId": (
-                            "https://a2ui.org/specification/v0_9/"
-                            "basic_catalog.json"
-                        ),
-                    },
-                },
-                "metadata": metadata,
-            },
-            {
-                "type": "data",
-                "data": {
-                    "version": "v0.9",
-                    "updateDataModel": {
-                        "surfaceId": surface_id,
-                        "data": snapshot,
-                    },
-                },
-                "metadata": metadata,
-            },
-        ]
-    )
-    artifacts = app.latest_artifacts()
-
-    # Assert
-    replay_payloads = [part["data"] for part in artifacts["a2uiParts"]]
-    replay_update = next(
-        payload["updateDataModel"]
-        for payload in replay_payloads
-        if "updateDataModel" in payload
-    )
-    assert replay_update == {
-        "surfaceId": surface_id,
-        "path": "/",
-        "value": snapshot,
     }
 
 

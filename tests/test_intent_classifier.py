@@ -74,6 +74,81 @@ async def test_classifier_treats_slm_result_as_non_binding_suggestion() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_input", "slm_suggestion", "expected_intents", "expected_required_agents"),
+    [
+        (
+            (
+                "Prepare me for tomorrow's meeting with ABC Manufacturing and "
+                "include loan compliance guardrails."
+            ),
+            IntentSuggestion(intent="meeting_prep", confidence=0.82),
+            [
+                "meeting_prep",
+                "relationship_summary",
+                "internal_knowledge",
+                "industry_research",
+                "credit_risk",
+                "compliance_policy",
+            ],
+            [
+                "relationship_summary",
+                "internal_knowledge",
+                "industry_research",
+                "credit_risk",
+                "compliance_policy",
+                "synthesis",
+            ],
+        ),
+        (
+            (
+                "Research this prospect for credit and compliance risks, "
+                "opportunities, and talking points."
+            ),
+            IntentSuggestion(intent="prospect_research", confidence=0.78),
+            [
+                "prospect_research",
+                "web_search",
+                "industry_research",
+                "product_opportunity",
+                "credit_risk",
+                "compliance_policy",
+            ],
+            [
+                "web_search",
+                "industry_research",
+                "product_opportunity",
+                "credit_risk",
+                "compliance_policy",
+                "synthesis",
+            ],
+        ),
+    ],
+)
+async def test_classifier_preserves_primary_workflow_with_sensitive_guardrails(
+    user_input: str,
+    slm_suggestion: IntentSuggestion,
+    expected_intents: list[str],
+    expected_required_agents: list[str],
+) -> None:
+    # Arrange
+    classifier = DeterministicIntentClassifier()
+
+    # Act
+    assessment = await classifier.assess(
+        user_input,
+        slm_suggestion,
+        available_agents=AgentRegistry.from_default_config().descriptors(),
+    )
+
+    # Assert
+    assert assessment.intents == expected_intents
+    assert assessment.required_agents == expected_required_agents
+    assert assessment.complexity == "complex"
+    assert "guardrails" in assessment.rationale.casefold()
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_input_returns_low_confidence_unknown_assessment() -> None:
     # Arrange
     classifier = DeterministicIntentClassifier()

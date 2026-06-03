@@ -20,13 +20,14 @@ import threading
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from orchestrator_demo.a2a_support.transport import A2APart
+from pydantic import BaseModel
+
+from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.event_parser import (
     PlanUserActionParseError,
     StructuredUserActionRequiredError,
     UnsupportedUserActionError,
 )
-from pydantic import BaseModel
 from orchestrator_demo.contracts import SpecialistResponse, StatusEvent
 from orchestrator_demo.orchestrator.approval_state import ApprovalStateError
 from orchestrator_demo.orchestrator.graph_runtime import GraphRuntimeError
@@ -47,7 +48,6 @@ class LocalOrchestratorApp:
     def __init__(self, service: OrchestratorService | None = None) -> None:
         self._service = service or OrchestratorService()
         self._counter = 0
-        self._counter_lock = threading.Lock()
         self._latest_a2ui_parts: list[dict[str, Any]] = []
         self._a2ui_replay_cache = _A2uiReplayCache()
         self._latest_artifacts: dict[str, Any] = {}
@@ -158,10 +158,8 @@ class LocalOrchestratorApp:
             }
 
     def _next_transport_ids(self) -> tuple[str, str]:
-        with self._counter_lock:
-            self._counter += 1
-            next_id = self._counter
-        return f"task_local_{next_id}", f"ctx_local_{next_id}"
+        self._counter += 1
+        return f"task_local_{self._counter}", f"ctx_local_{self._counter}"
 
     def _request_response_payload(
         self,
@@ -327,11 +325,6 @@ class _A2uiReplayCache:
             if isinstance(surface_id, str):
                 snapshot = self._snapshot_for(surface_id)
                 snapshot.create_part = deepcopy(dict(part))
-                snapshot.data_model = {}
-                snapshot.data_model_message = None
-                snapshot.update_components_message = None
-                snapshot.components_by_id.clear()
-                snapshot.component_order.clear()
                 return
 
         update_data_model = payload.get("updateDataModel")
@@ -678,7 +671,8 @@ def _applied_data_model_update(
     has_path = "path" in update_data_model
     has_value = "value" in update_data_model
     if not has_path and not has_value:
-        return deepcopy(update_data_model["data"]) if "data" in update_data_model else {}
+        data = update_data_model.get("data")
+        return deepcopy(data) if isinstance(data, Mapping) else {}
 
     parts = _safe_data_path_parts(update_data_model.get("path", "/"))
     if parts is None:
@@ -774,7 +768,7 @@ def _is_full_replacement(message: Mapping[str, Any]) -> bool:
     )
 
 
-def _data_parts_payload(parts: Sequence[A2APart]) -> list[dict[str, Any]]:
+def _data_parts_payload(parts: Sequence[DataPart]) -> list[dict[str, Any]]:
     return [part.model_dump(by_alias=True, mode="json") for part in parts]
 
 
@@ -864,7 +858,6 @@ def _approval_result_payload(result: Any) -> dict[str, Any] | None:
         "planVersion": result.plan_version,
         "approvedPlan": _jsonable(result.approved_plan),
         "reason": result.rejection_reason,
-        "failureReason": result.failure_reason,
         "graphCreated": result.graph_created,
         "specialistsCalled": result.specialists_called,
     }
@@ -878,7 +871,8 @@ def _surface_route_payload(
         return None
     owner = route_result.owner
     return {
-        "status": _public_user_action_status(route_result.status),
+        "status": route_result.status,
+        "error": _jsonable(route_result.error),
         "owner": None
         if owner is None
         else {
@@ -887,7 +881,6 @@ def _surface_route_payload(
             "ownerId": owner.owner_id,
             "planId": owner.plan_id,
         },
-        "error": _jsonable(route_result.error),
     }
 
 
@@ -945,7 +938,6 @@ def _user_action_status_message(status: str) -> str:
         "draft_updated": "Plan draft updated.",
         "rejected": "Plan rejected.",
         "approved": "Plan approved.",
-        "failed": "Plan approval failed.",
         "routed": "A2UI event routed to surface owner.",
         "error": "User action failed.",
     }.get(status, "User action handled.")

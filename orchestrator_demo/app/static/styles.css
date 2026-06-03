@@ -132,17 +132,6 @@ input {
   white-space: pre-wrap;
 }
 
-.a2ui-diagnostic {
-  overflow: auto;
-  max-height: 12rem;
-  margin: 0;
-  padding: 0.65rem;
-  border: 1px solid #d8dee5;
-  border-radius: 6px;
-  background: #f6f8fa;
-  white-space: pre-wrap;
-}
-
 .a2ui-field {
   display: grid;
   gap: 0.25rem;
