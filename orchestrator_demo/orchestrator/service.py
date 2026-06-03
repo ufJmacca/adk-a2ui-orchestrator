@@ -14,6 +14,7 @@ from orchestrator_demo.a2ui_support.renderer_contract import (
     prepare_approval_a2ui_for_renderer,
     prepare_specialist_a2ui_for_renderer,
 )
+from orchestrator_demo.a2ui_support.schema_manager import A2UI_VERSION, BASIC_CATALOG_ID
 from orchestrator_demo.agents import SpecialistAgent, build_default_specialists
 from orchestrator_demo.contracts import (
     ExecutionPlan,
@@ -53,6 +54,7 @@ from orchestrator_demo.orchestrator.surface_routes import (
     SurfaceOwnershipError,
     SurfaceRouteRegistry,
     SurfaceRouteResult,
+    SurfaceRegistrySnapshot,
 )
 from orchestrator_demo.registry.agent_registry import AgentRegistry
 
@@ -85,6 +87,12 @@ class OrchestratorUserActionResult:
     graph_execution: GraphExecutionResult | None = None
     status_events: tuple[StatusEvent, ...] = ()
     final_artifacts: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _PreparedSpecialistResponse:
+    response: SpecialistResponse | None
+    a2ui_parts: tuple[DataPart, ...] = ()
 
 
 class OrchestratorService:
@@ -157,7 +165,7 @@ class OrchestratorService:
         owner_agent_id = (
             route_result.owner.owner_id if route_result.owner is not None else None
         )
-        a2ui_parts = self._prepare_specialist_response_a2ui(
+        prepared = self._prepare_specialist_response_for_delivery(
             specialist_response,
             owner_agent_id=owner_agent_id,
         )
@@ -165,10 +173,10 @@ class OrchestratorService:
             status=route_result.status,
             surface_route_result=route_result,
             specialist_responses=(
-                (specialist_response,) if specialist_response is not None else ()
+                (prepared.response,) if prepared.response is not None else ()
             ),
-            a2ui_parts=a2ui_parts,
-            final_artifacts=_final_artifacts_for_response(specialist_response),
+            a2ui_parts=prepared.a2ui_parts,
+            final_artifacts=_final_artifacts_for_response(prepared.response),
         )
 
     def specialist_call_counts(self) -> dict[str, int]:
@@ -184,6 +192,19 @@ class OrchestratorService:
         """Return the deterministic owner registered for an A2UI surface."""
 
         return self._surface_registry.owner_for(surface_id)
+
+    def clear_renderer_surfaces(self) -> SurfaceRegistrySnapshot:
+        """Retire all renderer surface ownership for a fresh empty UI snapshot."""
+
+        return self._surface_registry.clear_all()
+
+    def restore_renderer_surfaces(
+        self,
+        snapshot: Mapping[str, SurfaceOwner] | SurfaceRegistrySnapshot,
+    ) -> None:
+        """Restore renderer surface ownership after a failed UI refresh."""
+
+        self._surface_registry.restore_all(snapshot)
 
     def approval_record(self, plan_id: str) -> ApprovalRecord:
         """Return the stored approval record snapshot for a plan."""
@@ -235,7 +256,7 @@ class OrchestratorService:
             raise GraphRuntimeError(
                 _direct_handler_failure_message(selected_agent, exc)
             ) from None
-        a2ui_parts = self._prepare_specialist_response_a2ui(
+        prepared = self._prepare_specialist_response_for_delivery(
             response,
             owner_agent_id=selected_agent,
         )
@@ -244,9 +265,9 @@ class OrchestratorService:
             path="direct",
             decision=context.decision,
             context=context,
-            specialist_responses=(response,),
-            a2ui_parts=a2ui_parts,
-            final_artifacts=_final_artifacts_for_response(response),
+            specialist_responses=((prepared.response,) if prepared.response else ()),
+            a2ui_parts=prepared.a2ui_parts,
+            final_artifacts=_final_artifacts_for_response(prepared.response),
         )
 
     def _handle_plan_required_request(
@@ -323,11 +344,18 @@ class OrchestratorService:
             raise
         a2ui_parts = self._prepare_approval_result_a2ui(approval_result)
         graph_execution = approval_result.graph_execution
-        specialist_responses = (
-            graph_execution.specialist_responses if graph_execution is not None else ()
-        )
-        specialist_a2ui_parts = self._prepare_graph_response_a2ui(
+        prepared_specialist_responses = self._prepare_graph_responses_for_delivery(
             graph_execution,
+        )
+        specialist_responses = tuple(
+            prepared.response
+            for prepared in prepared_specialist_responses
+            if prepared.response is not None
+        )
+        specialist_a2ui_parts = tuple(
+            part
+            for prepared in prepared_specialist_responses
+            for part in prepared.a2ui_parts
         )
 
         return OrchestratorUserActionResult(
@@ -339,7 +367,10 @@ class OrchestratorService:
             status_events=(
                 graph_execution.status_events if graph_execution is not None else ()
             ),
-            final_artifacts=_final_artifacts_for_graph(graph_execution),
+            final_artifacts=_final_artifacts_for_graph(
+                graph_execution,
+                specialist_responses=specialist_responses,
+            ),
         )
 
     def _prepare_approval_result_a2ui(
@@ -357,7 +388,117 @@ class OrchestratorService:
                 )
             )
 
+        if approval_result.status in {"approved", "rejected"}:
+            surface_id = self._final_approval_surface_id(approval_result)
+            if surface_id is None or approval_result.plan_id is None:
+                return ()
+            return tuple(
+                prepare_approval_a2ui_for_renderer(
+                    {
+                        "version": A2UI_VERSION,
+                        "deleteSurface": {"surfaceId": surface_id},
+                    },
+                    plan_id=approval_result.plan_id,
+                    surface_registry=self._surface_registry,
+                )
+            )
+
         return ()
+
+    def _final_approval_surface_id(
+        self,
+        approval_result: ApprovalActionResult,
+    ) -> str | None:
+        if approval_result.approved_plan is not None:
+            return (
+                approval_result.approved_plan.approval_surface_id
+                or f"surface_{approval_result.approved_plan.plan_id}"
+            )
+        if approval_result.plan_id is None:
+            return None
+
+        record = self._approval_store.get(approval_result.plan_id)
+        return (
+            record.draft_plan.approval_surface_id
+            or f"surface_{record.draft_plan.plan_id}"
+        )
+
+    def _prepare_graph_responses_for_delivery(
+        self,
+        graph_execution: GraphExecutionResult | None,
+    ) -> tuple[_PreparedSpecialistResponse, ...]:
+        if graph_execution is None:
+            return ()
+
+        return tuple(
+            self._prepare_specialist_response_for_delivery(
+                response,
+                owner_agent_id=request.agent_id,
+            )
+            for response, request in zip(
+                graph_execution.specialist_responses,
+                graph_execution.specialist_response_requests,
+            )
+        )
+
+    def _prepare_specialist_response_for_delivery(
+        self,
+        response: SpecialistResponse | None,
+        *,
+        owner_agent_id: str | None,
+    ) -> _PreparedSpecialistResponse:
+        if response is None:
+            return _PreparedSpecialistResponse(response=response)
+        if owner_agent_id is None:
+            return _PreparedSpecialistResponse(response=response)
+        if response.a2ui_payload is None:
+            if _has_a2ui_validation_diagnostic(response):
+                return self._prepare_fallback_specialist_response(
+                    response,
+                    owner_agent_id=owner_agent_id,
+                )
+            return _PreparedSpecialistResponse(response=response)
+
+        try:
+            return _PreparedSpecialistResponse(
+                response=response,
+                a2ui_parts=tuple(
+                    prepare_specialist_a2ui_for_renderer(
+                        response.a2ui_payload,
+                        owner_agent_id=owner_agent_id,
+                        surface_registry=self._surface_registry,
+                    )
+                ),
+            )
+        except (RendererContractError, SurfaceOwnershipError):
+            return self._prepare_fallback_specialist_response(
+                response,
+                owner_agent_id=owner_agent_id,
+            )
+
+    def _prepare_fallback_specialist_response(
+        self,
+        response: SpecialistResponse,
+        *,
+        owner_agent_id: str,
+    ) -> _PreparedSpecialistResponse:
+        fallback_payload = _fallback_specialist_a2ui_payload(response)
+        fallback_response = response.model_copy(
+            update={
+                "a2ui_payload": fallback_payload,
+                "surface_id": _fallback_surface_id(response),
+            }
+        )
+        return _PreparedSpecialistResponse(
+            response=fallback_response,
+            a2ui_parts=tuple(
+                prepare_specialist_a2ui_for_renderer(
+                    fallback_payload,
+                    owner_agent_id=owner_agent_id,
+                    surface_registry=self._surface_registry,
+                )
+            ),
+        )
 
     def _prepare_graph_response_a2ui(
         self,
@@ -366,18 +507,13 @@ class OrchestratorService:
         if graph_execution is None:
             return ()
 
-        parts: list[DataPart] = []
-        for response, request in zip(
-            graph_execution.specialist_responses,
-            graph_execution.specialist_response_requests,
-        ):
-            parts.extend(
-                self._prepare_specialist_response_a2ui(
-                    response,
-                    owner_agent_id=request.agent_id,
-                )
+        return tuple(
+            part
+            for prepared in self._prepare_graph_responses_for_delivery(
+                graph_execution
             )
-        return tuple(parts)
+            for part in prepared.a2ui_parts
+        )
 
     def _prepare_specialist_response_a2ui(
         self,
@@ -385,21 +521,10 @@ class OrchestratorService:
         *,
         owner_agent_id: str | None,
     ) -> tuple[DataPart, ...]:
-        if response is None or response.a2ui_payload is None:
-            return ()
-        if owner_agent_id is None:
-            return ()
-
-        try:
-            return tuple(
-                prepare_specialist_a2ui_for_renderer(
-                    response.a2ui_payload,
-                    owner_agent_id=owner_agent_id,
-                    surface_registry=self._surface_registry,
-                )
-            )
-        except (RendererContractError, SurfaceOwnershipError):
-            return ()
+        return self._prepare_specialist_response_for_delivery(
+            response,
+            owner_agent_id=owner_agent_id,
+        ).a2ui_parts
 
     def _sync_context_draft(self, plan_id: str) -> None:
         context = self._contexts_by_plan_id.get(plan_id)
@@ -549,10 +674,32 @@ def _coerce_specialist_response(value: Any) -> SpecialistResponse | None:
         return value
     if isinstance(value, Mapping):
         try:
-            return SpecialistResponse.model_validate(value)
+            return SpecialistResponse.model_validate(
+                _normalize_specialist_response_mapping(value)
+            )
         except ValueError:
             return None
     return None
+
+
+def _normalize_specialist_response_mapping(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(value)
+    aliases = {
+        "responseId": "response_id",
+        "agentId": "agent_id",
+        "structuredOutput": "structured_output",
+        "a2uiPayload": "a2ui_payload",
+        "surfaceId": "surface_id",
+    }
+    for alias, field_name in aliases.items():
+        if alias not in normalized:
+            continue
+        if field_name not in normalized:
+            normalized[field_name] = normalized[alias]
+        del normalized[alias]
+    return normalized
 
 
 def _final_artifacts_for_response(
@@ -565,20 +712,67 @@ def _final_artifacts_for_response(
 
 def _final_artifacts_for_graph(
     graph_execution: GraphExecutionResult | None,
+    *,
+    specialist_responses: tuple[SpecialistResponse, ...] | None = None,
 ) -> dict[str, Any]:
     if graph_execution is None:
         return {}
 
+    responses = (
+        specialist_responses
+        if specialist_responses is not None
+        else graph_execution.specialist_responses
+    )
     final_response = (
-        graph_execution.specialist_responses[-1]
-        if graph_execution.specialist_responses
+        responses[-1]
+        if responses
         else None
     )
     return {
         "final_response": final_response,
-        "specialist_responses": graph_execution.specialist_responses,
+        "specialist_responses": responses,
         "status_events": graph_execution.status_events,
     }
+
+
+def _has_a2ui_validation_diagnostic(response: SpecialistResponse) -> bool:
+    diagnostic = response.structured_output.get("a2ui_validation")
+    return isinstance(diagnostic, Mapping)
+
+
+def _fallback_specialist_a2ui_payload(
+    response: SpecialistResponse,
+) -> list[dict[str, Any]]:
+    surface_id = _fallback_surface_id(response)
+    return [
+        {
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": surface_id,
+                "catalogId": BASIC_CATALOG_ID,
+            },
+        },
+        {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "Text",
+                        "text": (
+                            "A2UI rendering unavailable. The specialist "
+                            "response is available as text."
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+
+
+def _fallback_surface_id(response: SpecialistResponse) -> str:
+    return f"surface_fallback_{_contract_id_token(response.response_id)}"
 
 
 __all__ = [

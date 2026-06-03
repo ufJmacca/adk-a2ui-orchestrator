@@ -79,6 +79,86 @@ class RecordingUserActionAdapter:
         )
 
 
+class CamelCaseA2uiUserActionAdapter:
+    async def handle_user_action(self, _user_action: Any) -> dict[str, Any]:
+        surface_id = "surface_product_opportunity_detail"
+        return {
+            "response_id": "response_product_opportunity_user_action_detail",
+            "agent_id": "product_opportunity",
+            "content": "Product Opportunity Agent: detail surface ready.",
+            "structured_output": {"status": "handled"},
+            "a2uiPayload": [
+                {
+                    "version": A2UI_VERSION,
+                    "createSurface": {
+                        "surfaceId": surface_id,
+                        "catalogId": BASIC_CATALOG_ID,
+                    },
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": surface_id,
+                        "components": [
+                            {
+                                "component": "Text",
+                                "id": "root",
+                                "text": "More product detail.",
+                            }
+                        ],
+                    },
+                },
+            ],
+            "surfaceId": surface_id,
+        }
+
+
+class MixedValidityA2uiUserActionAdapter:
+    async def handle_user_action(self, user_action: Any) -> SpecialistResponse:
+        original_surface_id = user_action["userAction"]["surfaceId"]
+        detail_surface_id = "surface_product_opportunity_mixed_detail"
+        return SpecialistResponse(
+            response_id="response_product_opportunity_mixed_invalid_a2ui",
+            agent_id="product_opportunity",
+            content="Product Opportunity Agent: mixed follow-up details.",
+            structured_output={"status": "handled"},
+            a2ui_payload=[
+                {
+                    "version": A2UI_VERSION,
+                    "deleteSurface": {"surfaceId": original_surface_id},
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "createSurface": {
+                        "surfaceId": detail_surface_id,
+                        "catalogId": BASIC_CATALOG_ID,
+                    },
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": detail_surface_id,
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": "Text",
+                                "text": "Follow-up details.",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": "surface_invalid_specialist_delta",
+                        "components": [],
+                    },
+                },
+            ],
+            surface_id=detail_surface_id,
+        )
+
+
 class CustomInsightsSpecialist:
     agent_id = "custom.insights"
 
@@ -94,6 +174,88 @@ class CustomInsightsSpecialist:
             agent_id=request.agent_id,
             content="Custom Insights Agent: completed.",
             structured_output={"request_id": request.request_id},
+        )
+
+
+class InvalidA2uiSpecialist:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    @property
+    def agent_id(self) -> str:
+        return self._delegate.agent_id
+
+    @property
+    def call_count(self) -> int:
+        return self._delegate.call_count
+
+    @property
+    def calls(self) -> list[SpecialistRequest]:
+        return self._delegate.calls
+
+    async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
+        response = await self._delegate.handle(request)
+        return response.model_copy(
+            update={
+                "a2ui_payload": [
+                    {
+                        "version": A2UI_VERSION,
+                        "updateComponents": {
+                            "surfaceId": "surface_invalid_specialist_delta",
+                            "components": [],
+                        },
+                    }
+                ],
+                "surface_id": "surface_invalid_specialist_delta",
+            }
+        )
+
+
+class OwnershipFailingA2uiSpecialist:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    @property
+    def agent_id(self) -> str:
+        return self._delegate.agent_id
+
+    @property
+    def call_count(self) -> int:
+        return self._delegate.call_count
+
+    @property
+    def calls(self) -> list[SpecialistRequest]:
+        return self._delegate.calls
+
+    async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
+        response = await self._delegate.handle(request)
+        surface_id = "surface_plan_specialist_claim"
+        return response.model_copy(
+            update={
+                "a2ui_payload": [
+                    {
+                        "version": A2UI_VERSION,
+                        "createSurface": {
+                            "surfaceId": surface_id,
+                            "catalogId": BASIC_CATALOG_ID,
+                        },
+                    },
+                    {
+                        "version": A2UI_VERSION,
+                        "updateComponents": {
+                            "surfaceId": surface_id,
+                            "components": [
+                                {
+                                    "component": "Text",
+                                    "id": "root",
+                                    "text": "Specialist-owned plan prefix claim.",
+                                }
+                            ],
+                        },
+                    },
+                ],
+                "surface_id": surface_id,
+            }
         )
 
 
@@ -919,7 +1081,19 @@ async def test_approval_returns_graph_result_when_specialist_a2ui_is_invalid() -
         "internal_knowledge",
         "synthesis",
     ]
-    assert result.a2ui_parts == ()
+    fallback_response = result.specialist_responses[0]
+    assert fallback_response.a2ui_payload is not None
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert any(
+        part.data.get("deleteSurface", {}).get("surfaceId") == surface_id
+        for part in result.a2ui_parts
+    )
+    assert any(
+        part.data.get("updateComponents", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in result.a2ui_parts
+    )
     assert result.final_artifacts["final_response"].agent_id == "synthesis"
     record = service.approval_record(plan_id)
     assert record.status == "approved"
@@ -961,7 +1135,10 @@ async def test_graph_a2ui_surface_owner_uses_invoked_step_agent_not_response_age
     assert result.status == "approved"
     assert result.graph_execution is not None
     assert result.specialist_responses[0].agent_id == "product_opportunity"
-    assert len(result.a2ui_parts) == 2
+    specialist_parts = [
+        part for part in result.a2ui_parts if "deleteSurface" not in part.data
+    ]
+    assert len(specialist_parts) == 2
     owner = service.surface_owner(spoofing_specialist.surface_id)
     assert owner is not None
     assert owner.owner_type == "specialist"
@@ -1537,3 +1714,175 @@ async def test_default_specialist_user_action_adapter_slugs_custom_agent_respons
     assert response.agent_id == "custom.insights"
     assert response.response_id == "response_custom_insights_user_action"
     assert "." not in response.response_id
+
+
+@pytest.mark.asyncio
+async def test_invalid_graph_specialist_a2ui_returns_valid_fallback_after_approval() -> (
+    None
+):
+    specialists = build_default_specialists()
+    specialists["relationship_summary"] = InvalidA2uiSpecialist(
+        specialists["relationship_summary"]
+    )
+    service = OrchestratorService(specialists=specialists)
+    proposed = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    assert proposed.approval_plan is not None
+    plan = proposed.approval_plan
+
+    approved = await service.handle_user_action(
+        _approve_event(
+            plan.plan_id,
+            plan.approval_surface_id or "",
+            [step.step_id for step in plan.steps],
+        )
+    )
+
+    assert approved.status == "approved"
+    assert service.approval_record(plan.plan_id).status == "approved"
+    fallback_response = next(
+        response
+        for response in approved.specialist_responses
+        if response.agent_id == "relationship_summary"
+    )
+    assert fallback_response.a2ui_payload is not None
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert all(
+        part.data.get("updateComponents", {}).get("surfaceId")
+        != "surface_invalid_specialist_delta"
+        for part in approved.a2ui_parts
+    )
+    assert any(
+        part.data.get("updateComponents", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in approved.a2ui_parts
+    )
+
+
+@pytest.mark.asyncio
+async def test_specialist_a2ui_ownership_failure_returns_fallback_after_approval() -> (
+    None
+):
+    specialists = build_default_specialists()
+    specialists["relationship_summary"] = OwnershipFailingA2uiSpecialist(
+        specialists["relationship_summary"]
+    )
+    service = OrchestratorService(specialists=specialists)
+    proposed = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    assert proposed.approval_plan is not None
+    plan = proposed.approval_plan
+
+    approved = await service.handle_user_action(
+        _approve_event(
+            plan.plan_id,
+            plan.approval_surface_id or "",
+            [step.step_id for step in plan.steps],
+        )
+    )
+
+    assert approved.status == "approved"
+    assert service.approval_record(plan.plan_id).status == "approved"
+    fallback_response = next(
+        response
+        for response in approved.specialist_responses
+        if response.agent_id == "relationship_summary"
+    )
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert all(
+        part.data.get("createSurface", {}).get("surfaceId")
+        != "surface_plan_specialist_claim"
+        for part in approved.a2ui_parts
+    )
+    assert any(
+        part.data.get("createSurface", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in approved.a2ui_parts
+    )
+
+
+@pytest.mark.asyncio
+async def test_specialist_user_action_response_normalizes_camel_case_a2ui() -> None:
+    service = OrchestratorService(
+        specialist_user_action_adapters={
+            "product_opportunity": CamelCaseA2uiUserActionAdapter()
+        }
+    )
+    result = await service.handle_user_request(
+        "What product opportunities should I consider for a cafe business?"
+    )
+    surface_id = result.specialist_responses[0].surface_id
+    assert surface_id is not None
+
+    routed = await service.handle_user_action(
+        {
+            "userAction": {
+                "type": "specialist_action",
+                "surfaceId": surface_id,
+                "payload": {"action": "show_more_detail"},
+            }
+        }
+    )
+
+    assert routed.status == "forwarded"
+    assert [response.agent_id for response in routed.specialist_responses] == [
+        "product_opportunity"
+    ]
+    assert len(routed.a2ui_parts) == 2
+    assert routed.final_artifacts["final_response"].surface_id == (
+        "surface_product_opportunity_detail"
+    )
+    assert service.surface_owner("surface_product_opportunity_detail") is not None
+
+
+@pytest.mark.asyncio
+async def test_specialist_user_action_invalid_a2ui_fallback_does_not_keep_stale_owner() -> (
+    None
+):
+    service = OrchestratorService(
+        specialist_user_action_adapters={
+            "product_opportunity": MixedValidityA2uiUserActionAdapter()
+        }
+    )
+    result = await service.handle_user_request(
+        "What product opportunities should I consider for a cafe business?"
+    )
+    surface_id = result.specialist_responses[0].surface_id
+    assert surface_id is not None
+    original_owner = service.surface_owner(surface_id)
+    assert original_owner is not None
+
+    routed = await service.handle_user_action(
+        {
+            "userAction": {
+                "type": "specialist_action",
+                "surfaceId": surface_id,
+                "payload": {"action": "show_more_detail"},
+            }
+        }
+    )
+
+    assert routed.status == "forwarded"
+    fallback_response = routed.final_artifacts["final_response"]
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert service.surface_owner(surface_id) == original_owner
+    assert service.surface_owner("surface_product_opportunity_mixed_detail") is None
+    assert service.surface_owner("surface_invalid_specialist_delta") is None
+    fallback_owner = service.surface_owner(fallback_response.surface_id)
+    assert fallback_owner is not None
+    assert fallback_owner.owner_id == "product_opportunity"
+    assert all(
+        part.data.get("createSurface", {}).get("surfaceId")
+        != "surface_product_opportunity_mixed_detail"
+        for part in routed.a2ui_parts
+    )
+    assert any(
+        part.data.get("createSurface", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in routed.a2ui_parts
+    )

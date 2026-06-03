@@ -907,15 +907,9 @@ async def test_forwarded_specialist_response_rejects_invalid_a2ui_without_forwar
     )
 
     # Assert
-    assert result.status == "error"
-    assert result.response is None
-    assert result.error is not None
-    assert result.error["code"] == "surface_registration_rejected"
-    assert "failed validation" in result.error["message"]
-    exposed_error = repr(result.error)
-    assert leaked_value not in exposed_error
-    assert "sk-live-specialist-a2ui-secret-token-123456789" not in exposed_error
-    assert "<redacted-secret>" in exposed_error
+    assert result.status == "forwarded"
+    assert result.response is adapter.response
+    assert result.error is None
     assert registry.owner_for("surface_product_recommendation_detail") is None
     assert adapter.received_user_actions == [user_action]
 

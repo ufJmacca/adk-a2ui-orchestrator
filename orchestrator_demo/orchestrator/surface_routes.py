@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from inspect import isawaitable
 from typing import Any, Literal
 
@@ -20,7 +20,12 @@ from orchestrator_demo.a2ui_support.schema_manager import (
     UPDATE_COMPONENTS_MESSAGE,
     UPDATE_DATA_MODEL_MESSAGE,
 )
-from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+from orchestrator_demo.a2ui_support.validation import (
+    SurfaceComponentGraphs,
+    apply_validated_a2ui_component_graph,
+    clone_surface_component_graphs,
+    validate_outbound_a2ui,
+)
 
 
 SurfaceOwnerType = Literal["orchestrator", "specialist"]
@@ -51,7 +56,15 @@ class SurfaceRouteResult:
     owner: SurfaceOwner | None = None
     response: Any | None = None
     error: dict[str, Any] | None = None
-    original_payload: Any | None = field(default=None, repr=False)
+    original_payload: Any | None = None
+
+
+@dataclass(frozen=True)
+class SurfaceRegistrySnapshot:
+    """Snapshot of renderer surface ownership and component validation state."""
+
+    owners_by_surface_id: dict[str, SurfaceOwner]
+    components_by_surface_id: SurfaceComponentGraphs
 
 
 class SurfaceRouteRegistry:
@@ -59,6 +72,7 @@ class SurfaceRouteRegistry:
 
     def __init__(self) -> None:
         self._owners_by_surface_id: dict[str, SurfaceOwner] = {}
+        self._components_by_surface_id: SurfaceComponentGraphs = {}
 
     def register_approval_surface(
         self,
@@ -124,12 +138,43 @@ class SurfaceRouteRegistry:
     ) -> SurfaceOwner | None:
         """Remove ownership for a deleted surface when the expected owner matches."""
 
-        return self._clear_surface_from(
+        removed = self._clear_surface_from(
             self._owners_by_surface_id,
             surface_id,
             owner_type=owner_type,
             owner_id=owner_id,
         )
+        if removed is not None:
+            self._components_by_surface_id.pop(surface_id, None)
+        return removed
+
+    def clear_all(self) -> SurfaceRegistrySnapshot:
+        """Remove all registered renderer surface ownership and return a snapshot."""
+
+        snapshot = SurfaceRegistrySnapshot(
+            owners_by_surface_id=dict(self._owners_by_surface_id),
+            components_by_surface_id=clone_surface_component_graphs(
+                self._components_by_surface_id
+            ),
+        )
+        self._owners_by_surface_id.clear()
+        self._components_by_surface_id.clear()
+        return snapshot
+
+    def restore_all(
+        self,
+        snapshot: Mapping[str, SurfaceOwner] | SurfaceRegistrySnapshot,
+    ) -> None:
+        """Restore a previously captured renderer surface ownership snapshot."""
+
+        if isinstance(snapshot, SurfaceRegistrySnapshot):
+            self._owners_by_surface_id = dict(snapshot.owners_by_surface_id)
+            self._components_by_surface_id = clone_surface_component_graphs(
+                snapshot.components_by_surface_id
+            )
+            return
+
+        self._owners_by_surface_id = dict(snapshot)
 
     def _clear_surface_from(
         self,
@@ -321,18 +366,25 @@ class SurfaceRouteRegistry:
         if payload is None:
             return
 
-        staged_owners = dict(self._owners_by_surface_id)
+        validated_payloads: list[Mapping[str, Any]] = []
+        staged_components = clone_surface_component_graphs(
+            self._components_by_surface_id
+        )
         for candidate in _iter_a2ui_messages(payload):
-            result = validate_outbound_a2ui(candidate)
+            result = validate_outbound_a2ui(
+                candidate,
+                existing_components_by_surface_id=staged_components,
+            )
             if not result.valid:
-                raise SurfaceOwnershipError(
-                    "specialist response A2UI failed validation and was not "
-                    "forwarded: "
-                    f"{_validation_error_message(result.validation_errors)}"
-                )
+                return
             data = getattr(result.renderer_part, "data", None)
             if not isinstance(data, Mapping):
-                continue
+                return
+            validated_payloads.append(data)
+            apply_validated_a2ui_component_graph(staged_components, data)
+
+        staged_owners = dict(self._owners_by_surface_id)
+        for data in validated_payloads:
             for surface_id in _deleted_surface_ids_from_validated_a2ui(data):
                 self._clear_specialist_owned_surface(
                     staged_owners, surface_id, owner=owner
@@ -347,6 +399,7 @@ class SurfaceRouteRegistry:
                 )
 
         self._owners_by_surface_id = staged_owners
+        self._components_by_surface_id = staged_components
 
     def _clear_specialist_owned_surface(
         self,
@@ -418,12 +471,6 @@ def _owner_handler_failure_message(exc: Exception) -> str:
     )
 
 
-def _validation_error_message(validation_errors: list[str]) -> str:
-    if validation_errors:
-        return "; ".join(validation_errors)
-    return "unknown validation error"
-
-
 def _response_a2ui_payload(response: Any) -> Any | None:
     if isinstance(response, Mapping):
         return response.get("a2ui_payload") or response.get("a2uiPayload")
@@ -469,4 +516,5 @@ __all__ = [
     "SurfaceOwnershipError",
     "SurfaceRouteRegistry",
     "SurfaceRouteResult",
+    "SurfaceRegistrySnapshot",
 ]

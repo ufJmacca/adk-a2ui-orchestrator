@@ -8,9 +8,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from orchestrator_demo.a2a_support.transport import DataPart
-from orchestrator_demo.a2ui_support.validation import (
-    _redact_secret_like_values,
-    _safe_path_component,
+from orchestrator_demo.a2ui_support.secret_safety import (
+    redact_secret_like_values,
+    safe_path_component,
 )
 from orchestrator_demo.contracts import (
     PLAN_APPROVAL_SURFACE_PREFIX,
@@ -301,9 +301,9 @@ def _validation_error_summary(exc: ValidationError) -> str:
 
     first_error = errors[0]
     location = ".".join(
-        _safe_path_component(str(part)) for part in first_error.get("loc", ())
+        safe_path_component(str(part)) for part in first_error.get("loc", ())
     )
-    message = _redact_secret_like_values(first_error.get("msg", str(exc)))
+    message = redact_secret_like_values(first_error.get("msg", str(exc)))
     if location:
         return f"{location}: {message}"
     return str(message)
