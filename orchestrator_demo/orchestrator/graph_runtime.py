@@ -14,6 +14,7 @@ from types import ModuleType
 from typing import Any, Protocol
 
 from orchestrator_demo.a2ui_support.validation import _redact_secret_like_values
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import (
     ExecutionPlan,
     GraphEdge,
@@ -191,6 +192,25 @@ class AdkGraphRuntime:
         """Create an ADK workflow for the approved plan and execute every step."""
 
         graph = build_graph_spec(plan)
+        log_audit_event(
+            "graph_execution_started",
+            {
+                "graph_id": graph.graph_id,
+                "plan_id": graph.plan_id,
+                "pattern": graph.pattern,
+                "step_count": len(graph.steps),
+            },
+        )
+        log_audit_event(
+            "graph_created",
+            {
+                "graph_id": graph.graph_id,
+                "plan_id": graph.plan_id,
+                "pattern": graph.pattern,
+                "step_count": len(graph.steps),
+                "edge_count": len(graph.edges),
+            },
+        )
         events: list[StatusEvent] = [
             _status_event(
                 graph,
@@ -232,6 +252,17 @@ class AdkGraphRuntime:
             outputs = _run_coroutine_blocking(_collect_adk_outputs(workflow, plan))
         except Exception as exc:
             if isinstance(exc, GraphRuntimeError):
+                log_audit_event(
+                    "graph_execution_failed",
+                    {
+                        "graph_id": graph.graph_id,
+                        "plan_id": graph.plan_id,
+                        "error_type": type(exc).__name__,
+                        "status_event_count": len(events),
+                        "request_count": len(requests),
+                        "response_count": len(responses),
+                    },
+                )
                 raise GraphRuntimeError(
                     _execution_failure_message(exc, events),
                     graph=exc.graph or graph,
@@ -243,6 +274,17 @@ class AdkGraphRuntime:
                     ),
                     adk_event_outputs=exc.adk_event_outputs,
                 ) from exc
+            log_audit_event(
+                "graph_execution_failed",
+                {
+                    "graph_id": graph.graph_id,
+                    "plan_id": graph.plan_id,
+                    "error_type": type(exc).__name__,
+                    "status_event_count": len(events),
+                    "request_count": len(requests),
+                    "response_count": len(responses),
+                },
+            )
             raise GraphRuntimeError(
                 f"ADK graph execution failed: {type(exc).__name__}",
                 graph=graph,
@@ -260,6 +302,16 @@ class AdkGraphRuntime:
                 f"Approved plan {plan.plan_id} execution completed.",
                 details={"responseCount": len(responses)},
             )
+        )
+        log_audit_event(
+            "graph_execution_completed",
+            {
+                "graph_id": graph.graph_id,
+                "plan_id": graph.plan_id,
+                "status_event_count": len(events),
+                "request_count": len(requests),
+                "response_count": len(responses),
+            },
         )
         return GraphExecutionResult(
             graph=graph,

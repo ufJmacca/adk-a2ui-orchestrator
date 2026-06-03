@@ -16,6 +16,7 @@ from orchestrator_demo.a2ui_support.renderer_contract import (
 )
 from orchestrator_demo.a2ui_support.schema_manager import A2UI_VERSION, BASIC_CATALOG_ID
 from orchestrator_demo.agents import SpecialistAgent, build_default_specialists
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import (
     ExecutionPlan,
     RoutingDecision,
@@ -231,6 +232,16 @@ class OrchestratorService:
                 ),
             )
             context.decision = decision
+            log_audit_event(
+                "route_decision",
+                {
+                    "path": decision.path,
+                    "selected_agent": decision.selected_agent,
+                    "confidence": decision.confidence,
+                    "reason": decision.reason,
+                    "missing_handler_agent_id": selected_agent,
+                },
+            )
             return OrchestratorRequestResult(
                 path=decision.path,
                 decision=decision,
@@ -284,6 +295,16 @@ class OrchestratorService:
                 reason=f"A safe approval plan cannot be formed: {exc}",
             )
             context.decision = decision
+            log_audit_event(
+                "route_decision",
+                {
+                    "path": decision.path,
+                    "selected_agent": decision.selected_agent,
+                    "confidence": decision.confidence,
+                    "reason": decision.reason,
+                    "planner_error": str(exc),
+                },
+            )
             return OrchestratorRequestResult(
                 path=decision.path,
                 decision=decision,
@@ -305,6 +326,16 @@ class OrchestratorService:
                 ),
             )
             context.decision = decision
+            log_audit_event(
+                "route_decision",
+                {
+                    "path": decision.path,
+                    "selected_agent": decision.selected_agent,
+                    "confidence": decision.confidence,
+                    "reason": decision.reason,
+                    "missing_handler_agent_ids": list(missing_agent_ids),
+                },
+            )
             return OrchestratorRequestResult(
                 path=decision.path,
                 decision=decision,
@@ -313,6 +344,18 @@ class OrchestratorService:
 
         self._approval_store.add_draft(plan)
         self._contexts_by_plan_id[plan.plan_id] = context
+        log_audit_event(
+            "plan_proposed",
+            {
+                "plan_id": plan.plan_id,
+                "approval_surface_id": plan.approval_surface_id,
+                "detected_intents": list(plan.detected_intents),
+                "selected_agent_ids": list(plan.selected_agents),
+                "step_ids": [step.step_id for step in plan.steps],
+                "step_count": len(plan.steps),
+                "approval_required": True,
+            },
+        )
         a2ui_parts = prepare_approval_a2ui_for_renderer(
             build_approval_canvas(
                 plan,

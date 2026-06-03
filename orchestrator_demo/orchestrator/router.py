@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from orchestrator_demo.app.logging import log_audit_event
 from orchestrator_demo.contracts import (
     AgentDescriptor,
     IntentName,
@@ -15,7 +16,9 @@ from orchestrator_demo.intent.classifier import (
     IntentClassifier,
 )
 from orchestrator_demo.intent.merge import (
+    LLM_CONFIDENCE_WEIGHT,
     SIMPLE_DIRECT_ROUTE_THRESHOLD,
+    SLM_CONFIDENCE_WEIGHT,
     merge_intent_confidence,
 )
 from orchestrator_demo.intent.slm_mock_client import SlmIntentClient
@@ -46,6 +49,13 @@ class RequestRouter:
 
     async def route_request(self, user_input: str) -> RequestContext:
         slm_suggestion = await self._slm_client.classify(user_input)
+        log_audit_event(
+            "slm_suggestion",
+            {
+                "intent": slm_suggestion.intent,
+                "confidence": slm_suggestion.confidence,
+            },
+        )
         available_agents = self._registry.descriptors()
         try:
             llm_assessment = await self._intent_classifier.assess(
@@ -55,8 +65,38 @@ class RequestRouter:
             )
         except ClassifierUnavailableAgentsError as exc:
             llm_assessment = exc.assessment
+        log_audit_event(
+            "llm_assessment",
+            {
+                "intents": list(llm_assessment.intents),
+                "confidence": llm_assessment.confidence,
+                "complexity": llm_assessment.complexity,
+                "required_agent_ids": list(llm_assessment.required_agents),
+                "rationale": llm_assessment.rationale,
+            },
+        )
         confidence = merge_intent_confidence(slm_suggestion, llm_assessment)
+        log_audit_event(
+            "merge_decision",
+            {
+                "slm_confidence": slm_suggestion.confidence,
+                "llm_confidence": llm_assessment.confidence,
+                "slm_weight": SLM_CONFIDENCE_WEIGHT,
+                "llm_weight": LLM_CONFIDENCE_WEIGHT,
+                "final_confidence": confidence,
+                "direct_route_threshold": self._direct_route_threshold,
+            },
+        )
         decision = self._decide(llm_assessment, available_agents, confidence)
+        log_audit_event(
+            "route_decision",
+            {
+                "path": decision.path,
+                "selected_agent": decision.selected_agent,
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+            },
+        )
 
         return RequestContext(
             user_input=user_input,

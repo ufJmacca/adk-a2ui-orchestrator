@@ -428,7 +428,7 @@ def _collect_secret_safety_errors(
         try:
             value_text = bytes(value).decode("utf-8")
         except UnicodeDecodeError:
-            return
+            value_text = bytes(value).decode("utf-8", errors="ignore")
         if is_secret_like_value(value_text):
             errors.append(
                 f"{subject} contains secret-like value at {path}: {REDACTED_SECRET}"

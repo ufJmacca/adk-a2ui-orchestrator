@@ -35,7 +35,12 @@ class DraftExecutionPlanner:
     def __init__(self, *, registry: DescriptorRegistry) -> None:
         self._registry = registry
 
-    def create_plan(self, context: RequestContext) -> ExecutionPlan:
+    def create_plan(
+        self,
+        context: RequestContext,
+        *,
+        record_draft: bool = True,
+    ) -> ExecutionPlan:
         """Create a draft plan using only agents available in the registry."""
 
         if context.decision.path != "plan_required":
@@ -105,7 +110,8 @@ class DraftExecutionPlanner:
             risk_notes=risk_notes,
             approval_surface_id=f"surface_{plan_id}",
         )
-        context.record_draft_plan(plan)
+        if record_draft:
+            context.record_draft_plan(plan)
         return plan
 
 

@@ -666,9 +666,11 @@ def test_invalid_reload_keeps_previous_registry_and_redacts_secret_like_values(
         for descriptor in registry.descriptors()
     } == previous_descriptors
     assert "secret-like" in str(exc_info.value)
-    assert "api_key" in str(exc_info.value)
+    assert "api_key" not in str(exc_info.value)
+    assert "<redacted>" in str(exc_info.value)
     assert "agent registry reload rejected" in caplog.text
     assert "secret-like" in caplog.text
+    assert "api_key" not in caplog.text
     assert leaked_value not in str(exc_info.value)
     assert leaked_value not in caplog.text
 
@@ -1222,7 +1224,8 @@ def test_registry_rejects_camel_case_secret_fields_in_schema_metadata(
             _registry_from(config_path)
 
     assert "secret-like" in str(exc_info.value)
-    assert secret_field in str(exc_info.value)
+    assert secret_field not in str(exc_info.value)
+    assert "<redacted>" in str(exc_info.value)
     assert leaked_value not in str(exc_info.value)
     assert leaked_value not in caplog.text
 
@@ -1987,7 +1990,10 @@ def test_invalid_reload_rejects_authorization_schema_fields(
         for descriptor in registry.descriptors()
     } == previous_descriptors
     assert "secret-like field" in str(exc_info.value)
-    assert f"{schema_field}.{expected_path}" in str(exc_info.value)
+    if expected_path == "properties.authorization":
+        assert f"{schema_field}.properties.<redacted>" in str(exc_info.value)
+    else:
+        assert f"{schema_field}.{expected_path}" in str(exc_info.value)
     assert "agent registry reload rejected" in caplog.text
 
 
