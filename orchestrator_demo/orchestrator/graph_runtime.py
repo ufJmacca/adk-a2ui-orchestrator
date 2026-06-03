@@ -230,16 +230,16 @@ class AdkGraphRuntime:
         responses: list[SpecialistResponse] = []
         response_requests: list[SpecialistRequest] = []
         step_outputs: dict[str, dict[str, Any]] = {}
-        _raise_for_missing_specialist_handlers(
-            plan=plan,
-            graph=graph,
-            specialist_handlers=self._specialist_handlers,
-            events=events,
-            requests=requests,
-            responses=responses,
-        )
 
         try:
+            _raise_for_missing_specialist_handlers(
+                plan=plan,
+                graph=graph,
+                specialist_handlers=self._specialist_handlers,
+                events=events,
+                requests=requests,
+                responses=responses,
+            )
             workflow = self._build_workflow(
                 plan=plan,
                 graph=graph,
@@ -1647,16 +1647,6 @@ def _graph_step_ids_by_plan_step_id(steps: Sequence[PlanStep]) -> dict[str, str]
         used_graph_step_ids.add(graph_step_id)
 
     return graph_step_ids
-
-
-def _identifier_suffix(value: str) -> str:
-    identifier = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
-    identifier = identifier.strip("_")
-    if not identifier:
-        return "unknown"
-    if identifier[0].isdigit():
-        return f"id_{identifier}"
-    return identifier
 
 
 def _has_mixed_sequential_parallel(steps: Sequence[PlanStep]) -> bool:

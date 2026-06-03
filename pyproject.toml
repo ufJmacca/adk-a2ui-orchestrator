@@ -30,6 +30,13 @@ dev = [
 line-length = 88
 target-version = "py311"
 
+[tool.mypy]
+python_version = "3.11"
+files = ["orchestrator_demo"]
+ignore_missing_imports = true
+show_error_codes = true
+warn_unused_ignores = true
+
 [tool.setuptools.packages.find]
 include = ["orchestrator_demo*"]
 exclude = ["prds*", "tests*"]

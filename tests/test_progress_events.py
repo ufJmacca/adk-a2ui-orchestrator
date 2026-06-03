@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from orchestrator_demo.contracts import ExecutionPlan, PlanStep, SpecialistResponse
@@ -7,6 +9,9 @@ from orchestrator_demo.orchestrator.graph_runtime import (
     AdkGraphRuntime,
     GraphRuntimeError,
 )
+
+
+AUDIT_LOGGER_NAME = "orchestrator_demo.audit"
 
 
 def _response_for(request) -> SpecialistResponse:
@@ -163,7 +168,9 @@ def test_progress_events_include_required_statuses_in_harness_visible_order() ->
     assert result.status_events[-1].details == {"responseCount": 4}
 
 
-def test_unavailable_approved_plan_agent_fails_with_developer_status_event() -> None:
+def test_unavailable_approved_plan_agent_fails_with_developer_status_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # Arrange
     plan = _missing_agent_plan()
     called_requests = []
@@ -177,8 +184,9 @@ def test_unavailable_approved_plan_agent_fails_with_developer_status_event() -> 
     )
 
     # Act / Assert
-    with pytest.raises(GraphRuntimeError, match="unavailable_agent") as exc_info:
-        runtime.execute(plan)
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        with pytest.raises(GraphRuntimeError, match="unavailable_agent") as exc_info:
+            runtime.execute(plan)
 
     failure = exc_info.value
     assert called_requests == []
@@ -200,6 +208,20 @@ def test_unavailable_approved_plan_agent_fails_with_developer_status_event() -> 
             "Register agent unavailable_agent before executing approved plan "
             "plan_progress_missing_agent."
         ),
+    }
+    failed_audit_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "audit_event", None) == "graph_execution_failed"
+    ]
+    assert len(failed_audit_records) == 1
+    assert getattr(failed_audit_records[0], "event_payload") == {
+        "graph_id": "graph_progress_missing_agent",
+        "plan_id": "plan_progress_missing_agent",
+        "error_type": "GraphRuntimeError",
+        "status_event_count": 3,
+        "request_count": 0,
+        "response_count": 0,
     }
 
 

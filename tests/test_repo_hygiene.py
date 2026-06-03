@@ -34,6 +34,13 @@ DEV_DEPENDENCIES = {
     "mypy",
 }
 
+REQUIRED_UV_GATE_COMMANDS = (
+    "uv sync --locked",
+    "uv run pytest",
+    "uv run ruff check .",
+    "uv run mypy orchestrator_demo",
+)
+
 PROHIBITED_DEPENDENCY_MANAGER_FILES = {
     "requirements.txt",
     "poetry.lock",
@@ -97,6 +104,39 @@ def test_pyproject_limits_package_discovery_to_application_package() -> None:
     # Assert
     assert package_discovery["include"] == ["orchestrator_demo*"]
     assert "prds*" in package_discovery["exclude"]
+
+
+def test_pyproject_configures_pytest_ruff_and_mypy_quality_gates() -> None:
+    # Arrange
+    pyproject_path = ROOT / "pyproject.toml"
+
+    # Act
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+
+    # Assert
+    assert pyproject["tool"]["pytest"]["ini_options"]["testpaths"] == ["tests"]
+    assert pyproject["tool"]["ruff"]["target-version"] == "py311"
+    assert pyproject["tool"]["mypy"] == {
+        "python_version": "3.11",
+        "files": ["orchestrator_demo"],
+        "ignore_missing_imports": True,
+        "show_error_codes": True,
+        "warn_unused_ignores": True,
+    }
+
+
+def test_readme_documents_required_uv_quality_gate_commands() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    missing_commands = [
+        command for command in REQUIRED_UV_GATE_COMMANDS if command not in readme
+    ]
+
+    # Assert
+    assert missing_commands == []
 
 
 def test_uv_lock_contains_declared_project_dependencies() -> None:
