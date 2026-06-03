@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Any, Literal
 
@@ -51,7 +51,7 @@ class SurfaceRouteResult:
     owner: SurfaceOwner | None = None
     response: Any | None = None
     error: dict[str, Any] | None = None
-    original_payload: Any | None = None
+    original_payload: Any | None = field(default=None, repr=False)
 
 
 class SurfaceRouteRegistry:
@@ -169,7 +169,6 @@ class SurfaceRouteRegistry:
                     surface_id=None,
                     message=str(exc),
                 ),
-                original_payload=candidate,
             )
 
         owner = self.owner_for(action.surface_id)
@@ -182,7 +181,6 @@ class SurfaceRouteRegistry:
                     surface_id=None,
                     message="No owner is registered for the requested A2UI surface.",
                 ),
-                original_payload=candidate,
             )
 
         if owner.owner_type == "orchestrator":
@@ -327,16 +325,17 @@ class SurfaceRouteRegistry:
         for candidate in _iter_a2ui_messages(payload):
             result = validate_outbound_a2ui(candidate)
             if not result.valid:
-                continue
+                raise SurfaceOwnershipError(
+                    "specialist response A2UI failed validation and was not "
+                    "forwarded: "
+                    f"{_validation_error_message(result.validation_errors)}"
+                )
             data = getattr(result.renderer_part, "data", None)
             if not isinstance(data, Mapping):
                 continue
             for surface_id in _deleted_surface_ids_from_validated_a2ui(data):
-                self._clear_surface_from(
-                    staged_owners,
-                    surface_id,
-                    owner_type="specialist",
-                    owner_id=owner.owner_id,
+                self._clear_specialist_owned_surface(
+                    staged_owners, surface_id, owner=owner
                 )
             for surface_id in _surface_ids_from_validated_a2ui(data):
                 self._register_owner(
@@ -348,6 +347,48 @@ class SurfaceRouteRegistry:
                 )
 
         self._owners_by_surface_id = staged_owners
+
+    def _clear_specialist_owned_surface(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        owner: SurfaceOwner,
+    ) -> SurfaceOwner | None:
+        return self._clear_specialist_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            agent_id=owner.owner_id,
+        )
+
+    def _clear_specialist_surface_from(
+        self,
+        owners_by_surface_id: dict[str, SurfaceOwner],
+        surface_id: str,
+        *,
+        agent_id: str,
+    ) -> SurfaceOwner | None:
+        surface_id = _validated_surface_id(surface_id)
+        existing = owners_by_surface_id.get(surface_id)
+        if existing is not None and (
+            existing.owner_type != "specialist" or existing.owner_id != agent_id
+        ):
+            raise SurfaceOwnershipError(
+                f"specialist {agent_id} cannot delete surface {surface_id} "
+                f"owned by {existing.owner_type}:{existing.owner_id}"
+            )
+        if existing is None and surface_id.startswith(PLAN_APPROVAL_SURFACE_PREFIX):
+            raise SurfaceOwnershipError(
+                f"specialist {agent_id} cannot delete reserved approval "
+                f"surface {surface_id}"
+            )
+
+        return self._clear_surface_from(
+            owners_by_surface_id,
+            surface_id,
+            owner_type="specialist",
+            owner_id=agent_id,
+        )
 
 
 def _validated_surface_id(surface_id: str) -> str:
@@ -375,6 +416,12 @@ def _owner_handler_failure_message(exc: Exception) -> str:
         "A2UI surface owner handler failed: "
         f"{type(exc).__name__}. Error details redacted."
     )
+
+
+def _validation_error_message(validation_errors: list[str]) -> str:
+    if validation_errors:
+        return "; ".join(validation_errors)
+    return "unknown validation error"
 
 
 def _response_a2ui_payload(response: Any) -> Any | None:

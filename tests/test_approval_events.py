@@ -325,6 +325,79 @@ def test_parser_accepts_renderer_control_event_context_from_approval_canvas() ->
     assert parsed.payload["stepId"] == "step_internal_knowledge"
 
 
+def test_parser_preserves_context_plan_metadata_for_event_name_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
+
+    event = {
+        "event": {
+            "name": "approve_plan",
+            "context": {
+                "surfaceId": "surface_plan_meeting_prep",
+                "planId": "plan_meeting_prep",
+                "planVersion": 1,
+                "payload": {
+                    "approvedStepIds": ["step_relationship_summary"],
+                },
+            },
+        },
+    }
+
+    # Act
+    parsed = parse_plan_user_action(event)
+
+    # Assert
+    assert parsed.type == "approve_plan"
+    assert parsed.surface_id == "surface_plan_meeting_prep"
+    assert parsed.plan_id == "plan_meeting_prep"
+    assert parsed.plan_version == 1
+    assert parsed.payload["surfaceId"] == "surface_plan_meeting_prep"
+    assert parsed.payload["planId"] == "plan_meeting_prep"
+    assert parsed.payload["planVersion"] == 1
+    assert parsed.payload["approvedStepIds"] == ["step_relationship_summary"]
+
+
+@pytest.mark.parametrize(
+    ("payload_metadata", "expected_field"),
+    [
+        ({"surfaceId": "surface_plan_other"}, "surfaceId"),
+        ({"planId": "plan_other"}, "planId"),
+        ({"planVersion": 2}, "planVersion"),
+    ],
+)
+def test_parser_rejects_conflicting_event_name_plan_metadata(
+    payload_metadata: dict[str, object],
+    expected_field: str,
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import (
+        PlanUserActionParseError,
+        parse_plan_user_action,
+    )
+
+    event = {
+        "event": {
+            "name": "approve_plan",
+            "context": {
+                "surfaceId": "surface_plan_meeting_prep",
+                "planId": "plan_meeting_prep",
+                "planVersion": 1,
+                "payload": {
+                    "approvedStepIds": ["step_relationship_summary"],
+                    **payload_metadata,
+                },
+            },
+        },
+    }
+
+    # Act / Assert
+    with pytest.raises(
+        PlanUserActionParseError,
+        match=f"conflicting event metadata for {expected_field}",
+    ):
+        parse_plan_user_action(event)
+
+
 def test_natural_language_approval_does_not_approve_or_execute_plan() -> None:
     # Arrange
     store, _original_plan = _store_with_meeting_plan()
@@ -617,6 +690,183 @@ def test_remove_step_rewires_dependents_to_removed_step_dependencies() -> None:
         "credit_risk",
     ]
     assert "internal_crm" not in record.draft_plan.data_source_categories
+
+
+def test_remove_step_reconnects_dependents_to_removed_step_dependencies() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+
+    store = ApprovalStateStore(agent_descriptors=_agent_descriptors())
+    store.add_draft(
+        ExecutionPlan(
+            plan_id="plan_meeting_prep",
+            objective="Prepare sequential credit context.",
+            detected_intents=["internal_knowledge", "credit_risk"],
+            selected_agents=["internal_knowledge", "credit_risk", "synthesis"],
+            steps=[
+                PlanStep(
+                    step_id="step_internal_knowledge",
+                    agent_id="internal_knowledge",
+                    instruction="Review internal notes.",
+                    expected_output="Internal context.",
+                    data_source_categories=["internal_crm"],
+                ),
+                PlanStep(
+                    step_id="step_credit_risk",
+                    agent_id="credit_risk",
+                    instruction="Assess credit risk from internal notes.",
+                    depends_on=["step_internal_knowledge"],
+                    expected_output="Credit risk context.",
+                    data_source_categories=["credit"],
+                ),
+                PlanStep(
+                    step_id="step_synthesis",
+                    agent_id="synthesis",
+                    instruction="Synthesize the brief.",
+                    depends_on=["step_credit_risk"],
+                    expected_output="Final brief.",
+                    data_source_categories=["specialist_outputs"],
+                ),
+            ],
+            data_source_categories=["internal_crm", "credit"],
+            approval_surface_id="surface_plan_meeting_prep",
+        )
+    )
+
+    # Act
+    result = store.apply_user_action(
+        _action("remove_step", {"stepId": "step_credit_risk"})
+    )
+    record = store.get("plan_meeting_prep")
+
+    # Assert
+    assert result.status == "draft_updated"
+    assert [step.step_id for step in record.draft_plan.steps] == [
+        "step_internal_knowledge",
+        "step_synthesis",
+    ]
+    assert record.draft_plan.steps[-1].depends_on == ["step_internal_knowledge"]
+
+
+def test_remove_step_rejects_orphaned_conditional_dependency() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanMutationError,
+    )
+
+    store = ApprovalStateStore(agent_descriptors=_agent_descriptors())
+    store.add_draft(
+        ExecutionPlan(
+            plan_id="plan_meeting_prep",
+            objective="Prepare conditional review context.",
+            detected_intents=["internal_knowledge", "credit_risk"],
+            selected_agents=["internal_knowledge", "credit_risk", "synthesis"],
+            steps=[
+                PlanStep(
+                    step_id="step_internal_knowledge",
+                    agent_id="internal_knowledge",
+                    instruction="Review internal notes.",
+                    expected_output="Internal context.",
+                    data_source_categories=["internal_crm"],
+                ),
+                PlanStep(
+                    step_id="step_credit_risk",
+                    agent_id="credit_risk",
+                    instruction="Review credit risk only if needed.",
+                    depends_on=["step_internal_knowledge"],
+                    condition="needs_review",
+                    expected_output="Credit review.",
+                    data_source_categories=["credit"],
+                ),
+                PlanStep(
+                    step_id="step_synthesis",
+                    agent_id="synthesis",
+                    instruction="Synthesize the brief.",
+                    depends_on=["step_credit_risk"],
+                    expected_output="Final brief.",
+                    data_source_categories=["specialist_outputs"],
+                ),
+            ],
+            data_source_categories=["internal_crm", "credit"],
+            approval_surface_id="surface_plan_meeting_prep",
+        )
+    )
+    record = store.get("plan_meeting_prep")
+    draft_snapshot = record.draft_plan.model_copy(deep=True)
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError, match="conditional step"):
+        store.apply_user_action(
+            _action("remove_step", {"stepId": "step_internal_knowledge"})
+        )
+
+    record_after_failed_remove = store.get("plan_meeting_prep")
+    assert record_after_failed_remove.status == "draft"
+    assert record_after_failed_remove.draft_plan == draft_snapshot
+
+
+def test_remove_step_rejects_conditional_data_quality_step() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanMutationError,
+    )
+
+    store = ApprovalStateStore(
+        agent_descriptors=[
+            _descriptor("internal_knowledge", "Internal Knowledge Agent"),
+            _descriptor("data_quality", "Data Quality Agent"),
+            _descriptor("synthesis", "Synthesis Agent"),
+        ]
+    )
+    store.add_draft(
+        ExecutionPlan(
+            plan_id="plan_meeting_prep",
+            objective="Prepare a briefing and check missing internal data.",
+            detected_intents=["meeting_prep"],
+            selected_agents=["internal_knowledge", "data_quality", "synthesis"],
+            steps=[
+                PlanStep(
+                    step_id="step_internal_knowledge",
+                    agent_id="internal_knowledge",
+                    instruction="Review internal CRM notes.",
+                    expected_output="Internal context.",
+                    data_source_categories=["internal_crm"],
+                ),
+                PlanStep(
+                    step_id="step_data_quality",
+                    agent_id="data_quality",
+                    instruction="Check missing or stale internal data if needed.",
+                    depends_on=["step_internal_knowledge"],
+                    condition="missing_internal_data",
+                    expected_output="Data quality gaps.",
+                    data_source_categories=["data_quality"],
+                ),
+                PlanStep(
+                    step_id="step_synthesis",
+                    agent_id="synthesis",
+                    instruction="Synthesize the available context.",
+                    depends_on=["step_data_quality"],
+                    expected_output="Final briefing or clarification need.",
+                    data_source_categories=["specialist_outputs"],
+                ),
+            ],
+            data_source_categories=["internal_crm", "data_quality"],
+            approval_surface_id="surface_plan_meeting_prep",
+        )
+    )
+    draft_snapshot = store.get("plan_meeting_prep").draft_plan.model_copy(deep=True)
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError, match="conditional data_quality step"):
+        store.apply_user_action(
+            _action("remove_step", {"stepId": "step_data_quality"})
+        )
+
+    record = store.get("plan_meeting_prep")
+    assert record.status == "draft"
+    assert record.draft_plan == draft_snapshot
 
 
 def test_generated_path_bound_replace_and_instruction_values_mutate_draft() -> None:
@@ -1010,6 +1260,136 @@ def test_choose_agent_and_add_instructions_aliases_mutate_draft() -> None:
     )
 
 
+def test_replace_agent_refreshes_step_and_plan_metadata_before_approval() -> None:
+    # Arrange
+    store, _original_plan = _store_with_meeting_plan()
+
+    # Act
+    replaced = store.apply_user_action(
+        _action(
+            "replace_agent",
+            {
+                "stepId": "step_industry_research",
+                "replacementAgentId": "credit_risk",
+            },
+        )
+    )
+    record = store.get("plan_meeting_prep")
+    replaced_step = next(
+        step
+        for step in record.draft_plan.steps
+        if step.step_id == "step_industry_research"
+    )
+    approval = store.apply_user_action(
+        {
+            "userAction": {
+                "type": "approve_plan",
+                "surfaceId": "surface_plan_meeting_prep",
+                "payload": {
+                    "planId": "plan_meeting_prep",
+                    "editedPlanVersion": replaced.plan_version,
+                    "approvedStepIds": [
+                        step.step_id for step in record.draft_plan.steps
+                    ],
+                },
+            }
+        }
+    )
+
+    # Assert
+    assert replaced.status == "draft_updated"
+    assert replaced_step.agent_id == "credit_risk"
+    assert replaced_step.instruction.startswith("Flag credit risk themes")
+    assert (
+        replaced_step.expected_output
+        == "Credit risk themes, missing data, and caveats."
+    )
+    assert replaced_step.data_source_categories == ["credit_risk"]
+    assert record.draft_plan.data_source_categories == [
+        "relationship_history",
+        "internal_crm",
+        "credit_risk",
+    ]
+    assert approval.approved_plan is not None
+    approved_step = next(
+        step
+        for step in approval.approved_plan.steps
+        if step.step_id == "step_industry_research"
+    )
+    assert approved_step.instruction == replaced_step.instruction
+    assert approved_step.data_source_categories == ["credit_risk"]
+
+
+def test_replace_agent_rejects_conditional_data_quality_step_before_approval() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanMutationError,
+    )
+
+    store = ApprovalStateStore(
+        agent_descriptors=[
+            _descriptor("internal_knowledge", "Internal Knowledge Agent"),
+            _descriptor("data_quality", "Data Quality Agent"),
+            _descriptor("credit_risk", "Credit Risk Agent"),
+            _descriptor("synthesis", "Synthesis Agent"),
+        ]
+    )
+    store.add_draft(
+        ExecutionPlan(
+            plan_id="plan_meeting_prep",
+            objective="Prepare a briefing and check missing internal data.",
+            detected_intents=["meeting_prep"],
+            selected_agents=["internal_knowledge", "data_quality", "synthesis"],
+            steps=[
+                PlanStep(
+                    step_id="step_internal_knowledge",
+                    agent_id="internal_knowledge",
+                    instruction="Review internal CRM notes.",
+                    expected_output="Internal context.",
+                    data_source_categories=["internal_crm"],
+                ),
+                PlanStep(
+                    step_id="step_data_quality",
+                    agent_id="data_quality",
+                    instruction="Check missing or stale internal data if needed.",
+                    depends_on=["step_internal_knowledge"],
+                    condition="missing_internal_data",
+                    expected_output="Data quality gaps.",
+                    data_source_categories=["data_quality"],
+                ),
+                PlanStep(
+                    step_id="step_synthesis",
+                    agent_id="synthesis",
+                    instruction="Synthesize the available context.",
+                    depends_on=["step_data_quality"],
+                    expected_output="Final briefing or clarification need.",
+                    data_source_categories=["specialist_outputs"],
+                ),
+            ],
+            data_source_categories=["internal_crm", "data_quality"],
+            approval_surface_id="surface_plan_meeting_prep",
+        )
+    )
+    draft_snapshot = store.get("plan_meeting_prep").draft_plan.model_copy(deep=True)
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError, match="conditional data_quality step"):
+        store.apply_user_action(
+            _action(
+                "replace_agent",
+                {
+                    "stepId": "step_data_quality",
+                    "replacementAgentId": "credit_risk",
+                },
+            )
+        )
+
+    record = store.get("plan_meeting_prep")
+    assert record.status == "draft"
+    assert record.draft_plan == draft_snapshot
+
+
 @pytest.mark.parametrize(
     ("action_type", "replacement_payload"),
     [
@@ -1198,10 +1578,59 @@ def test_approve_plan_rejects_malformed_approved_step_ids_before_freezing(
     assert record_after_failed_approval.draft_plan == draft_snapshot
 
 
-def test_failed_graph_execution_keeps_plan_recoverable() -> None:
+def test_approve_plan_rejects_mutable_plan_before_freezing_or_graph_execution() -> None:
     # Arrange
     from orchestrator_demo.orchestrator.approval_state import (
         ApprovalStateStore,
+        PlanMutationError,
+    )
+
+    class RecordingGraphRuntime:
+        def __init__(self) -> None:
+            self.executed_plan_ids: list[str] = []
+
+        def execute(self, plan: ExecutionPlan) -> object:
+            self.executed_plan_ids.append(plan.plan_id)
+            raise AssertionError("mutable plans must not reach graph execution")
+
+    graph_runtime = RecordingGraphRuntime()
+    store = ApprovalStateStore(
+        agent_descriptors=_agent_descriptors(),
+        graph_runtime=graph_runtime,
+    )
+    mutable_plan = _meeting_plan().model_copy(
+        update={"immutable_after_approval": False}
+    )
+    store.add_draft(mutable_plan)
+    draft_snapshot = store.get("plan_meeting_prep").draft_plan.model_copy(deep=True)
+    approve_event = _action(
+        "approve_plan",
+        {
+            "approvedStepIds": [
+                "step_relationship_summary",
+                "step_internal_knowledge",
+                "step_industry_research",
+                "step_synthesis",
+            ]
+        },
+    )
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError, match="immutable_after_approval=True"):
+        store.apply_user_action(approve_event)
+
+    record_after_failed_approval = store.get("plan_meeting_prep")
+    assert graph_runtime.executed_plan_ids == []
+    assert record_after_failed_approval.status == "draft"
+    assert record_after_failed_approval.approved_plan is None
+    assert record_after_failed_approval.draft_plan == draft_snapshot
+
+
+def test_failed_graph_execution_freezes_approved_plan_state() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import (
+        ApprovalStateStore,
+        PlanAlreadyFinalError,
     )
 
     class FailingGraphRuntime:
@@ -1238,27 +1667,32 @@ def test_failed_graph_execution_keeps_plan_recoverable() -> None:
     assert graph_runtime.specialist_calls == [
         ("plan_meeting_prep", "step_relationship_summary")
     ]
-    assert record_after_failed_execution.status == "draft"
-    assert record_after_failed_execution.approved_plan is None
-    assert record_after_failed_execution.approved_version is None
+    assert record_after_failed_execution.status == "approved_execution_failed"
+    assert record_after_failed_execution.approved_plan is not None
+    assert record_after_failed_execution.approved_version == 1
+    assert record_after_failed_execution.execution_failure_reason == (
+        "RuntimeError: graph failed for plan_meeting_prep"
+    )
 
-    recovery_result = store.apply_user_action(
-        _action(
-            "add_instruction",
-            {
-                "stepId": "step_internal_knowledge",
-                "instruction": "Retry after graph recovery.",
-            },
+    with pytest.raises(
+        PlanAlreadyFinalError,
+        match="already approved_execution_failed",
+    ):
+        store.apply_user_action(
+            _action(
+                "add_instruction",
+                {
+                    "stepId": "step_internal_knowledge",
+                    "instruction": "Retry after graph recovery.",
+                },
+            )
         )
-    )
-    recovered_record = store.get("plan_meeting_prep")
-    assert recovery_result.status == "draft_updated"
-    assert recovery_result.plan_version == 2
-    assert recovered_record.status == "draft"
-    assert recovered_record.approved_plan is None
-    assert recovered_record.draft_plan.steps[1].instruction.endswith(
-        "Additional instruction: Retry after graph recovery."
-    )
+
+    with pytest.raises(
+        PlanAlreadyFinalError,
+        match="already approved_execution_failed",
+    ):
+        store.apply_user_action(approve_event)
 
 
 def test_draft_update_commits_only_after_refreshed_canvas_validation() -> None:
@@ -1514,9 +1948,13 @@ def test_approve_plan_rejects_unavailable_step_agent_before_execution() -> None:
         )
 
     record_after_failed_execution = store.get("plan_typo_agent")
-    assert record_after_failed_execution.status == "draft"
-    assert record_after_failed_execution.approved_plan is None
-    assert record_after_failed_execution.approved_version is None
+    assert record_after_failed_execution.status == "approved_execution_failed"
+    assert record_after_failed_execution.approved_plan is not None
+    assert record_after_failed_execution.approved_version == 1
+    assert record_after_failed_execution.execution_failure_reason == (
+        "GraphRuntimeError: no specialist handler registered for approved plan "
+        "step step_typo_agent agent relationship_summarry"
+    )
 
 
 def test_default_graph_runtime_refreshes_handlers_for_live_registry_additions() -> None:

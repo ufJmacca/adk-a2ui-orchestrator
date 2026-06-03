@@ -229,6 +229,7 @@ class OrchestratorService:
                 context,
                 request,
                 specialist.handle,
+                enforce_response_agent_id=False,
             )
         except Exception as exc:
             raise GraphRuntimeError(
@@ -312,7 +313,14 @@ class OrchestratorService:
         self,
         user_action: Any,
     ) -> OrchestratorUserActionResult:
-        approval_result = self._approval_store.apply_user_action(user_action)
+        try:
+            approval_result = self._approval_store.apply_user_action(user_action)
+        except GraphRuntimeError as exc:
+            plan_id = _plan_id_from_graph_error(exc)
+            if plan_id is not None:
+                self._approval_store.reset_failed_approval(plan_id)
+                self._sync_context_draft(plan_id)
+            raise
         a2ui_parts = self._prepare_approval_result_a2ui(approval_result)
         graph_execution = approval_result.graph_execution
         specialist_responses = (
@@ -460,7 +468,12 @@ class _GuardedGraphRuntime:
                 raise SpecialistPreApprovalError(
                     f"handler {agent_id!r} cannot execute request for {request.agent_id!r}"
                 )
-            return await call_specialist_with_guard(context, request, specialist.handle)
+            return await call_specialist_with_guard(
+                context,
+                request,
+                specialist.handle,
+                enforce_response_agent_id=False,
+            )
 
         return handle
 
@@ -506,6 +519,14 @@ def _missing_specialist_handler_agent_ids(
         if step.agent_id not in specialists and step.agent_id not in missing_agent_ids:
             missing_agent_ids.append(step.agent_id)
     return missing_agent_ids
+
+
+def _plan_id_from_graph_error(exc: GraphRuntimeError) -> str | None:
+    graph = exc.graph
+    if graph is None:
+        return None
+    plan_id = getattr(graph, "plan_id", None)
+    return plan_id if isinstance(plan_id, str) else None
 
 
 def _direct_handler_failure_message(agent_id: str, exc: Exception) -> str:

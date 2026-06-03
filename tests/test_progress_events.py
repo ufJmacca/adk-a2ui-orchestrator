@@ -241,10 +241,8 @@ def test_registered_specialist_failure_preserves_prior_events_and_step_failed_st
     assert failed_event.step_id == "graph_step_credit_risk"
     assert failed_event.message == (
         "Approved plan step step_credit_risk failed during execution: "
-        "RuntimeError. Error details redacted."
+        "RuntimeError: credit service timed out."
     )
-    assert "credit service timed out" not in str(failure)
-    assert "credit service timed out" not in failed_event.message
     assert failed_event.details == {
         "agentId": "credit_risk",
         "planStepId": "step_credit_risk",
@@ -255,3 +253,44 @@ def test_registered_specialist_failure_preserves_prior_events_and_step_failed_st
             "step_credit_risk."
         ),
     }
+
+
+def test_registered_specialist_failure_redacts_secret_like_exception_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    plan = _handler_failure_plan()
+    leaked_value = "OPENROUTER_API_KEY=sk-live-handler-secret-token-123456789"
+
+    def failing_credit_handler(request):
+        raise RuntimeError(f"provider rejected {leaked_value}")
+
+    runtime = AdkGraphRuntime(
+        specialist_handlers={
+            "internal_knowledge": _response_for,
+            "credit_risk": failing_credit_handler,
+        }
+    )
+
+    # Act / Assert
+    with pytest.raises(GraphRuntimeError, match="credit_risk") as exc_info:
+        runtime.execute(plan)
+
+    failure = exc_info.value
+    failed_event = failure.status_events[-1]
+    exposed_failure = repr(
+        {
+            "runtime_error": str(failure),
+            "event_message": failed_event.message,
+            "event_details": failed_event.details,
+        }
+    )
+    assert leaked_value not in exposed_failure
+    assert "sk-live-handler-secret-token-123456789" not in exposed_failure
+    assert leaked_value not in caplog.text
+    assert "sk-live-handler-secret-token-123456789" not in caplog.text
+    assert "<redacted-secret>" in exposed_failure
+    assert failed_event.message == (
+        "Approved plan step step_credit_risk failed during execution: "
+        "RuntimeError: provider rejected <redacted-secret>."
+    )

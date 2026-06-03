@@ -250,6 +250,10 @@ def _format_agent_ids(agent_ids: list[str]) -> str:
     return ",".join(agent_ids) if agent_ids else "-"
 
 
+def _copy_descriptor(descriptor: AgentDescriptor) -> AgentDescriptor:
+    return descriptor.model_copy(deep=True)
+
+
 def _install_config_module(module_name: str, module: ModuleType) -> None:
     sys.modules[module_name] = module
     _set_parent_module_attribute(module_name, module)

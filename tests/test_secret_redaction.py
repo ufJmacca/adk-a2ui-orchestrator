@@ -48,5 +48,7 @@ def test_configuration_error_and_logs_do_not_expose_present_secret(
     assert "LLM_MODEL" in str(exc_info.value)
     assert SECRET_SENTINEL not in str(exc_info.value)
     assert SECRET_SENTINEL not in repr(exc_info.value)
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.__cause__ is None
     assert all(SECRET_SENTINEL not in record.getMessage() for record in caplog.records)
     assert SECRET_SENTINEL not in caplog.text
