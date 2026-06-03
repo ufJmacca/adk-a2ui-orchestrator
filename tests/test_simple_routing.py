@@ -357,7 +357,7 @@ async def test_high_confidence_simple_assessment_with_multiple_intents_or_agents
 
 
 @pytest.mark.asyncio
-async def test_high_confidence_simple_synthesis_only_assessment_requires_plan() -> None:
+async def test_high_confidence_simple_synthesis_only_assessment_requires_clarification() -> None:
     # Arrange
     user_input = "Summarize the available outputs into a final brief."
     slm_suggestion = IntentSuggestion(intent="meeting_prep", confidence=0.95)
@@ -385,9 +385,10 @@ async def test_high_confidence_simple_synthesis_only_assessment_requires_plan() 
     assert context.decision.confidence >= 0.85
     assert context.llm_assessment.complexity == "simple"
     assert context.llm_assessment.required_agents == ["synthesis"]
-    assert context.decision.path == "plan_required"
+    assert context.decision.path == "clarification_required"
     assert context.decision.selected_agent is None
     assert "synthesis" in context.decision.reason.casefold()
+    assert "specialist workstream" in context.decision.reason.casefold()
 
 
 @pytest.mark.asyncio

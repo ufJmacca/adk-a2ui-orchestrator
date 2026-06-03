@@ -1,7 +1,10 @@
 import pytest
 
 from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep
-from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+from orchestrator_demo.orchestrator.approval_state import (
+    ApprovalRecord,
+    ApprovalStateStore,
+)
 from orchestrator_demo.orchestrator.graph_builder import (
     GraphBuilder,
     GraphPlanApprovalError,
@@ -68,6 +71,16 @@ def _approval_record_for(plan: ExecutionPlan):
     assert result.status == "approved"
     assert result.approved_plan is not None
     return store.get(plan.plan_id)
+
+
+def _approved_record_without_store_validation(plan: ExecutionPlan) -> ApprovalRecord:
+    record = ApprovalRecord(
+        draft_plan=plan.model_copy(deep=True),
+        status="approved",
+        approved_version=plan.plan_version,
+    )
+    record.approved_plan = plan.model_copy(deep=True)
+    return record
 
 
 def _plan(
@@ -495,7 +508,7 @@ def test_graph_builder_rejects_approved_plan_that_is_not_immutable() -> None:
             )
         ],
     )
-    record = _approval_record_for(plan)
+    record = _approved_record_without_store_validation(plan)
     builder = GraphBuilder(registry=_registry_for(plan))
 
     # Act / Assert

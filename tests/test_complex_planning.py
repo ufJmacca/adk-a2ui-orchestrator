@@ -157,6 +157,38 @@ def _approved_context_for_step(plan: ExecutionPlan, step: PlanStep) -> dict[str,
     return context
 
 
+def _conditional_data_quality_guard_plan(user_input: str) -> ExecutionPlan:
+    return ExecutionPlan(
+        plan_id="plan_conditional_default_guard",
+        objective=user_input,
+        detected_intents=["meeting_prep"],
+        selected_agents=["internal_knowledge", "data_quality", "synthesis"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal context.",
+            ),
+            PlanStep(
+                step_id="step_data_quality",
+                agent_id="data_quality",
+                instruction="Check internal data gaps.",
+                depends_on=["step_internal_knowledge"],
+                expected_output="Data quality gaps.",
+            ),
+            PlanStep(
+                step_id="step_synthesis",
+                agent_id="synthesis",
+                instruction="Synthesize the available context.",
+                depends_on=["step_data_quality"],
+                expected_output="Final RM-ready brief.",
+            ),
+        ],
+        approval_surface_id="surface_plan_conditional_default_guard",
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", _golden_plan_cases(), ids=lambda case: case["name"])
 async def test_golden_complex_routes_generate_complete_draft_plans(
@@ -869,6 +901,57 @@ async def test_specialist_guard_allows_dependency_outputs_for_approved_step(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_key", ["dependencyOutputs", "stepResults"])
+async def test_specialist_guard_allows_conditional_default_branch_source_output(
+    runtime_key: str,
+) -> None:
+    # Arrange
+    user_input = "Prepare a briefing and check data quality only if needed."
+    context = RequestContext(
+        user_input=user_input,
+        slm_suggestion=IntentSuggestion(intent="meeting_prep", confidence=0.82),
+        llm_assessment=LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.91,
+            complexity="complex",
+            required_agents=["internal_knowledge", "data_quality", "synthesis"],
+            rationale="Conditional data quality review may be required.",
+        ),
+        decision=RoutingDecision(
+            path="plan_required",
+            selected_agent=None,
+            confidence=0.874,
+            reason="Plan approval required.",
+        ),
+        plan_scope_id="default_guard",
+    )
+    approved_plan = _conditional_data_quality_guard_plan(user_input)
+    approved_step = approved_plan.steps[-1]
+    runtime_context = _approved_context_for_step(approved_plan, approved_step)
+    runtime_context[runtime_key] = {
+        "step_internal_knowledge": {"content": "internal context completed"}
+    }
+    context.record_draft_plan(approved_plan)
+    context.mark_plan_approved(approved_plan)
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_conditional_default_branch_dependency_outputs",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=runtime_context,
+    )
+
+    # Act
+    response = await call_specialist_with_guard(context, request, specialist)
+
+    # Assert
+    assert response.agent_id == "synthesis"
+    assert specialist.calls == [request]
+
+
+@pytest.mark.asyncio
 async def test_specialist_guard_rejects_missing_dependency_outputs_for_dependent_step() -> None:
     # Arrange
     router = RequestRouter(
@@ -887,6 +970,56 @@ async def test_specialist_guard_rejects_missing_dependency_outputs_for_dependent
     specialist = _FakeSpecialist()
     request = SpecialistRequest(
         request_id="request_missing_dependency_outputs",
+        user_input=approved_step.instruction,
+        agent_id=approved_step.agent_id,
+        plan_id=approved_plan.plan_id,
+        step_id=approved_step.step_id,
+        context=runtime_context,
+    )
+
+    # Act / Assert
+    with pytest.raises(SpecialistPreApprovalError, match="approved context"):
+        await call_specialist_with_guard(context, request, specialist)
+
+    assert specialist.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_key", ["dependencyOutputs", "stepResults"])
+async def test_specialist_guard_rejects_unrelated_conditional_dependency_outputs(
+    runtime_key: str,
+) -> None:
+    # Arrange
+    user_input = "Prepare a briefing and check data quality only if needed."
+    context = RequestContext(
+        user_input=user_input,
+        slm_suggestion=IntentSuggestion(intent="meeting_prep", confidence=0.82),
+        llm_assessment=LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.91,
+            complexity="complex",
+            required_agents=["internal_knowledge", "data_quality", "synthesis"],
+            rationale="Conditional data quality review may be required.",
+        ),
+        decision=RoutingDecision(
+            path="plan_required",
+            selected_agent=None,
+            confidence=0.874,
+            reason="Plan approval required.",
+        ),
+        plan_scope_id="default_guard",
+    )
+    approved_plan = _conditional_data_quality_guard_plan(user_input)
+    approved_step = approved_plan.steps[-1]
+    runtime_context = _approved_context_for_step(approved_plan, approved_step)
+    runtime_context[runtime_key] = {
+        "step_unapproved": {"content": "unapproved dependency output"}
+    }
+    context.record_draft_plan(approved_plan)
+    context.mark_plan_approved(approved_plan)
+    specialist = _FakeSpecialist()
+    request = SpecialistRequest(
+        request_id="request_unrelated_conditional_dependency_outputs",
         user_input=approved_step.instruction,
         agent_id=approved_step.agent_id,
         plan_id=approved_plan.plan_id,

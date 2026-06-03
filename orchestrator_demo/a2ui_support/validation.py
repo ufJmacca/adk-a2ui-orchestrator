@@ -49,7 +49,9 @@ _SECRET_VALUE_PATTERNS = tuple(
         r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
         r"(?<![A-Za-z0-9])authorization\b\s*[:=]\s*(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}",
         r"(?<![A-Za-z0-9])bearer\s+[A-Za-z0-9._~+/=-]{10,}",
-        r"(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
+        r"(?<![A-Za-z0-9])"
+        r"(?:openrouter[_-]?api[_-]?key|api[_-]?key|access[_-]?key|"
+        r"private[_-]?key|secret|password|token|credential)\b\s*[:=]\s*\S{6,}",
     )
 )
 

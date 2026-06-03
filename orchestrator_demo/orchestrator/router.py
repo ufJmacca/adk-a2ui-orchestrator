@@ -96,6 +96,17 @@ class RequestRouter:
                 ),
             )
 
+        if _is_synthesis_only(assessment=llm_assessment):
+            return RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=confidence,
+                reason=(
+                    "A safe route or plan cannot be formed because synthesis "
+                    "requires at least one concrete specialist workstream."
+                ),
+            )
+
         if _is_direct_route_candidate(
             llm_assessment,
             confidence,
@@ -142,6 +153,10 @@ def _is_sensitive(assessment: LlmIntentAssessment) -> bool:
         SENSITIVE_INTENTS.intersection(assessment.intents)
         or SENSITIVE_AGENTS.intersection(assessment.required_agents)
     )
+
+
+def _is_synthesis_only(*, assessment: LlmIntentAssessment) -> bool:
+    return set(assessment.required_agents) == {SYNTHESIS_AGENT_ID}
 
 
 def _unavailable_required_agents(

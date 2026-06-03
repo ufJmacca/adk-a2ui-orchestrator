@@ -44,6 +44,9 @@ class _ApprovedStepPayload:
     agent_id: str
     user_input: str
     context: Mapping[str, Any]
+    dependency_output_alternates: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
 
 
 def _new_plan_scope_id() -> str:
@@ -147,6 +150,9 @@ class RequestContext:
                     user_input=step.instruction,
                     context=_freeze_approval_value(
                         _approved_step_context(plan, step)
+                    ),
+                    dependency_output_alternates=MappingProxyType(
+                        _conditional_default_dependency_alternates(plan, step)
                     ),
                 )
                 for step in plan.steps
@@ -290,6 +296,7 @@ class RequestContext:
             if not _approved_context_allows_request_context(
                 request.context,
                 approved_payload.context,
+                approved_payload.dependency_output_alternates,
             ):
                 raise SpecialistPreApprovalError(
                     "complex route specialist call context must match the approved "
@@ -356,6 +363,7 @@ def _approval_record_matches_approved_plan(
 def _approved_context_allows_request_context(
     request_context: Mapping[str, Any],
     approved_context: Mapping[str, Any],
+    dependency_output_alternates: Mapping[str, tuple[str, ...]],
 ) -> bool:
     approved_keys = set(approved_context)
     request_keys = set(request_context)
@@ -386,6 +394,7 @@ def _approved_context_allows_request_context(
         if not _runtime_dependency_outputs_allowed(
             request_context[key],
             allowed_dependency_ids,
+            dependency_output_alternates,
         ):
             return False
 
@@ -395,6 +404,7 @@ def _approved_context_allows_request_context(
 def _runtime_dependency_outputs_allowed(
     value: Any,
     allowed_dependency_ids: set[str],
+    dependency_output_alternates: Mapping[str, tuple[str, ...]],
 ) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -405,7 +415,32 @@ def _runtime_dependency_outputs_allowed(
             return False
         dependency_ids.add(step_id)
 
-    return dependency_ids == allowed_dependency_ids
+    allowed_dependency_sets = {frozenset(allowed_dependency_ids)}
+    for dependency_id, alternates in dependency_output_alternates.items():
+        if dependency_id not in allowed_dependency_ids:
+            continue
+        alternate_ids = set(allowed_dependency_ids)
+        alternate_ids.remove(dependency_id)
+        alternate_ids.update(alternates)
+        allowed_dependency_sets.add(frozenset(alternate_ids))
+
+    return frozenset(dependency_ids) in allowed_dependency_sets
+
+
+def _conditional_default_dependency_alternates(
+    plan: ExecutionPlan,
+    step: PlanStep,
+) -> dict[str, tuple[str, ...]]:
+    if step.agent_id != "synthesis":
+        return {}
+
+    alternates: dict[str, tuple[str, ...]] = {}
+    for candidate in plan.steps:
+        if candidate.agent_id != "data_quality" or len(candidate.depends_on) != 1:
+            continue
+        if candidate.step_id in step.depends_on:
+            alternates[candidate.step_id] = tuple(candidate.depends_on)
+    return alternates
 
 
 def _freeze_approval_value(value: Any) -> Any:

@@ -19,7 +19,7 @@ from orchestrator_demo.orchestrator.graph_runtime import (
 from orchestrator_demo.orchestrator.planner import step_metadata_for_agent
 
 
-PlanState = Literal["draft", "approved", "rejected"]
+PlanState = Literal["draft", "approved", "approved_execution_failed", "rejected"]
 ApprovalActionStatus = Literal["ignored", "draft_updated", "approved", "rejected"]
 CONDITIONAL_DATA_QUALITY_AGENT_ID = "data_quality"
 CONDITIONAL_DATA_QUALITY_ROUTE = "missing_internal_data"
@@ -57,6 +57,7 @@ class ApprovalRecord:
     status: PlanState = "draft"
     approved_version: int | None = None
     rejection_reason: str | None = None
+    execution_failure_reason: str | None = None
     _approved_plan: ExecutionPlan | None = field(default=None, repr=False)
 
     @property
@@ -78,6 +79,7 @@ def _record_snapshot(record: ApprovalRecord) -> ApprovalRecord:
         status=record.status,
         approved_version=record.approved_version,
         rejection_reason=record.rejection_reason,
+        execution_failure_reason=record.execution_failure_reason,
     )
     snapshot.approved_plan = record.approved_plan
     return snapshot
@@ -183,13 +185,20 @@ class ApprovalStateStore:
         self._require_draft(record)
         self._require_current_version(record, action)
         _require_approved_step_ids(record.draft_plan, action.payload)
+        _require_immutable_after_approval(record.draft_plan)
 
         frozen_plan = record.draft_plan.model_copy(deep=True)
-        graph_execution = self._graph_runtime.execute(frozen_plan)
-
         record.status = "approved"
         record.approved_plan = frozen_plan
         record.approved_version = frozen_plan.plan_version
+        record.execution_failure_reason = None
+
+        try:
+            graph_execution = self._graph_runtime.execute(frozen_plan)
+        except Exception as exc:
+            record.status = "approved_execution_failed"
+            record.execution_failure_reason = f"{type(exc).__name__}: {exc}"
+            raise
 
         return ApprovalActionResult(
             status="approved",
@@ -372,6 +381,13 @@ def _require_approved_step_ids(
     ) != len(approved_step_ids):
         raise PlanMutationError(
             "approvedStepIds must match current draft plan steps"
+        )
+
+
+def _require_immutable_after_approval(plan: ExecutionPlan) -> None:
+    if plan.immutable_after_approval is not True:
+        raise PlanMutationError(
+            "approve_plan requires immutable_after_approval=True before graph execution"
         )
 
 
