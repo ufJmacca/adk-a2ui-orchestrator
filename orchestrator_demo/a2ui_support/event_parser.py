@@ -8,9 +8,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from orchestrator_demo.a2a_support.transport import DataPart
-from orchestrator_demo.a2ui_support.validation import (
-    _redact_secret_like_values,
-    _safe_path_component,
+from orchestrator_demo.a2ui_support.secret_safety import (
+    redact_secret_like_values,
+    safe_path_component,
 )
 from orchestrator_demo.contracts import (
     PLAN_APPROVAL_SURFACE_PREFIX,
@@ -20,6 +20,16 @@ from orchestrator_demo.contracts import (
 
 
 SUPPORTED_PLAN_USER_ACTION_TYPES: set[str] = set(PLAN_USER_ACTION_TYPES)
+_EVENT_METADATA_ALIASES: dict[str, tuple[str, ...]] = {
+    "surfaceId": ("surfaceId", "surface_id"),
+    "planId": ("planId", "plan_id"),
+    "planVersion": (
+        "planVersion",
+        "plan_version",
+        "editedPlanVersion",
+        "edited_plan_version",
+    ),
+}
 
 
 class StructuredUserActionRequiredError(ValueError):
@@ -93,9 +103,13 @@ def _event_payload_from_mapping(candidate: Mapping[str, Any]) -> Mapping[str, An
     if isinstance(action, Mapping):
         return _event_payload_from_mapping(_with_renderer_edit_state(action, candidate))
 
+    derived_payload = _derive_user_action_from_event_name(candidate)
+    if derived_payload is not None:
+        return derived_payload
+
     event = candidate.get("event")
     if isinstance(event, Mapping):
-        return _event_payload_from_mapping(_with_renderer_edit_state(event, candidate))
+        return _event_payload_from_event(event, candidate)
 
     context = candidate.get("context")
     if isinstance(context, Mapping):
@@ -114,6 +128,83 @@ def _event_payload_from_mapping(candidate: Mapping[str, Any]) -> Mapping[str, An
     raise StructuredUserActionRequiredError(
         "plan approval requires a structured A2UI userAction event"
     )
+
+
+def _event_payload_from_event(
+    event: Mapping[str, Any],
+    source: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    payload = _with_renderer_edit_state(event, source)
+    derived_payload = _derive_user_action_from_event_name(payload)
+    if derived_payload is not None:
+        return derived_payload
+    return _event_payload_from_mapping(payload)
+
+
+def _derive_user_action_from_event_name(
+    event: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    event_name = event.get("name")
+    context = event.get("context")
+    if not isinstance(event_name, str) or not isinstance(context, Mapping):
+        return None
+
+    if isinstance(context.get("type"), str):
+        return None
+
+    surface_id = context.get("surfaceId") or context.get("surface_id")
+    if not isinstance(surface_id, str):
+        return None
+
+    action_payload = context.get("payload")
+    context_payload = {
+        key: value
+        for key, value in context.items()
+        if key not in {"payload"}
+    }
+    if isinstance(action_payload, Mapping):
+        _reject_conflicting_event_metadata(context_payload, action_payload)
+        payload = {
+            **action_payload,
+            **context_payload,
+        }
+    else:
+        payload = {
+            key: value
+            for key, value in context_payload.items()
+            if key not in {"surfaceId", "surface_id"}
+        }
+
+    return {
+        "type": event_name,
+        "surfaceId": surface_id,
+        "payload": payload,
+    }
+
+
+def _reject_conflicting_event_metadata(
+    context_payload: Mapping[str, Any],
+    action_payload: Mapping[str, Any],
+) -> None:
+    for metadata_name, aliases in _EVENT_METADATA_ALIASES.items():
+        context_values = _metadata_values(context_payload, aliases)
+        action_values = _metadata_values(action_payload, aliases)
+        all_values = [*context_values, *action_values]
+        if not all_values:
+            continue
+
+        first_value = all_values[0]
+        if any(value != first_value for value in all_values[1:]):
+            raise PlanUserActionParseError(
+                f"conflicting event metadata for {metadata_name}"
+            )
+
+
+def _metadata_values(
+    payload: Mapping[str, Any],
+    aliases: tuple[str, ...],
+) -> list[Any]:
+    return [payload[alias] for alias in aliases if payload.get(alias) is not None]
 
 
 def _with_renderer_edit_state(
@@ -210,9 +301,9 @@ def _validation_error_summary(exc: ValidationError) -> str:
 
     first_error = errors[0]
     location = ".".join(
-        _safe_path_component(str(part)) for part in first_error.get("loc", ())
+        safe_path_component(str(part)) for part in first_error.get("loc", ())
     )
-    message = _redact_secret_like_values(first_error.get("msg", str(exc)))
+    message = redact_secret_like_values(first_error.get("msg", str(exc)))
     if location:
         return f"{location}: {message}"
     return str(message)

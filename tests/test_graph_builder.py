@@ -1,7 +1,10 @@
 import pytest
 
 from orchestrator_demo.contracts import AgentDescriptor, ExecutionPlan, PlanStep
-from orchestrator_demo.orchestrator.approval_state import ApprovalStateStore
+from orchestrator_demo.orchestrator.approval_state import (
+    ApprovalRecord,
+    ApprovalStateStore,
+)
 from orchestrator_demo.orchestrator.graph_builder import (
     GraphBuilder,
     GraphPlanApprovalError,
@@ -68,6 +71,16 @@ def _approval_record_for(plan: ExecutionPlan):
     assert result.status == "approved"
     assert result.approved_plan is not None
     return store.get(plan.plan_id)
+
+
+def _approved_record_without_store_validation(plan: ExecutionPlan) -> ApprovalRecord:
+    record = ApprovalRecord(
+        draft_plan=plan.model_copy(deep=True),
+        status="approved",
+        approved_version=plan.plan_version,
+    )
+    record.approved_plan = plan.model_copy(deep=True)
+    return record
 
 
 def _plan(
@@ -252,6 +265,7 @@ def _conditional_data_quality_plan() -> ExecutionPlan:
                 agent_id="data_quality",
                 instruction="Check missing or stale internal data if needed.",
                 depends_on=["step_internal_knowledge"],
+                condition="missing_internal_data",
                 expected_output="Data quality gaps.",
                 data_source_categories=["data_quality"],
             ),
@@ -261,6 +275,199 @@ def _conditional_data_quality_plan() -> ExecutionPlan:
                 instruction="Synthesize the available context.",
                 depends_on=["step_data_quality"],
                 expected_output="Final briefing or clarification need.",
+                data_source_categories=["specialist_outputs"],
+            ),
+        ],
+    )
+
+
+def _generic_conditional_plan() -> ExecutionPlan:
+    return _plan(
+        plan_id="plan_generic_conditional_review",
+        selected_agents=["internal_knowledge", "credit_risk"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_credit_risk",
+                agent_id="credit_risk",
+                instruction="Assess credit risk if review is needed.",
+                depends_on=["step_internal_knowledge"],
+                condition="needs_review",
+                expected_output="Conditional credit risk themes.",
+                data_source_categories=["credit_risk"],
+            ),
+        ],
+    )
+
+
+def _generic_conditional_fan_in_plan() -> ExecutionPlan:
+    return _plan(
+        plan_id="plan_generic_conditional_fan_in",
+        selected_agents=["internal_knowledge", "industry_research", "credit_risk"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_industry_research",
+                agent_id="industry_research",
+                instruction="Gather industry context.",
+                expected_output="Industry context.",
+                data_source_categories=["industry_research"],
+            ),
+            PlanStep(
+                step_id="step_credit_risk",
+                agent_id="credit_risk",
+                instruction="Assess credit risk if review is needed.",
+                depends_on=["step_internal_knowledge", "step_industry_research"],
+                condition="needs_review",
+                expected_output="Conditional credit risk themes.",
+                data_source_categories=["credit_risk"],
+            ),
+        ],
+    )
+
+
+def _colliding_route_conditional_fan_in_plan() -> ExecutionPlan:
+    return _plan(
+        plan_id="plan_colliding_route_conditional_fan_in",
+        selected_agents=[
+            "internal_knowledge",
+            "industry_research",
+            "credit_risk",
+            "compliance_policy",
+            "synthesis",
+        ],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_industry_research",
+                agent_id="industry_research",
+                instruction="Gather industry context.",
+                expected_output="Industry context.",
+                data_source_categories=["industry_research"],
+            ),
+            PlanStep(
+                step_id="step_credit_risk",
+                agent_id="credit_risk",
+                instruction="Assess credit risk when review is needed.",
+                depends_on=["step_internal_knowledge"],
+                condition="needs-review",
+                expected_output="Credit risk themes.",
+                data_source_categories=["credit_risk"],
+            ),
+            PlanStep(
+                step_id="step_compliance_policy",
+                agent_id="compliance_policy",
+                instruction="Review policy when review is needed.",
+                depends_on=["step_internal_knowledge"],
+                condition="needs_review",
+                expected_output="Policy caveats.",
+                data_source_categories=["compliance_policy"],
+            ),
+            PlanStep(
+                step_id="step_synthesis",
+                agent_id="synthesis",
+                instruction="Synthesize selected review path and industry context.",
+                depends_on=[
+                    "step_credit_risk",
+                    "step_compliance_policy",
+                    "step_industry_research",
+                ],
+                expected_output="Final RM-ready review.",
+                data_source_categories=["specialist_outputs"],
+            ),
+        ],
+    )
+
+
+def _mixed_conditional_fan_in_plan() -> ExecutionPlan:
+    return _plan(
+        plan_id="plan_mixed_conditional_fan_in",
+        selected_agents=[
+            "internal_knowledge",
+            "industry_research",
+            "data_quality",
+            "synthesis",
+        ],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_industry_research",
+                agent_id="industry_research",
+                instruction="Gather industry context in parallel.",
+                expected_output="Industry context.",
+                data_source_categories=["industry_research"],
+            ),
+            PlanStep(
+                step_id="step_data_quality",
+                agent_id="data_quality",
+                instruction="Check missing or stale internal data if needed.",
+                depends_on=["step_internal_knowledge"],
+                condition="missing_internal_data",
+                expected_output="Data quality gaps.",
+                data_source_categories=["data_quality"],
+            ),
+            PlanStep(
+                step_id="step_synthesis",
+                agent_id="synthesis",
+                instruction="Synthesize internal, data quality, and industry context.",
+                depends_on=["step_data_quality", "step_industry_research"],
+                expected_output="Final briefing or clarification need.",
+                data_source_categories=["specialist_outputs"],
+            ),
+        ],
+    )
+
+
+def _mandatory_data_quality_plan() -> ExecutionPlan:
+    return _plan(
+        plan_id="plan_mandatory_data_quality",
+        selected_agents=["internal_knowledge", "data_quality", "synthesis"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal CRM notes.",
+                expected_output="Internal customer context.",
+                data_source_categories=["internal_crm"],
+            ),
+            PlanStep(
+                step_id="step_data_quality",
+                agent_id="data_quality",
+                instruction="Always validate internal CRM data quality.",
+                depends_on=["step_internal_knowledge"],
+                expected_output="Data quality gaps.",
+                data_source_categories=["data_quality"],
+            ),
+            PlanStep(
+                step_id="step_synthesis",
+                agent_id="synthesis",
+                instruction="Synthesize validated internal context.",
+                depends_on=["step_data_quality"],
+                expected_output="Final briefing.",
                 data_source_categories=["specialist_outputs"],
             ),
         ],
@@ -301,7 +508,7 @@ def test_graph_builder_rejects_approved_plan_that_is_not_immutable() -> None:
             )
         ],
     )
-    record = _approval_record_for(plan)
+    record = _approved_record_without_store_validation(plan)
     builder = GraphBuilder(registry=_registry_for(plan))
 
     # Act / Assert
@@ -432,6 +639,243 @@ def test_graph_builder_builds_conditional_data_quality_branch() -> None:
         ),
         ("graph_step_data_quality", "graph_step_synthesis", None),
         ("graph_step_internal_knowledge", "graph_step_synthesis", "__DEFAULT__"),
+    }
+
+
+def test_graph_builder_preserves_mandatory_data_quality_dependency() -> None:
+    # Arrange
+    plan = _mandatory_data_quality_plan()
+    builder = GraphBuilder(registry=_registry_for(plan))
+
+    # Act
+    result = builder.build(_approval_record_for(plan))
+
+    # Assert
+    assert result.spec.pattern == "sequential"
+    assert {
+        (edge.from_step_id, edge.to_step_id, edge.condition)
+        for edge in result.spec.edges
+    } == {
+        ("graph_step_internal_knowledge", "graph_step_data_quality", None),
+        ("graph_step_data_quality", "graph_step_synthesis", None),
+    }
+    assert _runtime_edges(result) == {
+        ("__START__", "graph_step_internal_knowledge", None),
+        ("graph_step_internal_knowledge", "graph_step_data_quality", None),
+        ("graph_step_data_quality", "graph_step_synthesis", None),
+    }
+
+
+def test_graph_builder_preserves_generic_plan_step_conditions() -> None:
+    # Arrange
+    plan = _generic_conditional_plan()
+    builder = GraphBuilder(registry=_registry_for(plan))
+
+    # Act
+    result = builder.build(_approval_record_for(plan))
+
+    # Assert
+    assert result.spec.pattern == "conditional"
+    assert {
+        (edge.from_step_id, edge.to_step_id, edge.condition)
+        for edge in result.spec.edges
+    } == {
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_credit_risk",
+            "needs_review",
+        )
+    }
+    assert _runtime_edges(result) == {
+        ("__START__", "graph_step_internal_knowledge", None),
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_credit_risk",
+            "needs_review",
+        ),
+    }
+
+
+def test_graph_builder_joins_generic_conditional_fan_in_dependencies() -> None:
+    # Arrange
+    plan = _generic_conditional_fan_in_plan()
+    builder = GraphBuilder(registry=_registry_for(plan))
+
+    # Act
+    result = builder.build(_approval_record_for(plan))
+
+    # Assert
+    assert result.spec.pattern == "conditional"
+    assert {
+        (edge.from_step_id, edge.to_step_id, edge.condition)
+        for edge in result.spec.edges
+    } == {
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_credit_risk",
+            "needs_review",
+        ),
+        ("graph_step_industry_research", "graph_step_credit_risk", None),
+    }
+    assert "join_graph_step_credit_risk" in result.runtime.node_names
+    assert "join_graph_step_credit_risk_needs_review_gate" in (
+        result.runtime.node_names
+    )
+    assert _runtime_edges(result) == {
+        ("__START__", "graph_step_internal_knowledge", None),
+        ("__START__", "graph_step_industry_research", None),
+        (
+            "graph_step_internal_knowledge",
+            "join_graph_step_credit_risk_needs_review_gate",
+            "needs_review",
+        ),
+        (
+            "join_graph_step_credit_risk_needs_review_gate",
+            "join_graph_step_credit_risk",
+            None,
+        ),
+        (
+            "graph_step_industry_research",
+            "join_graph_step_credit_risk",
+            None,
+        ),
+        ("join_graph_step_credit_risk", "graph_step_credit_risk", None),
+    }
+
+
+def test_graph_builder_uses_unique_join_names_for_colliding_route_suffixes() -> None:
+    # Arrange
+    plan = _colliding_route_conditional_fan_in_plan()
+    builder = GraphBuilder(registry=_registry_for(plan))
+
+    # Act
+    result = builder.build(_approval_record_for(plan))
+
+    # Assert
+    synthesis_join_names = [
+        name
+        for name in result.runtime.node_names
+        if name.startswith("join_graph_step_synthesis_needs_review")
+    ]
+    assert synthesis_join_names == [
+        "join_graph_step_synthesis_needs_review_route1",
+        "join_graph_step_synthesis_needs_review_route2",
+    ]
+    assert _runtime_edges(result) == {
+        ("__START__", "graph_step_internal_knowledge", None),
+        ("__START__", "graph_step_industry_research", None),
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_credit_risk",
+            "needs-review",
+        ),
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_compliance_policy",
+            "needs_review",
+        ),
+        (
+            "graph_step_credit_risk",
+            "join_graph_step_synthesis_needs_review_route1",
+            None,
+        ),
+        (
+            "graph_step_industry_research",
+            "join_graph_step_synthesis_needs_review_route1",
+            None,
+        ),
+        (
+            "join_graph_step_synthesis_needs_review_route1",
+            "graph_step_synthesis",
+            None,
+        ),
+        (
+            "graph_step_compliance_policy",
+            "join_graph_step_synthesis_needs_review_route2",
+            None,
+        ),
+        (
+            "graph_step_industry_research",
+            "join_graph_step_synthesis_needs_review_route2",
+            None,
+        ),
+        (
+            "join_graph_step_synthesis_needs_review_route2",
+            "graph_step_synthesis",
+            None,
+        ),
+    }
+
+
+def test_graph_builder_joins_mixed_conditional_fan_in_branches() -> None:
+    # Arrange
+    plan = _mixed_conditional_fan_in_plan()
+    builder = GraphBuilder(registry=_registry_for(plan))
+
+    # Act
+    result = builder.build(_approval_record_for(plan))
+
+    # Assert
+    assert result.spec.pattern == "conditional"
+    assert {
+        (edge.from_step_id, edge.to_step_id, edge.condition)
+        for edge in result.spec.edges
+    } == {
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_data_quality",
+            "missing_internal_data",
+        ),
+        ("graph_step_data_quality", "graph_step_synthesis", None),
+        ("graph_step_industry_research", "graph_step_synthesis", None),
+        ("graph_step_internal_knowledge", "graph_step_synthesis", "__DEFAULT__"),
+    }
+    assert (
+        "join_graph_step_synthesis_missing_internal_data" in result.runtime.node_names
+    )
+    assert (
+        "join_graph_step_synthesis_default_gate" in result.runtime.node_names
+    )
+    assert "join_graph_step_synthesis_default" in result.runtime.node_names
+    assert _runtime_edges(result) == {
+        ("__START__", "graph_step_internal_knowledge", None),
+        ("__START__", "graph_step_industry_research", None),
+        (
+            "graph_step_internal_knowledge",
+            "graph_step_data_quality",
+            "missing_internal_data",
+        ),
+        (
+            "graph_step_data_quality",
+            "join_graph_step_synthesis_missing_internal_data",
+            None,
+        ),
+        (
+            "graph_step_industry_research",
+            "join_graph_step_synthesis_missing_internal_data",
+            None,
+        ),
+        (
+            "graph_step_internal_knowledge",
+            "join_graph_step_synthesis_default_gate",
+            "__DEFAULT__",
+        ),
+        (
+            "join_graph_step_synthesis_default_gate",
+            "join_graph_step_synthesis_default",
+            None,
+        ),
+        (
+            "graph_step_industry_research",
+            "join_graph_step_synthesis_default",
+            None,
+        ),
+        (
+            "join_graph_step_synthesis_missing_internal_data",
+            "graph_step_synthesis",
+            None,
+        ),
+        ("join_graph_step_synthesis_default", "graph_step_synthesis", None),
     }
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -18,12 +18,14 @@ from orchestrator_demo.contracts import (
     SpecialistRequest,
     SpecialistResponse,
 )
+from orchestrator_demo.orchestrator.specialist_invocation import (
+    SpecialistCallable,
+    SpecialistLike,
+    invoke_specialist,
+)
 
 if TYPE_CHECKING:
     from orchestrator_demo.orchestrator.approval_state import ApprovalRecord
-
-
-SpecialistCallable = Callable[[SpecialistRequest], Awaitable[SpecialistResponse]]
 
 
 class SpecialistPreApprovalError(RuntimeError):
@@ -42,6 +44,9 @@ class _ApprovedStepPayload:
     agent_id: str
     user_input: str
     context: Mapping[str, Any]
+    dependency_output_alternates: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
 
 
 def _new_plan_scope_id() -> str:
@@ -88,6 +93,11 @@ class RequestContext:
         init=False,
         repr=False,
     )
+    _specialist_surface_owners: dict[str, str] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def approved_plan_step_agents(self) -> Mapping[str, Mapping[str, str]]:
@@ -100,11 +110,18 @@ class RequestContext:
         return MappingProxyType(self._approved_plan_step_payloads)
 
     @property
+    def specialist_surface_owners(self) -> Mapping[str, str]:
+        return MappingProxyType(self._specialist_surface_owners)
+
+    @property
     def has_structured_approval(self) -> bool:
         return (
             self.approved_plan_id is not None
             and self.approved_plan_id in self._approved_plan_step_payloads
         )
+
+    def specialist_owner_for_surface(self, surface_id: str) -> str | None:
+        return self._specialist_surface_owners.get(surface_id)
 
     def record_draft_plan(self, plan: ExecutionPlan) -> None:
         self._require_plan_matches_request_scope(plan)
@@ -134,6 +151,9 @@ class RequestContext:
                     context=_freeze_approval_value(
                         _approved_step_context(plan, step)
                     ),
+                    dependency_output_alternates=MappingProxyType(
+                        _conditional_default_dependency_alternates(plan, step)
+                    ),
                 )
                 for step in plan.steps
             }
@@ -160,17 +180,15 @@ class RequestContext:
         self._approved_plan_step_agents[plan.plan_id] = approved_step_agents
         self._approved_plan_step_payloads[plan.plan_id] = approved_step_payloads
 
-    def rollback_plan_approval(self, plan: ExecutionPlan) -> None:
-        if self.approved_plan_id is None:
-            return
-        if self.approved_plan_id != plan.plan_id:
-            raise PlanApprovalStateError(
-                "cannot roll back approval for a different plan"
-            )
+    def reset_plan_approval(self, plan_id: str) -> None:
+        """Clear approval guard state after graph execution fails before commit."""
 
-        self._approved_plan_step_agents.pop(plan.plan_id, None)
-        self._approved_plan_step_payloads.pop(plan.plan_id, None)
+        if self.approved_plan_id != plan_id:
+            return
+
         self.approved_plan_id = None
+        self._approved_plan_step_agents.pop(plan_id, None)
+        self._approved_plan_step_payloads.pop(plan_id, None)
 
     def _require_plan_matches_current_draft(
         self,
@@ -288,6 +306,7 @@ class RequestContext:
             if not _approved_context_allows_request_context(
                 request.context,
                 approved_payload.context,
+                approved_payload.dependency_output_alternates,
             ):
                 raise SpecialistPreApprovalError(
                     "complex route specialist call context must match the approved "
@@ -298,6 +317,24 @@ class RequestContext:
         raise SpecialistPreApprovalError(
             "specialist calls are not allowed while clarification is required"
         )
+
+    def record_specialist_surface_owner(
+        self,
+        *,
+        surface_id: str | None,
+        agent_id: str,
+    ) -> None:
+        if surface_id is None:
+            return
+
+        existing_owner = self._specialist_surface_owners.get(surface_id)
+        if existing_owner is not None and existing_owner != agent_id:
+            raise SpecialistPreApprovalError(
+                "specialist surface owner conflict for "
+                f"{surface_id!r}: expected {existing_owner!r}, got {agent_id!r}"
+            )
+
+        self._specialist_surface_owners[surface_id] = agent_id
 
 
 def _approved_step_context(
@@ -336,6 +373,7 @@ def _approval_record_matches_approved_plan(
 def _approved_context_allows_request_context(
     request_context: Mapping[str, Any],
     approved_context: Mapping[str, Any],
+    dependency_output_alternates: Mapping[str, tuple[str, ...]],
 ) -> bool:
     approved_keys = set(approved_context)
     request_keys = set(request_context)
@@ -366,6 +404,7 @@ def _approved_context_allows_request_context(
         if not _runtime_dependency_outputs_allowed(
             request_context[key],
             allowed_dependency_ids,
+            dependency_output_alternates,
         ):
             return False
 
@@ -375,6 +414,7 @@ def _approved_context_allows_request_context(
 def _runtime_dependency_outputs_allowed(
     value: Any,
     allowed_dependency_ids: set[str],
+    dependency_output_alternates: Mapping[str, tuple[str, ...]],
 ) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -385,7 +425,32 @@ def _runtime_dependency_outputs_allowed(
             return False
         dependency_ids.add(step_id)
 
-    return dependency_ids == allowed_dependency_ids
+    allowed_dependency_sets = {frozenset(allowed_dependency_ids)}
+    for dependency_id, alternates in dependency_output_alternates.items():
+        if dependency_id not in allowed_dependency_ids:
+            continue
+        alternate_ids = set(allowed_dependency_ids)
+        alternate_ids.remove(dependency_id)
+        alternate_ids.update(alternates)
+        allowed_dependency_sets.add(frozenset(alternate_ids))
+
+    return frozenset(dependency_ids) in allowed_dependency_sets
+
+
+def _conditional_default_dependency_alternates(
+    plan: ExecutionPlan,
+    step: PlanStep,
+) -> dict[str, tuple[str, ...]]:
+    if step.agent_id != "synthesis":
+        return {}
+
+    alternates: dict[str, tuple[str, ...]] = {}
+    for candidate in plan.steps:
+        if candidate.agent_id != "data_quality" or len(candidate.depends_on) != 1:
+            continue
+        if candidate.step_id in step.depends_on:
+            alternates[candidate.step_id] = tuple(candidate.depends_on)
+    return alternates
 
 
 def _freeze_approval_value(value: Any) -> Any:
@@ -403,15 +468,47 @@ def _freeze_approval_value(value: Any) -> Any:
     return value
 
 
+def _freeze_static_runtime_context(
+    runtime_context: Mapping[str, Any],
+    approved_context: Mapping[str, Any],
+) -> Any:
+    static_context = dict(runtime_context)
+    if (
+        "upstream" not in approved_context
+        and _approved_context_has_dependencies(approved_context)
+    ):
+        static_context.pop("upstream", None)
+
+    return _freeze_approval_value(static_context)
+
+
+def _approved_context_has_dependencies(context: Mapping[str, Any]) -> bool:
+    depends_on = context.get("dependsOn", ())
+    if isinstance(depends_on, list | tuple | set | frozenset):
+        return len(depends_on) > 0
+    return bool(depends_on)
+
+
 async def call_specialist_with_guard(
     context: RequestContext,
     request: SpecialistRequest,
-    specialist: SpecialistCallable,
+    specialist: SpecialistLike,
+    *,
+    enforce_response_agent_id: bool = True,
 ) -> SpecialistResponse:
     """Apply request guardrails before invoking a specialist."""
 
     context.require_specialist_call_allowed(request)
-    return await specialist(request)
+    response = await invoke_specialist(
+        specialist,
+        request,
+        enforce_response_agent_id=enforce_response_agent_id,
+    )
+    context.record_specialist_surface_owner(
+        surface_id=response.surface_id,
+        agent_id=request.agent_id,
+    )
+    return response
 
 
 __all__ = [

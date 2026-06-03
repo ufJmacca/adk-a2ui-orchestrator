@@ -7,8 +7,12 @@ from typing import Any
 
 import pytest
 
+from orchestrator_demo.agents import build_default_specialists
 from orchestrator_demo.a2a_support.transport import DataPart
-from orchestrator_demo.a2ui_support.schema_manager import A2UI_VERSION, BASIC_CATALOG_ID
+from orchestrator_demo.a2ui_support.schema_manager import (
+    A2UI_VERSION,
+    BASIC_CATALOG_ID,
+)
 from orchestrator_demo.contracts import (
     AgentDescriptor,
     ExecutionPlan,
@@ -18,14 +22,13 @@ from orchestrator_demo.contracts import (
     SpecialistRequest,
     SpecialistResponse,
 )
-from orchestrator_demo.orchestrator.approval_state import PlanMutationError
 from orchestrator_demo.orchestrator.graph_runtime import (
     GraphExecutionResult,
-    OwnedSpecialistResponse,
+    GraphRuntimeError,
     build_graph_spec,
 )
 from orchestrator_demo.orchestrator.service import OrchestratorService
-from orchestrator_demo.registry.agent_registry import AgentRegistry
+from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
 
 
 class RecordingSlmIntentClient:
@@ -76,22 +79,21 @@ class RecordingUserActionAdapter:
         )
 
 
-class MisreportingA2uiUserActionAdapter:
-    async def handle_user_action(self, _user_action: Any) -> SpecialistResponse:
+class CamelCaseA2uiUserActionAdapter:
+    async def handle_user_action(self, _user_action: Any) -> dict[str, Any]:
         surface_id = "surface_product_opportunity_detail"
-        return SpecialistResponse(
-            response_id="response_product_opportunity_detail",
-            agent_id="internal_knowledge",
-            content="Product Opportunity Agent: follow-up detail.",
-            structured_output={"status": "handled"},
-            surface_id=surface_id,
-            a2ui_payload=[
+        return {
+            "response_id": "response_product_opportunity_user_action_detail",
+            "agent_id": "product_opportunity",
+            "content": "Product Opportunity Agent: detail surface ready.",
+            "structured_output": {"status": "handled"},
+            "a2uiPayload": [
                 {
                     "version": A2UI_VERSION,
                     "createSurface": {
                         "surfaceId": surface_id,
                         "catalogId": BASIC_CATALOG_ID,
-                    }
+                    },
                 },
                 {
                     "version": A2UI_VERSION,
@@ -99,157 +101,261 @@ class MisreportingA2uiUserActionAdapter:
                         "surfaceId": surface_id,
                         "components": [
                             {
-                                "id": "detail",
                                 "component": "Text",
-                                "text": "Follow-up detail.",
+                                "id": "root",
+                                "text": "More product detail.",
                             }
                         ],
-                    }
+                    },
                 },
             ],
+            "surfaceId": surface_id,
+        }
+
+
+class MixedValidityA2uiUserActionAdapter:
+    async def handle_user_action(self, user_action: Any) -> SpecialistResponse:
+        original_surface_id = user_action["userAction"]["surfaceId"]
+        detail_surface_id = "surface_product_opportunity_mixed_detail"
+        return SpecialistResponse(
+            response_id="response_product_opportunity_mixed_invalid_a2ui",
+            agent_id="product_opportunity",
+            content="Product Opportunity Agent: mixed follow-up details.",
+            structured_output={"status": "handled"},
+            a2ui_payload=[
+                {
+                    "version": A2UI_VERSION,
+                    "deleteSurface": {"surfaceId": original_surface_id},
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "createSurface": {
+                        "surfaceId": detail_surface_id,
+                        "catalogId": BASIC_CATALOG_ID,
+                    },
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": detail_surface_id,
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": "Text",
+                                "text": "Follow-up details.",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": "surface_invalid_specialist_delta",
+                        "components": [],
+                    },
+                },
+            ],
+            surface_id=detail_surface_id,
         )
 
 
-class RecordingDynamicSpecialist:
-    def __init__(self, agent_id: str) -> None:
-        self._agent_id = agent_id
+class CustomInsightsSpecialist:
+    agent_id = "custom.insights"
+
+    def __init__(self) -> None:
         self.call_count = 0
         self.calls: list[SpecialistRequest] = []
 
+    async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
+        self.call_count += 1
+        self.calls.append(request)
+        return SpecialistResponse(
+            response_id=f"response_{request.request_id}",
+            agent_id=request.agent_id,
+            content="Custom Insights Agent: completed.",
+            structured_output={"request_id": request.request_id},
+        )
+
+
+class InvalidA2uiSpecialist:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
     @property
     def agent_id(self) -> str:
-        return self._agent_id
+        return self._delegate.agent_id
+
+    @property
+    def call_count(self) -> int:
+        return self._delegate.call_count
+
+    @property
+    def calls(self) -> list[SpecialistRequest]:
+        return self._delegate.calls
+
+    async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
+        response = await self._delegate.handle(request)
+        return response.model_copy(
+            update={
+                "a2ui_payload": [
+                    {
+                        "version": A2UI_VERSION,
+                        "updateComponents": {
+                            "surfaceId": "surface_invalid_specialist_delta",
+                            "components": [],
+                        },
+                    }
+                ],
+                "surface_id": "surface_invalid_specialist_delta",
+            }
+        )
+
+
+class OwnershipFailingA2uiSpecialist:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    @property
+    def agent_id(self) -> str:
+        return self._delegate.agent_id
+
+    @property
+    def call_count(self) -> int:
+        return self._delegate.call_count
+
+    @property
+    def calls(self) -> list[SpecialistRequest]:
+        return self._delegate.calls
+
+    async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
+        response = await self._delegate.handle(request)
+        surface_id = "surface_plan_specialist_claim"
+        return response.model_copy(
+            update={
+                "a2ui_payload": [
+                    {
+                        "version": A2UI_VERSION,
+                        "createSurface": {
+                            "surfaceId": surface_id,
+                            "catalogId": BASIC_CATALOG_ID,
+                        },
+                    },
+                    {
+                        "version": A2UI_VERSION,
+                        "updateComponents": {
+                            "surfaceId": surface_id,
+                            "components": [
+                                {
+                                    "component": "Text",
+                                    "id": "root",
+                                    "text": "Specialist-owned plan prefix claim.",
+                                }
+                            ],
+                        },
+                    },
+                ],
+                "surface_id": surface_id,
+            }
+        )
+
+
+class SpoofedA2uiSpecialist:
+    agent_id = "product_opportunity"
+
+    def __init__(
+        self,
+        *,
+        surface_id: str = "surface_product_opportunity_spoofed",
+        response_agent_id: str = "internal_knowledge",
+    ) -> None:
+        self.surface_id = surface_id
+        self.response_agent_id = response_agent_id
+        self.call_count = 0
+        self.calls: list[SpecialistRequest] = []
 
     async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
         self.call_count += 1
         self.calls.append(request)
         return SpecialistResponse(
-            response_id=f"response_{request.request_id.removeprefix('request_')}",
-            agent_id=request.agent_id,
-            content="Dynamic specialist handled.",
+            response_id=f"response_{request.request_id}",
+            agent_id=self.response_agent_id,
+            content="Product Opportunity Agent: completed with A2UI.",
+            structured_output={"request_id": request.request_id},
+            a2ui_payload=_specialist_a2ui(self.surface_id),
+            surface_id=self.surface_id,
         )
 
 
-class RecordingA2uiActionSpecialist(RecordingDynamicSpecialist):
-    def __init__(self, agent_id: str) -> None:
-        super().__init__(agent_id)
-        self.received_user_actions: list[Any] = []
+class ToggleFailingSpecialist:
+    agent_id = "internal_knowledge"
+
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.calls: list[SpecialistRequest] = []
+        self.should_fail = True
 
     async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
         self.call_count += 1
         self.calls.append(request)
-        response_suffix = request.request_id.removeprefix("request_")
-        surface_id = f"surface_{response_suffix}"
+        if self.should_fail:
+            raise RuntimeError(
+                "Authorization: Bearer sk-or-service-secret for customer account 12345"
+            )
         return SpecialistResponse(
-            response_id=f"response_{response_suffix}",
-            agent_id=request.agent_id,
-            content="Dynamic specialist returned A2UI.",
-            a2ui_payload=_specialist_a2ui_payload(surface_id),
-            surface_id=surface_id,
-        )
-
-    async def handle_user_action(self, user_action: Any) -> SpecialistResponse:
-        self.received_user_actions.append(user_action)
-        return SpecialistResponse(
-            response_id=f"response_{self.agent_id}_user_action_forwarded",
+            response_id=f"response_{request.request_id}",
             agent_id=self.agent_id,
-            content="Dynamic specialist handled forwarded A2UI user action.",
-            structured_output={"status": "forwarded_by_injected_specialist"},
+            content="Internal Knowledge Agent: recovered.",
+            structured_output={"status": "recovered"},
         )
 
 
-class StaticRegistry:
-    def __init__(self, descriptors: Sequence[AgentDescriptor]) -> None:
-        self._descriptors = [descriptor.model_copy(deep=True) for descriptor in descriptors]
+class SecretBearingA2uiSpecialist:
+    agent_id = "internal_knowledge"
 
-    def descriptors(self) -> list[AgentDescriptor]:
-        return [
-            descriptor.model_copy(deep=True) for descriptor in self._descriptors
-        ]
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.calls: list[SpecialistRequest] = []
 
-
-def _descriptor(agent_id: str) -> AgentDescriptor:
-    return AgentDescriptor(
-        agent_id=agent_id,
-        display_name=agent_id.replace("_", " ").title(),
-        capabilities=["business banking support"],
-        input_schema={"type": "object"},
-        output_schema={"type": "object"},
-        a2ui_catalogs=["basic"],
-        routing_examples=[f"Handle a {agent_id} request."],
-        execution_mode="local_llm",
-    )
-
-
-def _write_registry_config(path: Path, agent_ids: Sequence[str]) -> None:
-    descriptor_sources = [
-        repr(_descriptor(agent_id).model_dump(mode="json"))
-        for agent_id in agent_ids
-    ]
-    path.write_text(
-        "AVAILABLE_AGENTS = [\n"
-        + ",\n".join(descriptor_sources)
-        + "\n]\n",
-        encoding="utf-8",
-    )
+    async def handle(self, request: SpecialistRequest) -> SpecialistResponse:
+        self.call_count += 1
+        self.calls.append(request)
+        return SpecialistResponse(
+            response_id=f"response_{request.request_id}",
+            agent_id=self.agent_id,
+            content="Internal Knowledge Agent: completed with text fallback.",
+            structured_output={"status": "completed"},
+            a2ui_payload={
+                "version": "v0.9",
+                "updateComponents": {
+                    "surfaceId": "surface_internal_secret",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Text",
+                            "text": "Authorization: Bearer sk-or-service-secret",
+                        }
+                    ],
+                },
+            },
+            surface_id="surface_internal_secret",
+        )
 
 
-def _approve_event(plan_id: str, surface_id: str, step_ids: list[str]) -> dict[str, Any]:
+def _approve_event(
+    plan_id: str,
+    surface_id: str,
+    step_ids: list[str],
+    *,
+    plan_version: int = 1,
+) -> dict[str, Any]:
     return {
         "userAction": {
             "type": "approve_plan",
             "surfaceId": surface_id,
             "payload": {
                 "planId": plan_id,
-                "editedPlanVersion": 1,
-                "approvedStepIds": step_ids,
-            },
-        }
-    }
-
-
-def _specialist_a2ui_payload(surface_id: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "version": A2UI_VERSION,
-            "createSurface": {
-                "surfaceId": surface_id,
-                "catalogId": BASIC_CATALOG_ID,
-            },
-        },
-        {
-            "version": A2UI_VERSION,
-            "updateComponents": {
-                "surfaceId": surface_id,
-                "components": [
-                    {
-                        "id": f"component_{surface_id}",
-                        "component": "Text",
-                        "text": "Specialist UI.",
-                    }
-                ],
-            },
-        },
-    ]
-
-
-def _replace_agent_event(
-    plan_id: str,
-    surface_id: str,
-    *,
-    step_id: str,
-    replacement_agent_id: str,
-    plan_version: int = 1,
-) -> dict[str, Any]:
-    return {
-        "userAction": {
-            "type": "replace_agent",
-            "surfaceId": surface_id,
-            "payload": {
-                "planId": plan_id,
                 "editedPlanVersion": plan_version,
-                "stepId": step_id,
-                "replacementAgentId": replacement_agent_id,
+                "approvedStepIds": step_ids,
             },
         }
     }
@@ -294,6 +400,116 @@ def _add_instruction_event(
     }
 
 
+def _replace_agent_event(
+    plan_id: str,
+    surface_id: str,
+    *,
+    step_id: str,
+    replacement_agent_id: str,
+    plan_version: int = 1,
+) -> dict[str, Any]:
+    return {
+        "userAction": {
+            "type": "replace_agent",
+            "surfaceId": surface_id,
+            "payload": {
+                "planId": plan_id,
+                "editedPlanVersion": plan_version,
+                "stepId": step_id,
+                "replacementAgentId": replacement_agent_id,
+            },
+        }
+    }
+
+
+def _remove_step_event(
+    plan_id: str,
+    surface_id: str,
+    *,
+    step_id: str,
+    plan_version: int = 1,
+) -> dict[str, Any]:
+    return {
+        "userAction": {
+            "type": "remove_step",
+            "surfaceId": surface_id,
+            "payload": {
+                "planId": plan_id,
+                "editedPlanVersion": plan_version,
+                "stepId": step_id,
+            },
+        }
+    }
+
+
+def _descriptor_source(agent_id: str) -> str:
+    return f"""AgentDescriptor(
+        agent_id={agent_id!r},
+        display_name={agent_id.replace("_", " ").title()!r},
+        capabilities=["business banking support"],
+        input_schema={{"type": "object"}},
+        output_schema={{"type": "object"}},
+        a2ui_catalogs=["basic"],
+        routing_examples=["Handle a {agent_id} request."],
+        execution_mode="local_llm",
+    )"""
+
+
+def _write_registry_config(path: Path, agent_ids: list[str]) -> None:
+    path.write_text(
+        "from orchestrator_demo.contracts import AgentDescriptor\n\n"
+        "AVAILABLE_AGENTS = [\n"
+        + ",\n".join(_descriptor_source(agent_id) for agent_id in agent_ids)
+        + "\n]\n",
+        encoding="utf-8",
+    )
+
+
+def _specialist_a2ui(surface_id: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": surface_id,
+                "catalogId": BASIC_CATALOG_ID,
+            },
+        },
+        {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                    {
+                        "component": "Text",
+                        "id": "root",
+                        "text": "Specialist details.",
+                    }
+                ],
+            },
+        },
+    ]
+
+
+def _complex_internal_knowledge_classifier() -> tuple[
+    RecordingSlmIntentClient,
+    RecordingIntentClassifier,
+]:
+    return (
+        RecordingSlmIntentClient(
+            IntentSuggestion(intent="meeting_prep", confidence=0.9)
+        ),
+        RecordingIntentClassifier(
+            LlmIntentAssessment(
+                intents=["meeting_prep"],
+                confidence=0.94,
+                complexity="complex",
+                required_agents=["internal_knowledge", "synthesis"],
+                rationale="Injected two-step workflow.",
+            )
+        ),
+    )
+
+
 def _action_contexts_by_type(
     a2ui_part: DataPart,
 ) -> dict[str, dict[str, Any]]:
@@ -328,6 +544,250 @@ async def test_simple_direct_request_returns_one_specialist_response_no_approval
         "internal_knowledge"
     ]
     assert service.specialist_call_counts() == {"internal_knowledge": 1}
+
+
+@pytest.mark.asyncio
+async def test_direct_route_missing_specialist_handler_returns_clarification(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(config_path, ["custom_insights"])
+    registry = AgentRegistry.from_config_path(config_path)
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="internal_knowledge", confidence=0.95)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["internal_knowledge"],
+            confidence=0.95,
+            complexity="simple",
+            required_agents=["custom_insights"],
+            rationale="Injected route to a registry agent with no local handler.",
+        )
+    )
+    service = OrchestratorService(
+        registry=registry,
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+
+    # Act
+    result = await service.handle_user_request(
+        "Use the custom insights agent for this direct request."
+    )
+
+    # Assert
+    assert result.path == "clarification_required"
+    assert result.decision.path == "clarification_required"
+    assert result.context.decision.path == "clarification_required"
+    assert result.decision.selected_agent is None
+    assert "custom_insights" in result.decision.reason
+    assert result.specialist_responses == ()
+    assert result.a2ui_parts == ()
+    assert service.specialist_call_counts() == {}
+
+
+@pytest.mark.asyncio
+async def test_direct_route_slugs_custom_agent_id_in_specialist_request(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(config_path, ["custom.insights"])
+    registry = AgentRegistry.from_config_path(config_path)
+    specialist = CustomInsightsSpecialist()
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="internal_knowledge", confidence=0.95)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["internal_knowledge"],
+            confidence=0.95,
+            complexity="simple",
+            required_agents=["custom.insights"],
+            rationale="Injected direct route to a custom registry agent.",
+        )
+    )
+    service = OrchestratorService(
+        registry=registry,
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists={"custom.insights": specialist},
+    )
+
+    # Act
+    result = await service.handle_user_request(
+        "Use the custom insights agent for this direct request."
+    )
+
+    # Assert
+    assert result.path == "direct"
+    assert specialist.call_count == 1
+    request = specialist.calls[0]
+    assert request.agent_id == "custom.insights"
+    assert request.request_id == (
+        f"request_direct_{result.context.plan_scope_id}_custom_insights"
+    )
+    assert "." not in request.request_id
+    assert result.specialist_responses[0].structured_output["request_id"] == (
+        request.request_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_specialist_map_is_honored_for_direct_routes() -> None:
+    # Arrange
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="internal_knowledge", confidence=0.95)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["internal_knowledge"],
+            confidence=0.95,
+            complexity="simple",
+            required_agents=["internal_knowledge"],
+            rationale="Injected direct route with no executable handlers.",
+        )
+    )
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists={},
+    )
+
+    # Act
+    result = await service.handle_user_request("Summarize internal notes.")
+
+    # Assert
+    assert result.path == "clarification_required"
+    assert result.decision.selected_agent is None
+    assert "internal_knowledge" in result.decision.reason
+    assert result.specialist_responses == ()
+    assert result.a2ui_parts == ()
+    assert service.specialist_call_counts() == {}
+
+
+@pytest.mark.asyncio
+async def test_direct_route_specialist_failure_is_redacted() -> None:
+    # Arrange
+    failing_specialist = ToggleFailingSpecialist()
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="internal_knowledge", confidence=0.95)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["internal_knowledge"],
+            confidence=0.95,
+            complexity="simple",
+            required_agents=["internal_knowledge"],
+            rationale="Injected direct route to a failing specialist.",
+        )
+    )
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists={"internal_knowledge": failing_specialist},
+    )
+
+    # Act / Assert
+    with pytest.raises(GraphRuntimeError) as exc_info:
+        await service.handle_user_request("Summarize internal notes.")
+
+    error_message = str(exc_info.value)
+    assert "RuntimeError. Error details redacted." in error_message
+    assert "Authorization" not in error_message
+    assert "sk-or-service-secret" not in error_message
+    assert failing_specialist.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_direct_a2ui_requests_get_unique_response_and_surface_ids() -> None:
+    # Arrange
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="product_opportunity", confidence=0.95)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["product_opportunity"],
+            confidence=0.95,
+            complexity="simple",
+            required_agents=["product_opportunity"],
+            rationale="Injected single-agent product opportunity assessment.",
+        )
+    )
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+    user_input = "What product opportunities should I consider for a cafe business?"
+
+    # Act
+    first = await service.handle_user_request(user_input)
+    second = await service.handle_user_request(user_input)
+
+    # Assert
+    assert first.path == "direct"
+    assert second.path == "direct"
+    assert len(first.specialist_responses) == 1
+    assert len(second.specialist_responses) == 1
+    first_response = first.specialist_responses[0]
+    second_response = second.specialist_responses[0]
+
+    assert first_response.response_id != second_response.response_id
+    assert first_response.surface_id is not None
+    assert second_response.surface_id is not None
+    assert first_response.surface_id != second_response.surface_id
+    assert first_response.structured_output["request_id"] != (
+        second_response.structured_output["request_id"]
+    )
+    first_owner = service.surface_owner(first_response.surface_id)
+    second_owner = service.surface_owner(second_response.surface_id)
+    assert first_owner is not None
+    assert second_owner is not None
+    assert first_owner.owner_id == "product_opportunity"
+    assert second_owner.owner_id == "product_opportunity"
+
+
+@pytest.mark.asyncio
+async def test_direct_a2ui_surface_owner_uses_invoked_agent_not_response_agent() -> None:
+    # Arrange
+    spoofing_specialist = SpoofedA2uiSpecialist()
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="product_opportunity", confidence=0.95)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["product_opportunity"],
+            confidence=0.95,
+            complexity="simple",
+            required_agents=["product_opportunity"],
+            rationale="Injected direct route with spoofed response metadata.",
+        )
+    )
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists={"product_opportunity": spoofing_specialist},
+    )
+
+    # Act
+    result = await service.handle_user_request(
+        "What product opportunities should I consider for a cafe business?"
+    )
+
+    # Assert
+    assert result.path == "direct"
+    assert result.specialist_responses[0].agent_id == "internal_knowledge"
+    assert len(result.a2ui_parts) == 2
+    owner = service.surface_owner(spoofing_specialist.surface_id)
+    assert owner is not None
+    assert owner.owner_type == "specialist"
+    assert owner.owner_id == "product_opportunity"
 
 
 @pytest.mark.asyncio
@@ -468,6 +928,68 @@ async def test_complex_request_returns_approval_plan_before_specialist_call() ->
 
 
 @pytest.mark.asyncio
+async def test_complex_request_with_missing_specialist_handler_returns_clarification() -> None:
+    # Arrange
+    specialists = build_default_specialists()
+    internal_knowledge = specialists["internal_knowledge"]
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists={"internal_knowledge": internal_knowledge},
+    )
+
+    # Act
+    result = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+
+    # Assert
+    assert result.path == "clarification_required"
+    assert result.approval_plan is None
+    assert result.specialist_responses == ()
+    assert result.a2ui_parts == ()
+    assert "synthesis" in result.decision.reason
+    assert service.specialist_call_counts() == {}
+
+
+@pytest.mark.asyncio
+async def test_unformable_plan_returns_clarification_instead_of_planner_error() -> None:
+    # Arrange
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="meeting_prep", confidence=0.9)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.94,
+            complexity="complex",
+            required_agents=["synthesis"],
+            rationale="Injected synthesis-only plan assessment.",
+        )
+    )
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+
+    # Act
+    result = await service.handle_user_request(
+        "Synthesize the answer without any source workstream."
+    )
+
+    # Assert
+    assert result.path == "clarification_required"
+    assert result.decision.path == "clarification_required"
+    assert result.context.decision.path == "clarification_required"
+    assert "no available non-synthesis specialist workstream" in result.decision.reason
+    assert result.approval_plan is None
+    assert result.specialist_responses == ()
+    assert result.a2ui_parts == ()
+    assert service.specialist_call_counts() == {}
+
+
+@pytest.mark.asyncio
 async def test_approval_action_freezes_plan_executes_graph_and_returns_artifacts() -> None:
     # Arrange
     service = OrchestratorService()
@@ -527,76 +1049,177 @@ async def test_approval_action_freezes_plan_executes_graph_and_returns_artifacts
     assert result.final_artifacts["final_response"].agent_id == "synthesis"
 
 
-def test_graph_a2ui_surfaces_use_carried_owner_for_out_of_order_responses() -> None:
+@pytest.mark.asyncio
+async def test_approval_returns_graph_result_when_specialist_a2ui_is_invalid() -> None:
+    # Arrange
+    invalid_a2ui_specialist = SecretBearingA2uiSpecialist()
+    specialists = build_default_specialists()
+    specialists["internal_knowledge"] = invalid_a2ui_specialist
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists=specialists,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+    assert proposed.approval_plan is not None
+    plan_id = proposed.approval_plan.plan_id
+    surface_id = proposed.approval_plan.approval_surface_id or ""
+    step_ids = [step.step_id for step in proposed.approval_plan.steps]
+
+    # Act
+    result = await service.handle_user_action(
+        _approve_event(plan_id, surface_id, step_ids)
+    )
+
+    # Assert
+    assert result.status == "approved"
+    assert result.graph_execution is not None
+    assert [response.agent_id for response in result.specialist_responses] == [
+        "internal_knowledge",
+        "synthesis",
+    ]
+    fallback_response = result.specialist_responses[0]
+    assert fallback_response.a2ui_payload is not None
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert any(
+        part.data.get("deleteSurface", {}).get("surfaceId") == surface_id
+        for part in result.a2ui_parts
+    )
+    assert any(
+        part.data.get("updateComponents", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in result.a2ui_parts
+    )
+    assert result.final_artifacts["final_response"].agent_id == "synthesis"
+    record = service.approval_record(plan_id)
+    assert record.status == "approved"
+    assert record.approved_plan is not None
+    assert invalid_a2ui_specialist.call_count == 1
+    assert service.surface_owner("surface_internal_secret") is None
+
+
+@pytest.mark.asyncio
+async def test_graph_a2ui_surface_owner_uses_invoked_step_agent_not_response_agent() -> None:
+    # Arrange
+    spoofing_specialist = SpoofedA2uiSpecialist(
+        surface_id="surface_internal_graph_spoofed",
+        response_agent_id="product_opportunity",
+    )
+    specialists = build_default_specialists()
+    specialists["internal_knowledge"] = spoofing_specialist
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists=specialists,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+    assert proposed.approval_plan is not None
+
+    # Act
+    result = await service.handle_user_action(
+        _approve_event(
+            proposed.approval_plan.plan_id,
+            proposed.approval_plan.approval_surface_id or "",
+            [step.step_id for step in proposed.approval_plan.steps],
+        )
+    )
+
+    # Assert
+    assert result.status == "approved"
+    assert result.graph_execution is not None
+    assert result.specialist_responses[0].agent_id == "product_opportunity"
+    specialist_parts = [
+        part for part in result.a2ui_parts if "deleteSurface" not in part.data
+    ]
+    assert len(specialist_parts) == 2
+    owner = service.surface_owner(spoofing_specialist.surface_id)
+    assert owner is not None
+    assert owner.owner_type == "specialist"
+    assert owner.owner_id == "internal_knowledge"
+
+
+def test_graph_a2ui_surface_owner_uses_response_request_completion_order() -> None:
     # Arrange
     service = OrchestratorService()
     plan = ExecutionPlan(
-        plan_id="plan_parallel_owner",
-        objective="Prepare parallel owned specialist UIs.",
+        plan_id="plan_parallel_owner_registration",
+        objective="Prepare parallel context.",
         detected_intents=["meeting_prep"],
-        selected_agents=["relationship_summary", "product_opportunity"],
+        selected_agents=[
+            "relationship_summary",
+            "internal_knowledge",
+            "synthesis",
+        ],
         steps=[
             PlanStep(
-                step_id="step_slow_branch",
+                step_id="step_relationship_summary",
                 agent_id="relationship_summary",
-                instruction="Summarize the relationship.",
-                expected_output="Relationship summary.",
-                parallel_group="parallel_owner_check",
+                instruction="Summarize relationship history.",
+                expected_output="Relationship context.",
+                parallel_group="parallel_context",
             ),
             PlanStep(
-                step_id="step_fast_branch",
-                agent_id="product_opportunity",
-                instruction="Find product opportunities.",
-                expected_output="Product opportunities.",
-                parallel_group="parallel_owner_check",
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review internal notes.",
+                expected_output="Internal context.",
+                parallel_group="parallel_context",
+            ),
+            PlanStep(
+                step_id="step_synthesis",
+                agent_id="synthesis",
+                instruction="Synthesize the brief.",
+                expected_output="Final brief.",
+                depends_on=[
+                    "step_relationship_summary",
+                    "step_internal_knowledge",
+                ],
             ),
         ],
-        approval_surface_id="surface_plan_parallel_owner",
+        approval_surface_id="surface_plan_parallel_owner_registration",
     )
-    slow_request = SpecialistRequest(
-        request_id="request_parallel_owner_slow",
-        user_input="Summarize the relationship.",
+    relationship_request = SpecialistRequest(
+        request_id="request_parallel_relationship",
+        user_input="Summarize relationship history.",
         agent_id="relationship_summary",
         plan_id=plan.plan_id,
-        step_id="step_slow_branch",
+        step_id="step_relationship_summary",
     )
-    fast_request = SpecialistRequest(
-        request_id="request_parallel_owner_fast",
-        user_input="Find product opportunities.",
-        agent_id="product_opportunity",
-        plan_id=plan.plan_id,
-        step_id="step_fast_branch",
-    )
-    fast_response = SpecialistResponse(
-        response_id="response_parallel_owner_fast",
+    internal_request = SpecialistRequest(
+        request_id="request_parallel_internal",
+        user_input="Review internal notes.",
         agent_id="internal_knowledge",
-        content="Product Opportunity Agent: fast branch completed.",
-        surface_id="surface_product_opportunity_fast",
-        a2ui_payload=_specialist_a2ui_payload("surface_product_opportunity_fast"),
+        plan_id=plan.plan_id,
+        step_id="step_internal_knowledge",
     )
-    slow_response = SpecialistResponse(
-        response_id="response_parallel_owner_slow",
+    relationship_response = SpecialistResponse(
+        response_id="response_parallel_relationship",
         agent_id="relationship_summary",
-        content="Relationship Summary Agent: slow branch completed.",
-        surface_id="surface_relationship_summary_slow",
-        a2ui_payload=_specialist_a2ui_payload("surface_relationship_summary_slow"),
+        content="Relationship Summary Agent: completed with A2UI.",
+        a2ui_payload=_specialist_a2ui("surface_relationship_parallel"),
+        surface_id="surface_relationship_parallel",
+    )
+    internal_response = SpecialistResponse(
+        response_id="response_parallel_internal",
+        agent_id="internal_knowledge",
+        content="Internal Knowledge Agent: completed with A2UI.",
+        a2ui_payload=_specialist_a2ui("surface_internal_parallel"),
+        surface_id="surface_internal_parallel",
     )
     graph_execution = GraphExecutionResult(
         graph=build_graph_spec(plan),
         workflow=object(),
         status_events=(),
-        specialist_requests=(slow_request, fast_request),
-        specialist_responses=(fast_response, slow_response),
-        owned_specialist_responses=(
-            OwnedSpecialistResponse(
-                owner_agent_id="product_opportunity",
-                response=fast_response,
-            ),
-            OwnedSpecialistResponse(
-                owner_agent_id="relationship_summary",
-                response=slow_response,
-            ),
-        ),
+        specialist_requests=(relationship_request, internal_request),
+        specialist_responses=(internal_response, relationship_response),
+        specialist_response_requests=(internal_request, relationship_request),
         adk_event_outputs=(),
     )
 
@@ -605,12 +1228,64 @@ def test_graph_a2ui_surfaces_use_carried_owner_for_out_of_order_responses() -> N
 
     # Assert
     assert len(parts) == 4
-    fast_owner = service.surface_owner("surface_product_opportunity_fast")
-    assert fast_owner is not None
-    assert fast_owner.owner_id == "product_opportunity"
-    slow_owner = service.surface_owner("surface_relationship_summary_slow")
-    assert slow_owner is not None
-    assert slow_owner.owner_id == "relationship_summary"
+    internal_owner = service.surface_owner("surface_internal_parallel")
+    relationship_owner = service.surface_owner("surface_relationship_parallel")
+    assert internal_owner is not None
+    assert relationship_owner is not None
+    assert internal_owner.owner_id == "internal_knowledge"
+    assert relationship_owner.owner_id == "relationship_summary"
+
+
+@pytest.mark.asyncio
+async def test_failed_graph_execution_resets_request_approval_for_recovery() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.graph_runtime import GraphRuntimeError
+
+    failing_specialist = ToggleFailingSpecialist()
+    specialists = build_default_specialists()
+    specialists["internal_knowledge"] = failing_specialist
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+        specialists=specialists,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+    assert proposed.approval_plan is not None
+    plan_id = proposed.approval_plan.plan_id
+    surface_id = proposed.approval_plan.approval_surface_id or ""
+    step_ids = [step.step_id for step in proposed.approval_plan.steps]
+
+    # Act / Assert
+    with pytest.raises(GraphRuntimeError) as exc_info:
+        await service.handle_user_action(_approve_event(plan_id, surface_id, step_ids))
+
+    assert "Authorization: Bearer" not in str(exc_info.value)
+    failed_record = service.approval_record(plan_id)
+    assert failed_record.status == "draft"
+    assert failed_record.approved_plan is None
+
+    edited = await service.handle_user_action(
+        _add_instruction_event(
+            plan_id,
+            surface_id,
+            step_id="step_internal_knowledge",
+        )
+    )
+    assert edited.status == "draft_updated"
+    assert service.approval_record(plan_id).draft_plan.plan_version == 2
+
+    failing_specialist.should_fail = False
+    approved = await service.handle_user_action(
+        _approve_event(plan_id, surface_id, step_ids, plan_version=2)
+    )
+
+    assert approved.status == "approved"
+    assert approved.graph_execution is not None
+    assert service.approval_record(plan_id).status == "approved"
+    assert failing_specialist.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -656,6 +1331,242 @@ async def test_edit_and_reject_actions_follow_approval_state_rules() -> None:
 
 
 @pytest.mark.asyncio
+async def test_replace_agent_uses_live_registry_after_reload(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanMutationError
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(
+        config_path,
+        ["internal_knowledge", "credit_risk", "synthesis"],
+    )
+    registry = AgentRegistry.from_config_path(config_path)
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        registry=registry,
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+    assert proposed.approval_plan is not None
+    plan_id = proposed.approval_plan.plan_id
+    surface_id = proposed.approval_plan.approval_surface_id or ""
+
+    _write_registry_config(config_path, ["internal_knowledge", "synthesis"])
+    registry.reload()
+
+    # Act / Assert
+    with pytest.raises(PlanMutationError, match="replacement agent is unavailable"):
+        await service.handle_user_action(
+            _replace_agent_event(
+                plan_id,
+                surface_id,
+                step_id="step_internal_knowledge",
+                replacement_agent_id="credit_risk",
+            )
+        )
+
+    record = service.approval_record(plan_id)
+    assert record.status == "draft"
+    assert record.draft_plan.plan_version == 1
+    assert record.draft_plan.selected_agents == [
+        "internal_knowledge",
+        "synthesis",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_replace_agent_rejects_descriptor_without_specialist_handler(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanMutationError
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(
+        config_path,
+        ["internal_knowledge", "custom_insights", "synthesis"],
+    )
+    registry = AgentRegistry.from_config_path(config_path)
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        registry=registry,
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+    assert proposed.approval_plan is not None
+    plan_id = proposed.approval_plan.plan_id
+    surface_id = proposed.approval_plan.approval_surface_id or ""
+
+    # Act / Assert
+    with pytest.raises(
+        PlanMutationError,
+        match="agents without executable handlers: custom_insights",
+    ):
+        await service.handle_user_action(
+            _replace_agent_event(
+                plan_id,
+                surface_id,
+                step_id="step_internal_knowledge",
+                replacement_agent_id="custom_insights",
+            )
+        )
+
+    record = service.approval_record(plan_id)
+    assert record.status == "draft"
+    assert record.draft_plan.plan_version == 1
+    assert record.draft_plan.selected_agents == [
+        "internal_knowledge",
+        "synthesis",
+    ]
+    assert service.specialist_call_counts() == {}
+
+
+@pytest.mark.asyncio
+async def test_draft_can_repair_multiple_unavailable_agents_after_reload(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(
+        config_path,
+        ["internal_knowledge", "credit_risk", "product_opportunity", "synthesis"],
+    )
+    registry = AgentRegistry.from_config_path(config_path)
+    slm_client = RecordingSlmIntentClient(
+        IntentSuggestion(intent="meeting_prep", confidence=0.9)
+    )
+    intent_classifier = RecordingIntentClassifier(
+        LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.94,
+            complexity="complex",
+            required_agents=["internal_knowledge", "credit_risk", "synthesis"],
+            rationale="Injected two unavailable workstreams for repair.",
+        )
+    )
+    service = OrchestratorService(
+        registry=registry,
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a meeting brief with internal notes and credit risk."
+    )
+    assert proposed.approval_plan is not None
+    plan_id = proposed.approval_plan.plan_id
+    surface_id = proposed.approval_plan.approval_surface_id or ""
+    assert proposed.approval_plan.selected_agents == [
+        "internal_knowledge",
+        "credit_risk",
+        "synthesis",
+    ]
+
+    _write_registry_config(config_path, ["product_opportunity", "synthesis"])
+    registry.reload()
+
+    # Act
+    replaced = await service.handle_user_action(
+        _replace_agent_event(
+            plan_id,
+            surface_id,
+            step_id="step_internal_knowledge",
+            replacement_agent_id="product_opportunity",
+        )
+    )
+    removed = await service.handle_user_action(
+        _remove_step_event(
+            plan_id,
+            surface_id,
+            step_id="step_credit_risk",
+            plan_version=2,
+        )
+    )
+    repaired_record = service.approval_record(plan_id)
+    approved = await service.handle_user_action(
+        _approve_event(
+            plan_id,
+            surface_id,
+            [step.step_id for step in repaired_record.draft_plan.steps],
+            plan_version=3,
+        )
+    )
+
+    # Assert
+    assert replaced.status == "draft_updated"
+    assert removed.status == "draft_updated"
+    assert repaired_record.draft_plan.plan_version == 3
+    assert repaired_record.draft_plan.selected_agents == [
+        "product_opportunity",
+        "synthesis",
+    ]
+    assert [step.agent_id for step in repaired_record.draft_plan.steps] == [
+        "product_opportunity",
+        "synthesis",
+    ]
+    assert approved.status == "approved"
+    assert approved.graph_execution is not None
+    assert service.specialist_call_counts() == {
+        "product_opportunity": 1,
+        "synthesis": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_approve_plan_uses_live_registry_after_reload(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanMutationError
+    from orchestrator_demo.registry.agent_registry import AgentRegistry
+
+    config_path = tmp_path / "agent_config.py"
+    _write_registry_config(config_path, ["internal_knowledge", "synthesis"])
+    registry = AgentRegistry.from_config_path(config_path)
+    slm_client, intent_classifier = _complex_internal_knowledge_classifier()
+    service = OrchestratorService(
+        registry=registry,
+        slm_client=slm_client,
+        intent_classifier=intent_classifier,
+    )
+    proposed = await service.handle_user_request(
+        "Prepare a focused internal-knowledge workflow."
+    )
+    assert proposed.approval_plan is not None
+    plan_id = proposed.approval_plan.plan_id
+    surface_id = proposed.approval_plan.approval_surface_id or ""
+    step_ids = [step.step_id for step in proposed.approval_plan.steps]
+
+    _write_registry_config(config_path, ["synthesis"])
+    registry.reload()
+
+    # Act / Assert
+    with pytest.raises(
+        PlanMutationError,
+        match="plan references unavailable agents: internal_knowledge",
+    ):
+        await service.handle_user_action(
+            _approve_event(plan_id, surface_id, step_ids)
+        )
+
+    record = service.approval_record(plan_id)
+    assert record.status == "draft"
+    assert record.approved_plan is None
+    assert service.specialist_call_counts() == {}
+
+
+@pytest.mark.asyncio
 async def test_downstream_specialist_user_action_routes_by_surface_id_only() -> None:
     # Arrange
     adapter = RecordingUserActionAdapter()
@@ -690,444 +1601,6 @@ async def test_downstream_specialist_user_action_routes_by_surface_id_only() -> 
     assert adapter.received_user_actions == [user_action]
     assert adapter.received_user_actions[0] is user_action
     assert user_action == original_user_action
-
-
-@pytest.mark.asyncio
-async def test_injected_specialist_user_action_handler_is_used_by_default() -> None:
-    # Arrange
-    agent_id = "product_opportunity"
-    specialist = RecordingA2uiActionSpecialist(agent_id)
-    service = OrchestratorService(
-        registry=StaticRegistry([_descriptor(agent_id)]),
-        specialists={agent_id: specialist},
-        slm_client=RecordingSlmIntentClient(
-            IntentSuggestion(intent=agent_id, confidence=0.95)
-        ),
-        intent_classifier=RecordingIntentClassifier(
-            LlmIntentAssessment(
-                intents=[agent_id],
-                confidence=0.95,
-                complexity="simple",
-                required_agents=[agent_id],
-                rationale="Injected A2UI specialist route.",
-            )
-        ),
-    )
-    result = await service.handle_user_request(
-        "What product opportunities should I consider for a cafe business?"
-    )
-    surface_id = result.specialist_responses[0].surface_id
-    assert surface_id is not None
-    user_action = {
-        "userAction": {
-            "type": "specialist_action",
-            "surfaceId": surface_id,
-            "payload": {"action": "show_more_detail"},
-        }
-    }
-    original_user_action = deepcopy(user_action)
-
-    # Act
-    routed = await service.handle_user_action(user_action)
-
-    # Assert
-    assert routed.status == "forwarded"
-    assert specialist.received_user_actions == [user_action]
-    assert specialist.received_user_actions[0] is user_action
-    assert user_action == original_user_action
-    assert routed.specialist_responses[0].structured_output == {
-        "status": "forwarded_by_injected_specialist"
-    }
-    assert specialist.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_repeated_direct_a2ui_specialist_requests_use_distinct_surfaces() -> None:
-    # Arrange
-    service = OrchestratorService()
-    user_input = "What product opportunities should I consider for a cafe business?"
-
-    # Act
-    first = await service.handle_user_request(user_input)
-    second = await service.handle_user_request(user_input)
-
-    # Assert
-    assert first.path == "direct"
-    assert second.path == "direct"
-    first_response = first.specialist_responses[0]
-    second_response = second.specialist_responses[0]
-    assert first_response.response_id != second_response.response_id
-    assert first_response.surface_id is not None
-    assert second_response.surface_id is not None
-    assert first_response.surface_id != second_response.surface_id
-    assert first.a2ui_parts[0].data["createSurface"]["surfaceId"] == (
-        first_response.surface_id
-    )
-    assert second.a2ui_parts[0].data["createSurface"]["surfaceId"] == (
-        second_response.surface_id
-    )
-    assert service.surface_owner(first_response.surface_id).owner_id == (
-        "product_opportunity"
-    )
-    assert service.surface_owner(second_response.surface_id).owner_id == (
-        "product_opportunity"
-    )
-
-
-@pytest.mark.asyncio
-async def test_direct_request_sanitizes_dynamic_agent_id_in_generated_request_id() -> None:
-    # Arrange
-    dynamic_agent_id = "agent.v1"
-    specialist = RecordingDynamicSpecialist(dynamic_agent_id)
-    service = OrchestratorService(
-        registry=StaticRegistry([_descriptor(dynamic_agent_id)]),
-        specialists={dynamic_agent_id: specialist},
-        slm_client=RecordingSlmIntentClient(
-            IntentSuggestion(intent="internal_knowledge", confidence=0.95)
-        ),
-        intent_classifier=RecordingIntentClassifier(
-            LlmIntentAssessment(
-                intents=["internal_knowledge"],
-                confidence=0.95,
-                complexity="simple",
-                required_agents=[dynamic_agent_id],
-                rationale="Dynamic single-agent route.",
-            )
-        ),
-    )
-
-    # Act
-    result = await service.handle_user_request("Handle the dynamic agent request.")
-
-    # Assert
-    assert result.path == "direct"
-    assert [response.agent_id for response in result.specialist_responses] == [
-        dynamic_agent_id
-    ]
-    assert specialist.call_count == 1
-    assert specialist.calls[0].request_id.startswith("request_direct_agent_v1_")
-    assert "." not in specialist.calls[0].request_id
-
-
-@pytest.mark.asyncio
-async def test_direct_route_without_specialist_handler_returns_structured_error() -> None:
-    # Arrange
-    selected_agent = "remote_agent"
-    service = OrchestratorService(
-        registry=StaticRegistry([_descriptor(selected_agent)]),
-        slm_client=RecordingSlmIntentClient(
-            IntentSuggestion(intent="internal_knowledge", confidence=0.95)
-        ),
-        intent_classifier=RecordingIntentClassifier(
-            LlmIntentAssessment(
-                intents=["internal_knowledge"],
-                confidence=0.95,
-                complexity="simple",
-                required_agents=[selected_agent],
-                rationale="Descriptor-only direct route.",
-            )
-        ),
-    )
-
-    # Act
-    result = await service.handle_user_request("Handle this remote-only request.")
-
-    # Assert
-    assert result.path == "clarification_required"
-    assert result.decision.path == "clarification_required"
-    assert result.context.decision.path == "clarification_required"
-    assert result.specialist_responses == ()
-    assert result.a2ui_parts == ()
-    assert result.final_artifacts["error"] == {
-        "code": "specialist_handler_unavailable",
-        "agent_id": selected_agent,
-        "message": result.decision.reason,
-    }
-    assert selected_agent in result.decision.reason
-    assert service.specialist_call_counts() == {}
-
-
-@pytest.mark.asyncio
-async def test_empty_specialist_mapping_does_not_install_default_handlers() -> None:
-    # Arrange
-    selected_agent = "internal_knowledge"
-    service = OrchestratorService(
-        registry=StaticRegistry([_descriptor(selected_agent)]),
-        specialists={},
-        slm_client=RecordingSlmIntentClient(
-            IntentSuggestion(intent=selected_agent, confidence=0.95)
-        ),
-        intent_classifier=RecordingIntentClassifier(
-            LlmIntentAssessment(
-                intents=[selected_agent],
-                confidence=0.95,
-                complexity="simple",
-                required_agents=[selected_agent],
-                rationale="Intentional no-handler direct route.",
-            )
-        ),
-    )
-
-    # Act
-    result = await service.handle_user_request("Summarize the internal notes.")
-
-    # Assert
-    assert result.path == "clarification_required"
-    assert result.decision.path == "clarification_required"
-    assert result.specialist_responses == ()
-    assert result.a2ui_parts == ()
-    assert result.final_artifacts["error"] == {
-        "code": "specialist_handler_unavailable",
-        "agent_id": selected_agent,
-        "message": result.decision.reason,
-    }
-    assert service.specialist_call_counts() == {}
-
-
-@pytest.mark.asyncio
-async def test_complex_plan_without_specialist_handler_returns_structured_error() -> None:
-    # Arrange
-    selected_agent = "remote_agent"
-    service = OrchestratorService(
-        registry=StaticRegistry([_descriptor(selected_agent), _descriptor("synthesis")]),
-        slm_client=RecordingSlmIntentClient(
-            IntentSuggestion(intent="unknown", confidence=0.5)
-        ),
-        intent_classifier=RecordingIntentClassifier(
-            LlmIntentAssessment(
-                intents=["unknown"],
-                confidence=0.9,
-                complexity="complex",
-                required_agents=[selected_agent],
-                rationale="Descriptor-only complex route.",
-            )
-        ),
-    )
-
-    # Act
-    result = await service.handle_user_request("Coordinate this remote-only review.")
-
-    # Assert
-    assert result.path == "clarification_required"
-    assert result.decision.path == "clarification_required"
-    assert result.context.decision.path == "clarification_required"
-    assert result.context.draft_plan_id is None
-    assert result.approval_plan is None
-    assert result.specialist_responses == ()
-    assert result.a2ui_parts == ()
-    assert result.final_artifacts["error"] == {
-        "code": "specialist_handler_unavailable",
-        "agent_ids": [selected_agent],
-        "message": result.decision.reason,
-    }
-    assert selected_agent in result.decision.reason
-    assert service.specialist_call_counts() == {}
-
-
-@pytest.mark.asyncio
-async def test_plan_required_without_executable_workstream_returns_structured_error() -> None:
-    # Arrange
-    service = OrchestratorService(
-        slm_client=RecordingSlmIntentClient(
-            IntentSuggestion(intent="unknown", confidence=0.5)
-        ),
-        intent_classifier=RecordingIntentClassifier(
-            LlmIntentAssessment(
-                intents=["unknown"],
-                confidence=0.9,
-                complexity="complex",
-                required_agents=["synthesis"],
-                rationale="Only synthesis was selected.",
-            )
-        ),
-    )
-
-    # Act
-    result = await service.handle_user_request("Summarize without any workstream.")
-
-    # Assert
-    assert result.path == "clarification_required"
-    assert result.decision.path == "clarification_required"
-    assert result.context.decision.path == "clarification_required"
-    assert result.context.draft_plan_id is None
-    assert result.approval_plan is None
-    assert result.specialist_responses == ()
-    assert result.a2ui_parts == ()
-    assert result.final_artifacts["error"] == {
-        "code": "plan_creation_failed",
-        "message": result.decision.reason,
-    }
-    assert "non-synthesis specialist workstream" in result.decision.reason
-    assert service.specialist_call_counts() == {}
-
-
-@pytest.mark.asyncio
-async def test_approval_replace_agent_uses_live_registry_after_reload(
-    tmp_path: Path,
-) -> None:
-    # Arrange
-    config_path = tmp_path / "agent_config.py"
-    _write_registry_config(
-        config_path,
-        [
-            "relationship_summary",
-            "internal_knowledge",
-            "industry_research",
-            "legacy.agent",
-            "synthesis",
-        ],
-    )
-    registry = AgentRegistry.from_config_path(config_path)
-    service = OrchestratorService(registry=registry)
-    proposed = await service.handle_user_request(
-        "Prepare me for tomorrow's meeting with ABC Manufacturing."
-    )
-    assert proposed.approval_plan is not None
-    first_step_id = proposed.approval_plan.steps[0].step_id
-    surface_id = proposed.approval_plan.approval_surface_id or ""
-
-    _write_registry_config(
-        config_path,
-        [
-            "relationship_summary",
-            "internal_knowledge",
-            "industry_research",
-            "credit_risk",
-            "synthesis",
-        ],
-    )
-    registry.reload()
-
-    # Act / Assert
-    with pytest.raises(PlanMutationError, match="replacement agent is unavailable"):
-        await service.handle_user_action(
-            _replace_agent_event(
-                proposed.approval_plan.plan_id,
-                surface_id,
-                step_id=first_step_id,
-                replacement_agent_id="legacy.agent",
-            )
-        )
-
-    edited = await service.handle_user_action(
-        _replace_agent_event(
-            proposed.approval_plan.plan_id,
-            surface_id,
-            step_id=first_step_id,
-            replacement_agent_id="credit_risk",
-        )
-    )
-
-    assert edited.status == "draft_updated"
-    record = service.approval_record(proposed.approval_plan.plan_id)
-    assert record.draft_plan.plan_version == 2
-    assert record.draft_plan.steps[0].agent_id == "credit_risk"
-
-
-@pytest.mark.asyncio
-async def test_approval_replace_agent_rejects_descriptor_without_handler_after_reload(
-    tmp_path: Path,
-) -> None:
-    # Arrange
-    config_path = tmp_path / "agent_config.py"
-    _write_registry_config(
-        config_path,
-        [
-            "relationship_summary",
-            "internal_knowledge",
-            "industry_research",
-            "synthesis",
-        ],
-    )
-    registry = AgentRegistry.from_config_path(config_path)
-    service = OrchestratorService(registry=registry)
-    proposed = await service.handle_user_request(
-        "Prepare me for tomorrow's meeting with ABC Manufacturing."
-    )
-    assert proposed.approval_plan is not None
-    first_step_id = proposed.approval_plan.steps[0].step_id
-    surface_id = proposed.approval_plan.approval_surface_id or ""
-
-    _write_registry_config(
-        config_path,
-        [
-            "relationship_summary",
-            "internal_knowledge",
-            "industry_research",
-            "remote_agent",
-            "synthesis",
-        ],
-    )
-    registry.reload()
-
-    # Act / Assert
-    with pytest.raises(PlanMutationError, match="replacement agent is unavailable"):
-        await service.handle_user_action(
-            _replace_agent_event(
-                proposed.approval_plan.plan_id,
-                surface_id,
-                step_id=first_step_id,
-                replacement_agent_id="remote_agent",
-            )
-        )
-
-    record = service.approval_record(proposed.approval_plan.plan_id)
-    assert record.status == "draft"
-    assert record.draft_plan.plan_version == 1
-    assert record.draft_plan.steps[0].agent_id != "remote_agent"
-    assert service.specialist_call_counts() == {}
-
-
-@pytest.mark.asyncio
-async def test_approval_rejects_stale_draft_agent_removed_after_registry_reload(
-    tmp_path: Path,
-) -> None:
-    # Arrange
-    config_path = tmp_path / "agent_config.py"
-    _write_registry_config(
-        config_path,
-        [
-            "relationship_summary",
-            "internal_knowledge",
-            "industry_research",
-            "synthesis",
-        ],
-    )
-    registry = AgentRegistry.from_config_path(config_path)
-    service = OrchestratorService(registry=registry)
-    proposed = await service.handle_user_request(
-        "Prepare me for tomorrow's meeting with ABC Manufacturing."
-    )
-    assert proposed.approval_plan is not None
-    assert "industry_research" in proposed.approval_plan.selected_agents
-
-    _write_registry_config(
-        config_path,
-        [
-            "relationship_summary",
-            "internal_knowledge",
-            "synthesis",
-        ],
-    )
-    registry.reload()
-
-    # Act / Assert
-    with pytest.raises(
-        PlanMutationError,
-        match="approved plan references unavailable agents: industry_research",
-    ):
-        await service.handle_user_action(
-            _approve_event(
-                proposed.approval_plan.plan_id,
-                proposed.approval_plan.approval_surface_id or "",
-                [step.step_id for step in proposed.approval_plan.steps],
-            )
-        )
-
-    record = service.approval_record(proposed.approval_plan.plan_id)
-    assert record.status == "draft"
-    assert record.approved_plan is None
-    assert service.specialist_call_counts() == {}
 
 
 @pytest.mark.asyncio
@@ -1166,11 +1639,177 @@ async def test_default_specialist_user_action_adapter_returns_owner_response() -
 
 
 @pytest.mark.asyncio
-async def test_forwarded_a2ui_surfaces_register_to_invoked_owner_not_response_agent() -> None:
+async def test_remote_wrapper_user_action_handler_is_used_by_default() -> None:
     # Arrange
+    from orchestrator_demo.a2a_support.local_remote_wrapper import LocalRemoteAgentWrapper
+    from orchestrator_demo.agents.product_opportunity import ProductOpportunityAgent
+
+    local_agent = ProductOpportunityAgent()
+    wrapper = LocalRemoteAgentWrapper(local_agent)
+    surface_registry = SurfaceRouteRegistry()
+    surface_id = "surface_product_opportunity_request_product_opportunity"
+    surface_registry.register_specialist_surface(
+        surface_id,
+        agent_id=wrapper.agent_id,
+    )
+    service = OrchestratorService(
+        specialists={wrapper.agent_id: wrapper},
+        surface_registry=surface_registry,
+    )
+    user_action = {
+        "userAction": {
+            "type": "specialist_action",
+            "surfaceId": surface_id,
+            "payload": {
+                "selectedProduct": "treasury_services",
+                "filters": ["cash_visibility", "controls"],
+            },
+        }
+    }
+
+    # Act
+    routed = await service.handle_user_action(user_action)
+
+    # Assert
+    assert routed.status == "forwarded"
+    assert local_agent.call_count == 1
+    assert local_agent.calls[0].context["user_action_payload"] == user_action
+    assert len(routed.specialist_responses) == 1
+    response = routed.specialist_responses[0]
+    assert response.agent_id == "product_opportunity"
+    assert response.response_id.startswith("response_product_opportunity_request_")
+
+
+@pytest.mark.asyncio
+async def test_default_specialist_user_action_adapter_slugs_custom_agent_response_id() -> None:
+    # Arrange
+    surface_registry = SurfaceRouteRegistry()
+    surface_registry.register_specialist_surface(
+        "surface_custom_insights_action",
+        agent_id="custom.insights",
+    )
+    service = OrchestratorService(
+        specialists={"custom.insights": CustomInsightsSpecialist()},
+        surface_registry=surface_registry,
+    )
+
+    # Act
+    routed = await service.handle_user_action(
+        {
+            "userAction": {
+                "type": "specialist_action",
+                "surfaceId": "surface_custom_insights_action",
+                "payload": {"action": "show_more_detail"},
+            }
+        }
+    )
+
+    # Assert
+    assert routed.status == "forwarded"
+    assert routed.surface_route_result is not None
+    assert routed.surface_route_result.owner is not None
+    assert routed.surface_route_result.owner.owner_id == "custom.insights"
+    assert len(routed.specialist_responses) == 1
+    response = routed.specialist_responses[0]
+    assert response.agent_id == "custom.insights"
+    assert response.response_id == "response_custom_insights_user_action"
+    assert "." not in response.response_id
+
+
+@pytest.mark.asyncio
+async def test_invalid_graph_specialist_a2ui_returns_valid_fallback_after_approval() -> (
+    None
+):
+    specialists = build_default_specialists()
+    specialists["relationship_summary"] = InvalidA2uiSpecialist(
+        specialists["relationship_summary"]
+    )
+    service = OrchestratorService(specialists=specialists)
+    proposed = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    assert proposed.approval_plan is not None
+    plan = proposed.approval_plan
+
+    approved = await service.handle_user_action(
+        _approve_event(
+            plan.plan_id,
+            plan.approval_surface_id or "",
+            [step.step_id for step in plan.steps],
+        )
+    )
+
+    assert approved.status == "approved"
+    assert service.approval_record(plan.plan_id).status == "approved"
+    fallback_response = next(
+        response
+        for response in approved.specialist_responses
+        if response.agent_id == "relationship_summary"
+    )
+    assert fallback_response.a2ui_payload is not None
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert all(
+        part.data.get("updateComponents", {}).get("surfaceId")
+        != "surface_invalid_specialist_delta"
+        for part in approved.a2ui_parts
+    )
+    assert any(
+        part.data.get("updateComponents", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in approved.a2ui_parts
+    )
+
+
+@pytest.mark.asyncio
+async def test_specialist_a2ui_ownership_failure_returns_fallback_after_approval() -> (
+    None
+):
+    specialists = build_default_specialists()
+    specialists["relationship_summary"] = OwnershipFailingA2uiSpecialist(
+        specialists["relationship_summary"]
+    )
+    service = OrchestratorService(specialists=specialists)
+    proposed = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    assert proposed.approval_plan is not None
+    plan = proposed.approval_plan
+
+    approved = await service.handle_user_action(
+        _approve_event(
+            plan.plan_id,
+            plan.approval_surface_id or "",
+            [step.step_id for step in plan.steps],
+        )
+    )
+
+    assert approved.status == "approved"
+    assert service.approval_record(plan.plan_id).status == "approved"
+    fallback_response = next(
+        response
+        for response in approved.specialist_responses
+        if response.agent_id == "relationship_summary"
+    )
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert all(
+        part.data.get("createSurface", {}).get("surfaceId")
+        != "surface_plan_specialist_claim"
+        for part in approved.a2ui_parts
+    )
+    assert any(
+        part.data.get("createSurface", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in approved.a2ui_parts
+    )
+
+
+@pytest.mark.asyncio
+async def test_specialist_user_action_response_normalizes_camel_case_a2ui() -> None:
     service = OrchestratorService(
         specialist_user_action_adapters={
-            "product_opportunity": MisreportingA2uiUserActionAdapter()
+            "product_opportunity": CamelCaseA2uiUserActionAdapter()
         }
     )
     result = await service.handle_user_request(
@@ -1179,20 +1818,71 @@ async def test_forwarded_a2ui_surfaces_register_to_invoked_owner_not_response_ag
     surface_id = result.specialist_responses[0].surface_id
     assert surface_id is not None
 
-    # Act
     routed = await service.handle_user_action(
         {
             "userAction": {
                 "type": "specialist_action",
                 "surfaceId": surface_id,
-                "payload": {"action": "show_detail"},
+                "payload": {"action": "show_more_detail"},
             }
         }
     )
 
-    # Assert
     assert routed.status == "forwarded"
-    assert routed.specialist_responses[0].agent_id == "internal_knowledge"
-    owner = service.surface_owner("surface_product_opportunity_detail")
-    assert owner is not None
-    assert owner.owner_id == "product_opportunity"
+    assert [response.agent_id for response in routed.specialist_responses] == [
+        "product_opportunity"
+    ]
+    assert len(routed.a2ui_parts) == 2
+    assert routed.final_artifacts["final_response"].surface_id == (
+        "surface_product_opportunity_detail"
+    )
+    assert service.surface_owner("surface_product_opportunity_detail") is not None
+
+
+@pytest.mark.asyncio
+async def test_specialist_user_action_invalid_a2ui_fallback_does_not_keep_stale_owner() -> (
+    None
+):
+    service = OrchestratorService(
+        specialist_user_action_adapters={
+            "product_opportunity": MixedValidityA2uiUserActionAdapter()
+        }
+    )
+    result = await service.handle_user_request(
+        "What product opportunities should I consider for a cafe business?"
+    )
+    surface_id = result.specialist_responses[0].surface_id
+    assert surface_id is not None
+    original_owner = service.surface_owner(surface_id)
+    assert original_owner is not None
+
+    routed = await service.handle_user_action(
+        {
+            "userAction": {
+                "type": "specialist_action",
+                "surfaceId": surface_id,
+                "payload": {"action": "show_more_detail"},
+            }
+        }
+    )
+
+    assert routed.status == "forwarded"
+    fallback_response = routed.final_artifacts["final_response"]
+    assert fallback_response.surface_id is not None
+    assert fallback_response.surface_id.startswith("surface_fallback_response_")
+    assert service.surface_owner(surface_id) == original_owner
+    assert service.surface_owner("surface_product_opportunity_mixed_detail") is None
+    assert service.surface_owner("surface_invalid_specialist_delta") is None
+    fallback_owner = service.surface_owner(fallback_response.surface_id)
+    assert fallback_owner is not None
+    assert fallback_owner.owner_id == "product_opportunity"
+    assert all(
+        part.data.get("createSurface", {}).get("surfaceId")
+        != "surface_product_opportunity_mixed_detail"
+        for part in routed.a2ui_parts
+    )
+    assert any(
+        part.data.get("createSurface", {}).get("surfaceId")
+        == fallback_response.surface_id
+        for part in routed.a2ui_parts
+    )

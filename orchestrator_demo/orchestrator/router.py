@@ -22,13 +22,13 @@ from orchestrator_demo.intent.merge import (
     merge_intent_confidence,
 )
 from orchestrator_demo.intent.slm_mock_client import SlmIntentClient
-from orchestrator_demo.orchestrator.planner import SYNTHESIS_AGENT_ID
 from orchestrator_demo.orchestrator.request_context import RequestContext
 from orchestrator_demo.registry.agent_registry import AgentRegistry
 
 
 SENSITIVE_INTENTS: set[IntentName] = {"credit_risk", "compliance_policy"}
 SENSITIVE_AGENTS = {"credit_risk", "compliance_policy"}
+SYNTHESIS_AGENT_ID = "synthesis"
 
 
 class RequestRouter:
@@ -115,8 +115,17 @@ class RequestRouter:
             llm_assessment,
             available_agents,
         )
-        if unavailable_agents:
-            unavailable = ", ".join(unavailable_agents)
+        unavailable_sensitive_agents = [
+            agent_id for agent_id in unavailable_agents if agent_id in SENSITIVE_AGENTS
+        ]
+        if unavailable_sensitive_agents or (
+            unavailable_agents
+            and not _can_form_partial_plan(
+                llm_assessment,
+                available_agents,
+            )
+        ):
+            unavailable = ", ".join(unavailable_sensitive_agents or unavailable_agents)
             return RoutingDecision(
                 path="clarification_required",
                 selected_agent=None,
@@ -124,6 +133,17 @@ class RequestRouter:
                 reason=(
                     "A safe route or plan cannot be formed because required "
                     f"agents are unavailable: {unavailable}."
+                ),
+            )
+
+        if _is_synthesis_only(assessment=llm_assessment):
+            return RoutingDecision(
+                path="clarification_required",
+                selected_agent=None,
+                confidence=confidence,
+                reason=(
+                    "A safe route or plan cannot be formed because no available "
+                    "non-synthesis specialist workstream remains."
                 ),
             )
 
@@ -175,6 +195,10 @@ def _is_sensitive(assessment: LlmIntentAssessment) -> bool:
     )
 
 
+def _is_synthesis_only(*, assessment: LlmIntentAssessment) -> bool:
+    return set(assessment.required_agents) == {SYNTHESIS_AGENT_ID}
+
+
 def _unavailable_required_agents(
     assessment: LlmIntentAssessment,
     available_agents: Sequence[AgentDescriptor],
@@ -214,13 +238,27 @@ def _required_agent_ids_for_availability(
     return required_agent_ids
 
 
-def _dedupe(values: Sequence[str]) -> list[str]:
-    deduped: list[str] = []
-    for value in values:
-        if value not in deduped:
-            deduped.append(value)
+def _can_form_partial_plan(
+    assessment: LlmIntentAssessment,
+    available_agents: Sequence[AgentDescriptor],
+) -> bool:
+    available_agent_ids = {descriptor.agent_id for descriptor in available_agents}
+    required_agent_ids = _required_agent_ids_for_availability(
+        assessment,
+        available_agent_ids=available_agent_ids,
+    )
+    selected_workstream_ids = [
+        agent_id
+        for agent_id in required_agent_ids
+        if agent_id in available_agent_ids and agent_id != SYNTHESIS_AGENT_ID
+    ]
+    if not selected_workstream_ids:
+        return False
 
-    return deduped
+    requires_synthesis = SYNTHESIS_AGENT_ID in required_agent_ids
+    return not (
+        requires_synthesis and SYNTHESIS_AGENT_ID not in available_agent_ids
+    )
 
 
 def _plan_required_reason(
@@ -248,6 +286,16 @@ def _plan_required_reason(
         reasons.append("does not satisfy direct-route requirements")
 
     return f"Plan approval required: {', '.join(reasons)}."
+
+
+
+def _dedupe(values: Sequence[str]) -> list[str]:
+    deduped: list[str] = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+
+    return deduped
 
 
 __all__ = [
