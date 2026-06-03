@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -18,12 +18,14 @@ from orchestrator_demo.contracts import (
     SpecialistRequest,
     SpecialistResponse,
 )
+from orchestrator_demo.orchestrator.specialist_invocation import (
+    SpecialistCallable,
+    SpecialistLike,
+    invoke_specialist,
+)
 
 if TYPE_CHECKING:
     from orchestrator_demo.orchestrator.approval_state import ApprovalRecord
-
-
-SpecialistCallable = Callable[[SpecialistRequest], Awaitable[SpecialistResponse]]
 
 
 class SpecialistPreApprovalError(RuntimeError):
@@ -91,6 +93,11 @@ class RequestContext:
         init=False,
         repr=False,
     )
+    _specialist_surface_owners: dict[str, str] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def approved_plan_step_agents(self) -> Mapping[str, Mapping[str, str]]:
@@ -103,11 +110,18 @@ class RequestContext:
         return MappingProxyType(self._approved_plan_step_payloads)
 
     @property
+    def specialist_surface_owners(self) -> Mapping[str, str]:
+        return MappingProxyType(self._specialist_surface_owners)
+
+    @property
     def has_structured_approval(self) -> bool:
         return (
             self.approved_plan_id is not None
             and self.approved_plan_id in self._approved_plan_step_payloads
         )
+
+    def specialist_owner_for_surface(self, surface_id: str) -> str | None:
+        return self._specialist_surface_owners.get(surface_id)
 
     def record_draft_plan(self, plan: ExecutionPlan) -> None:
         self._require_plan_matches_request_scope(plan)
@@ -294,6 +308,24 @@ class RequestContext:
             "specialist calls are not allowed while clarification is required"
         )
 
+    def record_specialist_surface_owner(
+        self,
+        *,
+        surface_id: str | None,
+        agent_id: str,
+    ) -> None:
+        if surface_id is None:
+            return
+
+        existing_owner = self._specialist_surface_owners.get(surface_id)
+        if existing_owner is not None and existing_owner != agent_id:
+            raise SpecialistPreApprovalError(
+                "specialist surface owner conflict for "
+                f"{surface_id!r}: expected {existing_owner!r}, got {agent_id!r}"
+            )
+
+        self._specialist_surface_owners[surface_id] = agent_id
+
 
 def _approved_step_context(
     plan: ExecutionPlan,
@@ -426,15 +458,41 @@ def _freeze_approval_value(value: Any) -> Any:
     return value
 
 
+def _freeze_static_runtime_context(
+    runtime_context: Mapping[str, Any],
+    approved_context: Mapping[str, Any],
+) -> Any:
+    static_context = dict(runtime_context)
+    if (
+        "upstream" not in approved_context
+        and _approved_context_has_dependencies(approved_context)
+    ):
+        static_context.pop("upstream", None)
+
+    return _freeze_approval_value(static_context)
+
+
+def _approved_context_has_dependencies(context: Mapping[str, Any]) -> bool:
+    depends_on = context.get("dependsOn", ())
+    if isinstance(depends_on, list | tuple | set | frozenset):
+        return len(depends_on) > 0
+    return bool(depends_on)
+
+
 async def call_specialist_with_guard(
     context: RequestContext,
     request: SpecialistRequest,
-    specialist: SpecialistCallable,
+    specialist: SpecialistLike,
 ) -> SpecialistResponse:
     """Apply request guardrails before invoking a specialist."""
 
     context.require_specialist_call_allowed(request)
-    return await specialist(request)
+    response = await invoke_specialist(specialist, request)
+    context.record_specialist_surface_owner(
+        surface_id=response.surface_id,
+        agent_id=request.agent_id,
+    )
+    return response
 
 
 __all__ = [

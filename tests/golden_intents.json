@@ -142,11 +142,25 @@
       "intent": "prospect_research",
       "confidence": 0.78
     },
-    "expected_intents": ["credit_risk", "compliance_policy"],
+    "expected_intents": [
+      "prospect_research",
+      "web_search",
+      "industry_research",
+      "product_opportunity",
+      "credit_risk",
+      "compliance_policy"
+    ],
     "expected_complexity": "complex",
-    "expected_required_agents": ["credit_risk", "compliance_policy", "synthesis"],
-    "expected_confidence": 0.87,
-    "expected_rationale_contains": "sensitive credit"
+    "expected_required_agents": [
+      "web_search",
+      "industry_research",
+      "product_opportunity",
+      "credit_risk",
+      "compliance_policy",
+      "synthesis"
+    ],
+    "expected_confidence": 0.9,
+    "expected_rationale_contains": "guardrails"
   },
   {
     "name": "slm_disagreement_meeting_prep",
@@ -191,11 +205,25 @@
       "intent": "meeting_prep",
       "confidence": 0.82
     },
-    "expected_intents": ["credit_risk", "compliance_policy"],
+    "expected_intents": [
+      "meeting_prep",
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research",
+      "credit_risk",
+      "compliance_policy"
+    ],
     "expected_complexity": "complex",
-    "expected_required_agents": ["credit_risk", "compliance_policy", "synthesis"],
-    "expected_confidence": 0.87,
-    "expected_rationale_contains": "sensitive credit"
+    "expected_required_agents": [
+      "relationship_summary",
+      "internal_knowledge",
+      "industry_research",
+      "credit_risk",
+      "compliance_policy",
+      "synthesis"
+    ],
+    "expected_confidence": 0.91,
+    "expected_rationale_contains": "guardrails"
   },
   {
     "name": "sensitive_compliance_policy",
