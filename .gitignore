@@ -10,3 +10,5 @@ tests/visual/.artifacts/
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+*.db

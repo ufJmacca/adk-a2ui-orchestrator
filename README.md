@@ -61,6 +61,21 @@ The startup line prints the local base URL, normally
 `http://127.0.0.1:8000`. The basic renderer is available at `GET /`, and the
 machine-readable endpoint contract is available at `GET /api`.
 
+## Google ADK Dev UI
+
+The repo also exposes a Google ADK-compatible `root_agent` for ADK Web. Run this
+from the repository root after providing the required runtime configuration:
+
+```bash
+uv sync --locked
+uv run adk web orchestrator_demo --host 0.0.0.0 --port 8001
+```
+
+Open the forwarded `8001` URL and select the `orchestrator` app. ADK Web exposes
+the orchestrator through request, approve, and reject tools with JSON outputs.
+It does not render A2UI surfaces; use `uv run python -m orchestrator_demo.app`
+for the local A2UI renderer.
+
 ## Local Transport Contract
 
 The local app uses JSON HTTP endpoints to exercise the A2A/A2UI loop:
