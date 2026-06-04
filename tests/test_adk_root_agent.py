@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from google.adk.agents.base_agent import BaseAgent
+from google.adk.apps.app import App
 
 from orchestrator_demo.orchestrator.agent import (
     AdkOrchestratorAdapter,
@@ -82,15 +83,57 @@ async def test_adk_adapter_rejects_pending_plan_without_execution() -> None:
 def test_adk_loader_finds_orchestrator_root_agent(monkeypatch) -> None:
     from google.adk.cli.utils.agent_loader import AgentLoader
 
+    # Arrange
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-openrouter-key")
     monkeypatch.setenv("LLM_MODEL", "openrouter/unit-test/model")
     monkeypatch.syspath_prepend(str(REPOSITORY_ROOT))
     for module_name in ("orchestrator.agent", "orchestrator"):
-        sys.modules.pop(module_name, None)
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
 
+    # Act
     loaded = AgentLoader(str(REPOSITORY_ROOT / "orchestrator_demo")).load_agent(
         "orchestrator"
     )
 
-    assert isinstance(loaded, BaseAgent)
+    # Assert
+    if isinstance(loaded, App):
+        assert loaded.name == "orchestrator"
+        assert isinstance(loaded.root_agent, BaseAgent)
+        assert loaded.root_agent.name == "orchestrator"
+    else:
+        assert isinstance(loaded, BaseAgent)
+        assert loaded.name == "orchestrator"
+
+
+def test_adk_loader_finds_exported_app_with_root_agent(
+    monkeypatch, tmp_path
+) -> None:
+    from google.adk.cli.utils.agent_loader import AgentLoader
+
+    # Arrange
+    agent_package = tmp_path / "orchestrator"
+    agent_package.mkdir()
+    (agent_package / "__init__.py").write_text(
+        "\n".join(
+            [
+                "from google.adk.agents import Agent",
+                "from google.adk.apps.app import App",
+                "",
+                'root_agent = Agent(name="orchestrator", model="gemini-2.0-flash")',
+                'app = App(name="orchestrator", root_agent=root_agent)',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for module_name in ("orchestrator.agent", "orchestrator"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    # Act
+    loaded = AgentLoader(str(tmp_path)).load_agent("orchestrator")
+
+    # Assert
+    assert isinstance(loaded, App)
     assert loaded.name == "orchestrator"
+    assert isinstance(loaded.root_agent, BaseAgent)
+    assert loaded.root_agent.name == "orchestrator"
