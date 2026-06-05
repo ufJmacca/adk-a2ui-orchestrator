@@ -139,11 +139,7 @@ def test_orchestrator_agent_card_enables_adk_a2a_discovery() -> None:
     assert str(card.url) == "http://127.0.0.1:8000/a2a/orchestrator"
     assert card.capabilities.streaming is True
     assert card.capabilities.state_transition_history is True
-    assert set(card.default_input_modes) == {
-        "application/json",
-        A2UI_MIME_TYPE,
-        "text/plain",
-    }
+    assert card.default_input_modes == ["text/plain"]
     assert set(card.default_output_modes) == {
         "application/json",
         A2UI_MIME_TYPE,
@@ -151,7 +147,7 @@ def test_orchestrator_agent_card_enables_adk_a2a_discovery() -> None:
     }
     assert {
         "submit_orchestrator_request",
-        "review_orchestrator_plan",
+        "review_orchestrator_a2ui_plan",
         "edit_orchestrator_plan",
         "approve_orchestrator_plan",
         "reject_orchestrator_plan",
