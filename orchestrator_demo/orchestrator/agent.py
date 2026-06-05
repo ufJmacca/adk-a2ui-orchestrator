@@ -645,6 +645,9 @@ def build_root_agent(
             "returns path plan_required, tell the user the planId, planVersion, "
             "approvalSurfaceId/surfaceId, step ids, and that they can call edit, "
             "approval, or rejection tools with the current planVersion. "
+            "Use add_plan_instruction, remove_plan_step, replace_plan_agent, or "
+            "reorder_plan_steps before approve_orchestrator_plan when the user "
+            "requests plan changes. "
             "This ADK Web surface does not render A2UI components; it exposes "
             "the orchestrator through tools for debugging."
         ),
