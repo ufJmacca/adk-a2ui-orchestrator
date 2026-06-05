@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from collections.abc import AsyncGenerator
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import Agent
 from google.adk.apps.app import App
+from google.adk.models import BaseLlm
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
+from google.genai import types
 
 from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
@@ -44,6 +51,7 @@ from orchestrator_demo.orchestrator.service import (
 
 
 ORCHESTRATOR_SESSION_STATE_KEY = "orchestrator_session"
+DETERMINISTIC_MODEL_ENV = "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL"
 _FINAL_APPROVAL_STATUSES = frozenset(
     {"approved", "approved_execution_failed", "rejected"}
 )
@@ -665,7 +673,7 @@ def build_root_agent(
 ) -> Agent:
     """Build the ADK loader-compatible root agent for ``adk web``."""
 
-    resolved_model = model if model is not None else build_litellm_model()
+    resolved_model = model if model is not None else _runtime_model()
     resolved_adapter = adapter or AdkOrchestratorAdapter(
         agent=_runtime_orchestrator_agent(resolved_model)
     )
@@ -745,6 +753,157 @@ def _runtime_orchestrator_agent(model: Any) -> OrchestratorAgent:
             intent_classifier=_intent_classifier_for_model(model),
         )
     )
+
+
+def _runtime_model() -> Any:
+    if _truthy_env(DETERMINISTIC_MODEL_ENV):
+        return DeterministicOrchestratorModel()
+    return build_litellm_model()
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+class DeterministicOrchestratorModel(BaseLlm):
+    """Local model used by subprocess A2A integration tests."""
+
+    model: str = "orchestrator-deterministic-test-model"
+
+    async def generate_content_async(
+        self,
+        llm_request: LlmRequest,
+        stream: bool = False,
+    ) -> AsyncGenerator[LlmResponse, None]:
+        if _current_turn_function_response(llm_request) is not None:
+            yield _text_response(
+                "Structured orchestrator tool response returned to the A2A client."
+            )
+            return
+
+        if "submit_orchestrator_request" in llm_request.tools_dict:
+            user_input = _latest_user_text(llm_request)
+            function_call = types.Part.from_function_call(
+                name="submit_orchestrator_request",
+                args={"user_input": user_input},
+            )
+            if function_call.function_call is not None:
+                function_call.function_call.id = "call_submit_orchestrator_request"
+            yield LlmResponse(
+                content=types.Content(role="model", parts=[function_call])
+            )
+            return
+
+        yield _text_response(json.dumps(_deterministic_intent_assessment(llm_request)))
+
+
+def _text_response(text: str) -> LlmResponse:
+    return LlmResponse(
+        content=types.Content(role="model", parts=[types.Part.from_text(text=text)])
+    )
+
+
+def _current_turn_function_response(llm_request: LlmRequest) -> Any:
+    if not llm_request.contents:
+        return None
+    content = llm_request.contents[-1]
+    for part in reversed(content.parts or []):
+        if part.function_response is not None:
+            return part.function_response.response
+    return None
+
+
+def _latest_user_text(llm_request: LlmRequest) -> str:
+    for content in reversed(llm_request.contents):
+        if content.role != "user":
+            continue
+        text = _content_text(content)
+        if text:
+            return text
+    for content in reversed(llm_request.contents):
+        text = _content_text(content)
+        if text:
+            return text
+    return ""
+
+
+def _content_text(content: types.Content) -> str:
+    return "\n".join(
+        part.text for part in content.parts or [] if isinstance(part.text, str)
+    )
+
+
+def _deterministic_intent_assessment(llm_request: LlmRequest) -> dict[str, Any]:
+    text = _classifier_user_request_text(_latest_user_text(llm_request)).casefold()
+    if "internal notes" in text or "crm" in text:
+        return {
+            "intents": ["internal_knowledge"],
+            "confidence": 0.94,
+            "complexity": "simple",
+            "required_agents": ["internal_knowledge"],
+            "rationale": "Deterministic test classifier selected internal knowledge.",
+        }
+    if "meeting" in text or "prepare" in text:
+        return {
+            "intents": [
+                "meeting_prep",
+                "relationship_summary",
+                "internal_knowledge",
+                "industry_research",
+            ],
+            "confidence": 0.93,
+            "complexity": "complex",
+            "required_agents": [
+                "relationship_summary",
+                "internal_knowledge",
+                "industry_research",
+                "synthesis",
+            ],
+            "rationale": "Deterministic test classifier selected meeting prep plan.",
+        }
+    if (
+        "prospect" in text
+        or "risks" in text
+        or "opportunities" in text
+        or "talking points" in text
+    ):
+        return {
+            "intents": [
+                "prospect_research",
+                "industry_research",
+                "product_opportunity",
+                "credit_risk",
+            ],
+            "confidence": 0.92,
+            "complexity": "complex",
+            "required_agents": [
+                "web_search",
+                "industry_research",
+                "product_opportunity",
+                "credit_risk",
+                "synthesis",
+            ],
+            "rationale": "Deterministic test classifier selected prospect research plan.",
+        }
+    return {
+        "intents": ["unknown"],
+        "confidence": 0.42,
+        "complexity": "complex",
+        "required_agents": ["data_quality"],
+        "rationale": (
+            "Deterministic test classifier found an ambiguous request with no "
+            "safe single owner agent."
+        ),
+    }
+
+
+def _classifier_user_request_text(text: str) -> str:
+    if "User request:" not in text:
+        return text
+    user_request = text.split("User request:", maxsplit=1)[1]
+    for delimiter in ("\nSLM suggestion:", "\nAvailable agents:"):
+        user_request = user_request.split(delimiter, maxsplit=1)[0]
+    return user_request.strip()
 
 
 def _intent_classifier_for_model(model: Any) -> LiteLlmIntentClassifier:
