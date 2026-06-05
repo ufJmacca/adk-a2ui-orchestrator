@@ -1,6 +1,7 @@
 import inspect
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,35 @@ from orchestrator_demo.orchestrator.agent import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+class FakeToolContext:
+    def __init__(self) -> None:
+        self.state: dict[str, Any] = {}
+        self.saved_artifacts: list[dict[str, Any]] = []
+
+    async def save_artifact(
+        self,
+        filename: str,
+        artifact: Any,
+        custom_metadata: dict[str, Any] | None = None,
+    ) -> int:
+        version = len(
+            [
+                saved
+                for saved in self.saved_artifacts
+                if saved["filename"] == filename
+            ]
+        )
+        self.saved_artifacts.append(
+            {
+                "filename": filename,
+                "artifact": artifact,
+                "customMetadata": custom_metadata,
+                "version": version,
+            }
+        )
+        return version
 
 
 def test_build_root_agent_returns_adk_agent_with_orchestrator_tools() -> None:
@@ -45,9 +75,11 @@ def test_build_root_agent_returns_adk_agent_with_orchestrator_tools() -> None:
 @pytest.mark.asyncio
 async def test_adk_adapter_submits_complex_request_and_approves_plan() -> None:
     adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
 
     submitted = await adapter.submit_orchestrator_request(
-        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=tool_context,
     )
 
     assert submitted["path"] == "plan_required"
@@ -65,6 +97,7 @@ async def test_adk_adapter_submits_complex_request_and_approves_plan() -> None:
         plan["approval_surface_id"],
         [step["step_id"] for step in plan["steps"]],
         edited_plan_version=plan["plan_version"],
+        tool_context=tool_context,
     )
 
     assert approved["status"] == "approved"
@@ -76,8 +109,10 @@ async def test_adk_adapter_submits_complex_request_and_approves_plan() -> None:
 @pytest.mark.asyncio
 async def test_adk_adapter_rejects_pending_plan_without_execution() -> None:
     adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
     submitted = await adapter.submit_orchestrator_request(
-        "Research this prospect and give me risks, opportunities, and talking points."
+        "Research this prospect and give me risks, opportunities, and talking points.",
+        tool_context=tool_context,
     )
     plan = submitted["approvalPlan"]
 
@@ -85,6 +120,7 @@ async def test_adk_adapter_rejects_pending_plan_without_execution() -> None:
         plan["plan_id"],
         plan["approval_surface_id"],
         "Do not run this workflow.",
+        tool_context=tool_context,
     )
 
     assert rejected["status"] == "rejected"

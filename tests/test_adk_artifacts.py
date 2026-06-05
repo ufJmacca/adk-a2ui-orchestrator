@@ -111,6 +111,8 @@ async def test_approved_plan_saves_latest_and_plan_execution_text_artifacts() ->
 
     # Assert
     assert approved["status"] == "approved"
+    assert approved["graphCreated"] is True
+    assert approved["specialistsCalled"] is True
     assert [artifact["filename"] for artifact in tool_context.saved_artifacts] == [
         "orchestrator_latest_result.json",
         plan_filename,
@@ -153,4 +155,3 @@ async def test_approved_plan_saves_latest_and_plan_execution_text_artifacts() ->
     assert tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]["artifactRefs"] == (
         expected_refs
     )
-

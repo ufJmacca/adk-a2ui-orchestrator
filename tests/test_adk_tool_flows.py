@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from google.genai import types
 
+from orchestrator_demo.agents import build_default_specialists
 from orchestrator_demo.orchestrator.agent import (
     ORCHESTRATOR_SESSION_STATE_KEY,
     AdkOrchestratorAdapter,
@@ -119,6 +120,32 @@ def _assert_draft_updated_contract(
     assert response["approvalResult"]["specialistsCalled"] is False
 
 
+def _assert_data_part_payloads(response: dict[str, Any]) -> None:
+    assert response["a2uiParts"]
+    assert all(
+        part["type"] == "data"
+        and part["metadata"]["mimeType"] == "application/json+a2ui"
+        for part in response["a2uiParts"]
+    )
+
+
+def _assert_approval_surface_deleted(
+    response: dict[str, Any],
+    approval_surface_id: str,
+) -> None:
+    delete_parts = [
+        part
+        for part in response["a2uiParts"]
+        if isinstance(part.get("data"), dict)
+        and isinstance(part["data"].get("deleteSurface"), dict)
+    ]
+    assert delete_parts
+    assert any(
+        part["data"]["deleteSurface"]["surfaceId"] == approval_surface_id
+        for part in delete_parts
+    )
+
+
 def _a2ui_update_components(response: dict[str, Any]) -> list[dict[str, Any]]:
     update_parts = [
         part
@@ -219,6 +246,41 @@ def test_root_agent_exposes_required_draft_edit_tools_with_required_fields() -> 
     assert "replace_plan_agent" in instruction
     assert "reorder_plan_steps" in instruction
     assert "before approve_orchestrator_plan" in instruction
+
+
+def test_approval_tools_require_final_adk_contract_fields() -> None:
+    # Arrange
+    root_agent = build_root_agent(
+        adapter=AdkOrchestratorAdapter(),
+        model="gemini-2.0-flash",
+    )
+
+    # Act
+    tool_signatures = {
+        tool.name: inspect.signature(tool.func) for tool in root_agent.tools
+    }
+
+    # Assert
+    approve_parameters = tool_signatures["approve_orchestrator_plan"].parameters
+    reject_parameters = tool_signatures["reject_orchestrator_plan"].parameters
+    for required_field in (
+        "plan_id",
+        "approval_surface_id",
+        "approved_step_ids",
+        "edited_plan_version",
+        "tool_context",
+    ):
+        assert required_field in approve_parameters
+        assert approve_parameters[required_field].default is inspect.Parameter.empty
+    for required_field in (
+        "plan_id",
+        "approval_surface_id",
+        "reason",
+        "tool_context",
+    ):
+        assert required_field in reject_parameters
+        assert reject_parameters[required_field].default is inspect.Parameter.empty
+    assert reject_parameters["edited_plan_version"].default is None
 
 
 @pytest.mark.asyncio
@@ -398,6 +460,248 @@ async def test_draft_edit_tools_update_plan_a2ui_and_session_without_execution()
         in reordered["plan"]["steps"][0]["instruction"]
     )
     assert reordered["plan"]["steps"][1]["agentId"] == "credit_risk"
+
+
+@pytest.mark.asyncio
+async def test_approve_tool_executes_graph_saves_artifacts_and_persists_session() -> None:
+    # Arrange
+    tool_context = FakeToolContext()
+    service = OrchestratorService()
+    adapter = AdkOrchestratorAdapter(agent=OrchestratorAgent(service))
+    submitted = await adapter.submit_orchestrator_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=tool_context,
+    )
+
+    # Act
+    approved = await adapter.approve_orchestrator_plan(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        submitted["stepIds"],
+        edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert approved["status"] == "approved"
+    assert approved["path"] == "approved"
+    assert approved["planId"] == submitted["planId"]
+    assert approved["planVersion"] == submitted["planVersion"]
+    assert approved["approvalSurfaceId"] == submitted["approvalSurfaceId"]
+    assert approved["graphCreated"] is True
+    assert approved["specialistsCalled"] is True
+    assert approved["approvalResult"]["graphCreated"] is True
+    assert approved["approvalResult"]["specialistsCalled"] is True
+    assert approved["statusEvents"]
+    assert approved["artifacts"]["final_response"]["agent_id"] == "synthesis"
+    _assert_data_part_payloads(approved)
+    _assert_approval_surface_deleted(approved, submitted["approvalSurfaceId"])
+
+    latest_filename = "orchestrator_latest_result.json"
+    plan_filename = f"orchestrator_plan_{submitted['planId']}_execution.json"
+    assert [artifact["filename"] for artifact in tool_context.saved_artifacts] == [
+        latest_filename,
+        plan_filename,
+    ]
+    snapshot = tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
+    assert snapshot["approvalRecords"][submitted["planId"]]["status"] == "approved"
+    assert set(snapshot["artifactRefs"]) == {latest_filename, plan_filename}
+    assert service.specialist_call_counts() == {
+        "relationship_summary": 1,
+        "internal_knowledge": 1,
+        "industry_research": 1,
+        "synthesis": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reject_tool_returns_closed_a2ui_update_and_persists_without_execution() -> None:
+    # Arrange
+    tool_context = FakeToolContext()
+    service = OrchestratorService()
+    adapter = AdkOrchestratorAdapter(agent=OrchestratorAgent(service))
+    submitted = await adapter.submit_orchestrator_request(
+        "Research this prospect and give me risks, opportunities, and talking points.",
+        tool_context=tool_context,
+    )
+
+    # Act
+    rejected = await adapter.reject_orchestrator_plan(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        "Do not run this workflow.",
+        edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert rejected["status"] == "rejected"
+    assert rejected["path"] == "rejected"
+    assert rejected["planId"] == submitted["planId"]
+    assert rejected["planVersion"] == submitted["planVersion"]
+    assert rejected["reason"] == "Do not run this workflow."
+    assert rejected["graphCreated"] is False
+    assert rejected["specialistsCalled"] is False
+    assert rejected["approvalResult"]["graphCreated"] is False
+    assert rejected["approvalResult"]["specialistsCalled"] is False
+    assert rejected["approvalResult"]["reason"] == "Do not run this workflow."
+    _assert_data_part_payloads(rejected)
+    _assert_approval_surface_deleted(rejected, submitted["approvalSurfaceId"])
+
+    assert service.specialist_call_counts() == {}
+    assert tool_context.saved_artifacts == []
+    snapshot = tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
+    record = snapshot["approvalRecords"][submitted["planId"]]
+    assert record["status"] == "rejected"
+    assert record["rejectionReason"] == "Do not run this workflow."
+
+
+@pytest.mark.asyncio
+async def test_approval_and_rejection_validation_failures_return_safe_errors() -> None:
+    # Arrange
+    adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
+    submitted = await adapter.submit_orchestrator_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=tool_context,
+    )
+    stale_context = FakeToolContext()
+    stale_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = json.loads(
+        json.dumps(tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY])
+    )
+    unknown_plan_context = FakeToolContext()
+    unknown_plan_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = json.loads(
+        json.dumps(tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY])
+    )
+    wrong_surface_context = FakeToolContext()
+    wrong_surface_snapshot = json.loads(
+        json.dumps(tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY])
+    )
+    wrong_surface_snapshot["surfaceRegistry"]["ownersBySurfaceId"][
+        "surface_plan_wrong"
+    ] = {
+        "surfaceId": "surface_plan_wrong",
+        "ownerType": "orchestrator",
+        "ownerId": "orchestrator",
+        "planId": submitted["planId"],
+        "source": "approval_surface",
+    }
+    wrong_surface_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = (
+        wrong_surface_snapshot
+    )
+
+    updated = await adapter.add_plan_instruction(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        submitted["stepIds"][0],
+        "Prioritize covenant follow-up questions.",
+        edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
+    )
+    final_context = FakeToolContext()
+    final_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = json.loads(
+        json.dumps(tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY])
+    )
+
+    specialists = build_default_specialists()
+    unavailable_context = FakeToolContext()
+    unavailable_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = json.loads(
+        json.dumps(tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY])
+    )
+    unavailable_adapter = AdkOrchestratorAdapter(
+        agent=OrchestratorAgent(
+            OrchestratorService(
+                specialists={
+                    agent_id: specialist
+                    for agent_id, specialist in specialists.items()
+                    if agent_id != "synthesis"
+                }
+            )
+        )
+    )
+
+    # Act
+    stale_approval = await adapter.approve_orchestrator_plan(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        submitted["stepIds"],
+        edited_plan_version=submitted["planVersion"],
+        tool_context=stale_context,
+    )
+    mismatched_steps = await adapter.approve_orchestrator_plan(
+        updated["planId"],
+        updated["approvalSurfaceId"],
+        ["step_does_not_match_current_plan"],
+        edited_plan_version=updated["planVersion"],
+        tool_context=tool_context,
+    )
+    wrong_surface = await adapter.approve_orchestrator_plan(
+        updated["planId"],
+        "surface_plan_wrong",
+        updated["stepIds"],
+        edited_plan_version=updated["planVersion"],
+        tool_context=wrong_surface_context,
+    )
+    unknown_plan = await adapter.approve_orchestrator_plan(
+        "plan_missing",
+        updated["approvalSurfaceId"],
+        updated["stepIds"],
+        edited_plan_version=updated["planVersion"],
+        tool_context=unknown_plan_context,
+    )
+    unavailable_specialist = await unavailable_adapter.approve_orchestrator_plan(
+        updated["planId"],
+        updated["approvalSurfaceId"],
+        updated["stepIds"],
+        edited_plan_version=updated["planVersion"],
+        tool_context=unavailable_context,
+    )
+    approved = await adapter.approve_orchestrator_plan(
+        updated["planId"],
+        updated["approvalSurfaceId"],
+        updated["stepIds"],
+        edited_plan_version=updated["planVersion"],
+        tool_context=final_context,
+    )
+    final_plan_rejection = await adapter.reject_orchestrator_plan(
+        updated["planId"],
+        updated["approvalSurfaceId"],
+        "Cannot reject a final plan.",
+        edited_plan_version=updated["planVersion"],
+        tool_context=final_context,
+    )
+
+    # Assert
+    assert approved["status"] == "approved"
+    assert {
+        stale_approval["error"]["code"],
+        mismatched_steps["error"]["code"],
+        wrong_surface["error"]["code"],
+        unknown_plan["error"]["code"],
+        unavailable_specialist["error"]["code"],
+        final_plan_rejection["error"]["code"],
+    } == {
+        "stale_plan_version",
+        "invalid_plan_mutation",
+        "surface_mismatch",
+        "plan_not_found",
+        "plan_already_final",
+    }
+    assert unavailable_specialist["error"]["code"] == "invalid_plan_mutation"
+    for response in (
+        stale_approval,
+        mismatched_steps,
+        wrong_surface,
+        unknown_plan,
+        unavailable_specialist,
+        final_plan_rejection,
+    ):
+        assert response["status"] == "error"
+        assert response["path"] == "error"
+        rendered = json.dumps(response, sort_keys=True)
+        assert "Traceback" not in rendered
+        assert "step_does_not_match_current_plan" not in rendered
+        assert "sk-" not in rendered
 
 
 @pytest.mark.asyncio

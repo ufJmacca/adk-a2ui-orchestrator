@@ -88,6 +88,16 @@ def build_user_action_response(
         if approval_result.plan_version is not None:
             payload["planVersion"] = approval_result.plan_version
 
+    if approval_result is not None:
+        payload["graphCreated"] = approval_result.graph_created
+        payload["specialistsCalled"] = approval_result.specialists_called
+        if result.status == "rejected":
+            payload["reason"] = (
+                _safe_text(approval_result.rejection_reason)
+                if approval_result.rejection_reason is not None
+                else None
+            )
+
     return payload
 
 
