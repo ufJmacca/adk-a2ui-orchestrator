@@ -140,7 +140,8 @@ class AdkOrchestratorAdapter:
                         tool_context,
                         suppress_errors=True,
                     )
-                return build_error_response(exc)
+                response = build_error_response(exc)
+        self._skip_model_summarization(tool_context)
         return response
 
     async def add_plan_instruction(
@@ -325,7 +326,8 @@ class AdkOrchestratorAdapter:
                         tool_context,
                         suppress_errors=True,
                     )
-                return build_error_response(exc)
+                response = build_error_response(exc)
+        self._skip_model_summarization(tool_context)
         return response
 
     async def _save_request_artifacts(
@@ -432,6 +434,19 @@ class AdkOrchestratorAdapter:
         except Exception:
             if not suppress_errors:
                 raise
+
+    def _skip_model_summarization(self, tool_context: ToolContext | None) -> None:
+        if tool_context is None:
+            return
+
+        actions = getattr(tool_context, "actions", None)
+        if actions is None:
+            return
+
+        try:
+            actions.skip_summarization = True
+        except AttributeError:
+            return
 
     def _snapshot_preserving_finalized_plans(
         self,
