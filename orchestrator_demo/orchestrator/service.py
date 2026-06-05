@@ -220,6 +220,16 @@ class OrchestratorService:
             artifact_refs=self._artifact_refs,
         )
 
+    def artifact_refs(self) -> dict[str, Any]:
+        """Return saved ADK artifact references tracked in session state."""
+
+        return dict(self._artifact_refs)
+
+    def record_artifact_refs(self, artifact_refs: Mapping[str, Any]) -> None:
+        """Record ADK artifact references for later session snapshot export."""
+
+        self._artifact_refs.update(dict(artifact_refs))
+
     def restore_session_snapshot(self, snapshot: Mapping[str, Any]) -> None:
         """Restore approval, request, surface, and artifact state from a snapshot."""
 

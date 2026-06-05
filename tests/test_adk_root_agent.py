@@ -25,6 +25,10 @@ def test_build_root_agent_returns_adk_agent_with_orchestrator_tools() -> None:
     assert agent.name == "orchestrator"
     assert {tool.name for tool in agent.tools} == {
         "submit_orchestrator_request",
+        "add_plan_instruction",
+        "remove_plan_step",
+        "replace_plan_agent",
+        "reorder_plan_steps",
         "approve_orchestrator_plan",
         "reject_orchestrator_plan",
     }
@@ -52,6 +56,7 @@ async def test_adk_adapter_submits_complex_request_and_approves_plan() -> None:
         plan["plan_id"],
         plan["approval_surface_id"],
         [step["step_id"] for step in plan["steps"]],
+        edited_plan_version=plan["plan_version"],
     )
 
     assert approved["status"] == "approved"
