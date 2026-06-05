@@ -336,6 +336,210 @@ class RequestContext:
 
         self._specialist_surface_owners[surface_id] = agent_id
 
+    def export_snapshot(self) -> dict[str, Any]:
+        """Return JSON-safe request guardrail state for ADK session storage."""
+
+        return {
+            "userInput": self.user_input,
+            "slmSuggestion": self.slm_suggestion.model_dump(mode="json"),
+            "llmAssessment": self.llm_assessment.model_dump(mode="json"),
+            "decision": self.decision.model_dump(mode="json"),
+            "planScopeId": self.plan_scope_id,
+            "draftPlanId": self.draft_plan_id,
+            "draftApprovalSurfaceId": self.draft_approval_surface_id,
+            "draftPlanSnapshot": _json_safe(self._draft_plan_snapshot),
+            "approvedPlanId": self.approved_plan_id,
+            "approvedPlanStepAgents": _json_safe(self._approved_plan_step_agents),
+            "approvedPlanStepPayloads": _approved_payloads_to_snapshot(
+                self._approved_plan_step_payloads
+            ),
+            "specialistSurfaceOwners": dict(self._specialist_surface_owners),
+        }
+
+    @classmethod
+    def restore_snapshot(cls, snapshot: Mapping[str, Any]) -> "RequestContext":
+        """Restore request guardrail state from a JSON-safe snapshot."""
+
+        context = cls(
+            user_input=_required_snapshot_string(snapshot, "userInput"),
+            slm_suggestion=IntentSuggestion.model_validate(
+                _required_snapshot_mapping(snapshot, "slmSuggestion")
+            ),
+            llm_assessment=LlmIntentAssessment.model_validate(
+                _required_snapshot_mapping(snapshot, "llmAssessment")
+            ),
+            decision=RoutingDecision.model_validate(
+                _required_snapshot_mapping(snapshot, "decision")
+            ),
+            plan_scope_id=_required_snapshot_string(snapshot, "planScopeId"),
+        )
+        context.draft_plan_id = _optional_snapshot_string(snapshot.get("draftPlanId"))
+        context.draft_approval_surface_id = _optional_snapshot_string(
+            snapshot.get("draftApprovalSurfaceId")
+        )
+        draft_plan_snapshot = snapshot.get("draftPlanSnapshot")
+        context._draft_plan_snapshot = (
+            dict(draft_plan_snapshot)
+            if isinstance(draft_plan_snapshot, Mapping)
+            else None
+        )
+        context.approved_plan_id = _optional_snapshot_string(
+            snapshot.get("approvedPlanId")
+        )
+        context._approved_plan_step_agents = _restore_step_agents(
+            snapshot.get("approvedPlanStepAgents")
+        )
+        context._approved_plan_step_payloads = _restore_step_payloads(
+            snapshot.get("approvedPlanStepPayloads")
+        )
+        context._specialist_surface_owners = _restore_string_map(
+            snapshot.get("specialistSurfaceOwners")
+        )
+        return context
+
+
+def _approved_payloads_to_snapshot(
+    payloads_by_plan_id: Mapping[str, Mapping[str, _ApprovedStepPayload]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    return {
+        plan_id: {
+            step_id: {
+                "agentId": payload.agent_id,
+                "userInput": payload.user_input,
+                "context": _json_safe(payload.context),
+                "dependencyOutputAlternates": {
+                    dependency_id: list(alternates)
+                    for dependency_id, alternates in (
+                        payload.dependency_output_alternates.items()
+                    )
+                },
+            }
+            for step_id, payload in step_payloads.items()
+        }
+        for plan_id, step_payloads in payloads_by_plan_id.items()
+    }
+
+
+def _restore_step_agents(candidate: Any) -> dict[str, Mapping[str, str]]:
+    if candidate is None:
+        return {}
+    if not isinstance(candidate, Mapping):
+        raise PlanApprovalStateError("approvedPlanStepAgents must be an object")
+
+    return {
+        str(plan_id): MappingProxyType(_restore_string_map(step_agents))
+        for plan_id, step_agents in candidate.items()
+    }
+
+
+def _restore_step_payloads(
+    candidate: Any,
+) -> dict[str, Mapping[str, _ApprovedStepPayload]]:
+    if candidate is None:
+        return {}
+    if not isinstance(candidate, Mapping):
+        raise PlanApprovalStateError("approvedPlanStepPayloads must be an object")
+
+    payloads_by_plan_id: dict[str, Mapping[str, _ApprovedStepPayload]] = {}
+    for plan_id, step_payloads in candidate.items():
+        if not isinstance(step_payloads, Mapping):
+            raise PlanApprovalStateError(
+                "approvedPlanStepPayloads plan entries must be objects"
+            )
+        payloads_by_plan_id[str(plan_id)] = MappingProxyType(
+            {
+                str(step_id): _restore_step_payload(payload)
+                for step_id, payload in step_payloads.items()
+            }
+        )
+    return payloads_by_plan_id
+
+
+def _restore_step_payload(candidate: Any) -> _ApprovedStepPayload:
+    if not isinstance(candidate, Mapping):
+        raise PlanApprovalStateError("approved step payload must be an object")
+
+    context = candidate.get("context")
+    if not isinstance(context, Mapping):
+        raise PlanApprovalStateError("approved step payload context must be an object")
+
+    dependency_output_alternates = candidate.get("dependencyOutputAlternates", {})
+    if not isinstance(dependency_output_alternates, Mapping):
+        raise PlanApprovalStateError(
+            "approved step dependency alternates must be an object"
+        )
+
+    return _ApprovedStepPayload(
+        agent_id=_required_snapshot_string(candidate, "agentId"),
+        user_input=_required_snapshot_string(candidate, "userInput"),
+        context=_freeze_approval_value(context),
+        dependency_output_alternates=MappingProxyType(
+            {
+                str(dependency_id): tuple(_restore_string_sequence(alternates))
+                for dependency_id, alternates in dependency_output_alternates.items()
+            }
+        ),
+    )
+
+
+def _restore_string_map(candidate: Any) -> dict[str, str]:
+    if candidate is None:
+        return {}
+    if not isinstance(candidate, Mapping):
+        raise PlanApprovalStateError("snapshot field must be an object")
+    restored: dict[str, str] = {}
+    for key, value in candidate.items():
+        if not isinstance(value, str):
+            raise PlanApprovalStateError("snapshot map values must be strings")
+        restored[str(key)] = value
+    return restored
+
+
+def _restore_string_sequence(candidate: Any) -> list[str]:
+    if not isinstance(candidate, list):
+        raise PlanApprovalStateError("snapshot sequence must be a list")
+    if not all(isinstance(value, str) for value in candidate):
+        raise PlanApprovalStateError("snapshot sequence values must be strings")
+    return list(candidate)
+
+
+def _required_snapshot_mapping(
+    snapshot: Mapping[str, Any],
+    field_name: str,
+) -> Mapping[str, Any]:
+    value = snapshot.get(field_name)
+    if not isinstance(value, Mapping):
+        raise PlanApprovalStateError(f"{field_name} must be an object")
+    return value
+
+
+def _required_snapshot_string(
+    snapshot: Mapping[str, Any],
+    field_name: str,
+) -> str:
+    value = snapshot.get(field_name)
+    if not isinstance(value, str):
+        raise PlanApprovalStateError(f"{field_name} must be a string")
+    return value
+
+
+def _optional_snapshot_string(candidate: Any) -> str | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, str):
+        return candidate
+    raise PlanApprovalStateError("snapshot field must be a string or null")
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(child) for key, child in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(child) for child in value]
+    if isinstance(value, set | frozenset):
+        return sorted(_json_safe(child) for child in value)
+    return value
+
 
 def _approved_step_context(
     plan: ExecutionPlan,
