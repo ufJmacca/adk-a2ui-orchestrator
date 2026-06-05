@@ -1,7 +1,9 @@
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tomllib
+from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +43,27 @@ REQUIRED_UV_GATE_COMMANDS = (
     "uv run mypy orchestrator_demo",
 )
 
+REQUIRED_PRIMARY_RUNTIME_COMMAND = (
+    "uv run adk api_server --a2a --with_ui orchestrator_demo "
+    "--host 0.0.0.0 --port 8000 "
+    "--session_service_uri sqlite://.adk/orchestrator_sessions.sqlite "
+    "--artifact_service_uri file://.adk/artifacts"
+)
+
+REQUIRED_DEV_UI_DEBUG_COMMAND = (
+    "uv run adk web orchestrator_demo --host 0.0.0.0 --port 8000"
+)
+
+PROHIBITED_README_RUNTIME_MARKERS = (
+    "python -m orchestrator_demo.app",
+    "/api/request",
+    "/api/user-action",
+    "/api/status/stream",
+    "/api/status",
+    "/api/artifacts",
+    "GET /",
+)
+
 PROHIBITED_DEPENDENCY_MANAGER_FILES = {
     "requirements.txt",
     "poetry.lock",
@@ -58,6 +81,54 @@ def _dependency_name(requirement: str) -> str:
 def _version_tuple(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")[:3]
     return int(major), int(minor), int(patch)
+
+
+def _readme_command_lines(readme: str) -> list[str]:
+    command_lines: list[str] = []
+    in_command_block = False
+
+    for raw_line in readme.splitlines():
+        line = raw_line.strip()
+        if line in {"```bash", "```sh", "```shell"}:
+            in_command_block = True
+            continue
+        if in_command_block and line == "```":
+            in_command_block = False
+            continue
+        if in_command_block and line:
+            command_lines.append(line)
+
+    return command_lines
+
+
+def _readme_h2_sections(readme: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    current_heading: str | None = None
+    current_lines: list[str] = []
+
+    for line in readme.splitlines():
+        if line.startswith("## "):
+            if current_heading is not None:
+                sections[current_heading] = "\n".join(current_lines).strip()
+            current_heading = line.removeprefix("## ").strip()
+            current_lines = []
+            continue
+        if current_heading is not None:
+            current_lines.append(line)
+
+    if current_heading is not None:
+        sections[current_heading] = "\n".join(current_lines).strip()
+
+    return sections
+
+
+def _squash_whitespace(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _command_option_value(command: str, option: str) -> str:
+    arguments = shlex.split(command)
+    return arguments[arguments.index(option) + 1]
 
 
 def test_required_bootstrap_files_exist() -> None:
@@ -151,6 +222,143 @@ def test_readme_documents_required_uv_quality_gate_commands() -> None:
     assert missing_commands == []
 
 
+def test_readme_documents_adk_lazy_missing_configuration_behavior() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    runtime_configuration_section = _readme_h2_sections(readme).get(
+        "Runtime Configuration"
+    )
+
+    # Assert
+    assert runtime_configuration_section is not None
+    runtime_configuration_text = _squash_whitespace(
+        runtime_configuration_section.lower()
+    )
+
+    assert "loads the root agent lazily" in runtime_configuration_text
+    assert "can start, serve the dev ui, and publish the a2a card" in (
+        runtime_configuration_text
+    )
+    assert "reported on the first agent request" in runtime_configuration_text
+    assert "fails fast" not in runtime_configuration_text
+    assert "fail-fast" not in runtime_configuration_text
+
+
+def test_readme_primary_runtime_section_documents_required_adk_a2a_command() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+    expected_command = REQUIRED_PRIMARY_RUNTIME_COMMAND
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    readme_command_lines = _readme_command_lines(readme)
+    primary_runtime_section = _readme_h2_sections(readme).get(
+        "Primary Local Runtime"
+    )
+    primary_runtime_command_lines = _readme_command_lines(
+        primary_runtime_section or ""
+    )
+
+    # Assert
+    assert primary_runtime_section is not None
+    primary_runtime_text = _squash_whitespace(primary_runtime_section.lower())
+
+    assert "primary local runtime" in primary_runtime_text
+    assert primary_runtime_command_lines.count(expected_command) == 1
+    assert REQUIRED_DEV_UI_DEBUG_COMMAND not in primary_runtime_command_lines
+    assert readme_command_lines.count(expected_command) == 1
+
+
+def test_readme_primary_runtime_command_uses_prd_required_local_storage_uris() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+    expected_session_uri = "sqlite://.adk/orchestrator_sessions.sqlite"
+    expected_artifact_uri = "file://.adk/artifacts"
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    session_uri = _command_option_value(
+        REQUIRED_PRIMARY_RUNTIME_COMMAND,
+        "--session_service_uri",
+    )
+    artifact_uri = _command_option_value(
+        REQUIRED_PRIMARY_RUNTIME_COMMAND,
+        "--artifact_service_uri",
+    )
+
+    # Assert
+    assert REQUIRED_PRIMARY_RUNTIME_COMMAND in readme
+    assert session_uri == expected_session_uri
+    assert artifact_uri == expected_artifact_uri
+
+    session_parts = urlparse(session_uri)
+    artifact_parts = urlparse(artifact_uri)
+
+    assert session_parts.scheme == "sqlite"
+    assert session_parts.netloc == ".adk"
+    assert session_parts.path == "/orchestrator_sessions.sqlite"
+    assert artifact_parts.scheme == "file"
+    assert artifact_parts.netloc == ".adk"
+    assert artifact_parts.path == "/artifacts"
+
+
+def test_readme_dev_ui_debugging_section_keeps_adk_web_debugging_only() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+    expected_command = REQUIRED_DEV_UI_DEBUG_COMMAND
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    readme_command_lines = _readme_command_lines(readme)
+    dev_ui_debugging_section = _readme_h2_sections(readme).get("Dev UI Debugging")
+    dev_ui_debugging_command_lines = _readme_command_lines(
+        dev_ui_debugging_section or ""
+    )
+
+    # Assert
+    assert dev_ui_debugging_section is not None
+    dev_ui_debugging_text = _squash_whitespace(dev_ui_debugging_section.lower())
+
+    assert "only for dev ui debugging" in dev_ui_debugging_text
+    assert "not the primary local runtime" in dev_ui_debugging_text
+    assert dev_ui_debugging_command_lines.count(expected_command) == 1
+    assert REQUIRED_PRIMARY_RUNTIME_COMMAND not in dev_ui_debugging_command_lines
+    assert readme_command_lines.count(expected_command) == 1
+
+
+def test_readme_no_longer_documents_custom_http_runtime_paths() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+    prohibited_markers = PROHIBITED_README_RUNTIME_MARKERS
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    documented_markers = [
+        marker for marker in prohibited_markers if marker in readme
+    ]
+
+    # Assert
+    assert documented_markers == []
+
+
+def test_readme_shell_commands_use_uv_only_project_execution() -> None:
+    # Arrange
+    readme_path = ROOT / "README.md"
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    command_lines = _readme_command_lines(readme)
+    non_uv_commands = sorted(
+        command for command in command_lines if not command.startswith("uv ")
+    )
+
+    # Assert
+    assert non_uv_commands == []
+
+
 def test_uv_lock_contains_declared_project_dependencies() -> None:
     # Arrange
     lock_path = ROOT / "uv.lock"
@@ -205,6 +413,7 @@ def test_gitignore_protects_runtime_secrets_and_local_venv() -> None:
     assert ".env" in ignore_rules
     assert ".env.*" in ignore_rules
     assert "!.env.example" in ignore_rules
+    assert ".adk/" in ignore_rules
     assert ".venv/" in ignore_rules
     assert "__pycache__/" in ignore_rules
     assert "*.py[cod]" in ignore_rules
