@@ -349,12 +349,24 @@ def _sdk_compatible_payload(value: Any) -> Any:
                 normalized[key] = _sdk_compatible_event_context(child_value)
             else:
                 normalized[key] = _sdk_compatible_payload(child_value)
+        if _is_label_only_button_component(value):
+            normalized.pop("label", None)
+            normalized["child"] = f"{value['id']}_label"
         return normalized
 
     if isinstance(value, list):
         return [_sdk_compatible_payload(item) for item in value]
 
     return value
+
+
+def _is_label_only_button_component(value: Mapping[Any, Any]) -> bool:
+    return (
+        value.get("component") == "Button"
+        and isinstance(value.get("id"), str)
+        and isinstance(value.get("label"), str)
+        and "child" not in value
+    )
 
 
 def _sdk_compatible_event_context(context: Mapping[str, Any]) -> dict[Any, Any]:

@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2ui_support.adk_ui_delivery import A2UIWidgetDeliveryError
 from orchestrator_demo.a2ui_support.approval_canvas import A2UIEmissionError
 from orchestrator_demo.a2ui_support.renderer_contract import RendererContractError
 from orchestrator_demo.a2ui_support.secret_safety import redact_secret_like_values
@@ -419,7 +420,10 @@ def _error_code_and_message(exc: BaseException) -> tuple[str, str]:
         return "graph_execution_failed", "The approved graph could not be executed."
     if isinstance(exc, SurfaceOwnershipError):
         return "surface_ownership_error", "The A2UI surface ownership change failed."
-    if isinstance(exc, A2UIEmissionError | RendererContractError):
+    if isinstance(
+        exc,
+        A2UIEmissionError | A2UIWidgetDeliveryError | RendererContractError,
+    ):
         return "a2ui_delivery_error", "The A2UI payload could not be delivered safely."
     if isinstance(exc, ArtifactStorageError | OSError):
         return "artifact_storage_error", "The artifact could not be saved."

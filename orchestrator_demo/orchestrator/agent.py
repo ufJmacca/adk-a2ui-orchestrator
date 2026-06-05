@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 
@@ -11,6 +11,11 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 
+from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+    deliver_a2ui_parts_to_adk_ui,
+    install_a2ui_response_event_delivery,
+)
 from orchestrator_demo.a2ui_support.secret_safety import (
     safe_path_component,
 )
@@ -40,6 +45,8 @@ ORCHESTRATOR_SESSION_STATE_KEY = "orchestrator_session"
 _FINAL_APPROVAL_STATUSES = frozenset(
     {"approved", "approved_execution_failed", "rejected"}
 )
+
+install_a2ui_response_event_delivery()
 
 
 class OrchestratorAgent:
@@ -133,6 +140,11 @@ class AdkOrchestratorAdapter:
                         "status": "failed",
                         "error": build_error_response(exc)["error"],
                     }
+                self._deliver_a2ui_to_adk_ui(
+                    tool_context,
+                    response,
+                    validated_a2ui_parts=result.a2ui_parts,
+                )
                 self._persist_session_to_context(tool_context)
             except Exception as exc:
                 if session_ready:
@@ -306,6 +318,11 @@ class AdkOrchestratorAdapter:
                     }
                 )
                 response = build_user_action_response(result)
+                if (
+                    response.get("status") == "rejected"
+                    and "approvalSurfaceId" not in response
+                ):
+                    response["approvalSurfaceId"] = approval_surface_id
                 try:
                     await self._save_user_action_artifacts(
                         tool_context,
@@ -320,6 +337,11 @@ class AdkOrchestratorAdapter:
                         "status": "failed",
                         "error": build_error_response(exc)["error"],
                     }
+                self._deliver_a2ui_to_adk_ui(
+                    tool_context,
+                    response,
+                    validated_a2ui_parts=result.a2ui_parts,
+                )
                 self._persist_session_to_context(tool_context)
             except Exception as exc:
                 if session_ready:
@@ -397,6 +419,19 @@ class AdkOrchestratorAdapter:
 
         self._agent.record_artifact_refs({filename: artifact_ref})
         response["artifactRefs"] = self._agent.artifact_refs()
+
+    def _deliver_a2ui_to_adk_ui(
+        self,
+        tool_context: ToolContext | None,
+        response: Mapping[str, Any],
+        *,
+        validated_a2ui_parts: Sequence[DataPart] | None = None,
+    ) -> None:
+        deliver_a2ui_parts_to_adk_ui(
+            response,
+            tool_context,
+            validated_a2ui_parts=validated_a2ui_parts,
+        )
 
     def _restore_session_from_context(
         self,
@@ -649,8 +684,8 @@ def build_root_agent(
             "Use add_plan_instruction, remove_plan_step, replace_plan_agent, or "
             "reorder_plan_steps before approve_orchestrator_plan when the user "
             "requests plan changes. "
-            "This ADK Web surface does not render A2UI components; it exposes "
-            "the orchestrator through tools for debugging."
+            "This ADK Web surface emits validated A2UI parts and structured "
+            "JSON through tools for debugging."
         ),
         tools=resolved_adapter.tools(),
     )

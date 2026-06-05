@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,6 +30,25 @@ _EVENT_METADATA_ALIASES: dict[str, tuple[str, ...]] = {
         "editedPlanVersion",
         "edited_plan_version",
     ),
+}
+_USER_ACTION_FIELDS = {
+    "actionId",
+    "action_id",
+    "type",
+    "surfaceId",
+    "surface_id",
+    "planId",
+    "plan_id",
+    "planVersion",
+    "plan_version",
+    "payload",
+}
+_JSON_LITERAL_CONTEXT_KEYS = {
+    "approvalEdits",
+    "approvedStepIds",
+    "editableFields",
+    "filters",
+    "orderedStepIds",
 }
 
 
@@ -92,38 +112,55 @@ def _extract_event_payload(candidate: Any) -> Mapping[str, Any]:
     )
 
 
-def _event_payload_from_mapping(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+def _event_payload_from_mapping(
+    candidate: Mapping[str, Any],
+    source: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    source = candidate if source is None else source
     user_action = candidate.get("userAction")
     if isinstance(user_action, Mapping):
-        return _direct_user_action_payload(
-            _with_renderer_edit_state(user_action, candidate)
+        derived_payload = _adk_rendered_user_action_payload(user_action, source)
+        if derived_payload is not None:
+            return derived_payload
+        return _with_source_approval_edits(
+            _direct_user_action_payload(user_action),
+            source,
         )
 
     action = candidate.get("action")
     if isinstance(action, Mapping):
-        return _event_payload_from_mapping(_with_renderer_edit_state(action, candidate))
+        return _event_payload_from_mapping(_with_renderer_edit_state(action, source), source)
 
     derived_payload = _derive_user_action_from_event_name(candidate)
     if derived_payload is not None:
-        return derived_payload
+        return _with_source_approval_edits(derived_payload, source)
 
     event = candidate.get("event")
     if isinstance(event, Mapping):
-        return _event_payload_from_event(event, candidate)
+        return _event_payload_from_event(event, source)
 
     context = candidate.get("context")
     if isinstance(context, Mapping):
-        return _event_payload_from_mapping(_with_renderer_edit_state(context, candidate))
+        return _event_payload_from_mapping(
+            _with_renderer_edit_state(_decoded_mapping_context(context), source),
+            source,
+        )
+    basic_catalog_context = _basic_catalog_payload_from(context)
+    if basic_catalog_context is not None:
+        return _event_payload_from_mapping(
+            _with_renderer_edit_state(basic_catalog_context, source),
+            source,
+        )
 
     if isinstance(candidate.get("type"), str) and isinstance(
         candidate.get("surfaceId") or candidate.get("surface_id"),
         str,
     ):
-        return _direct_user_action_payload(candidate)
+        return _with_source_approval_edits(_direct_user_action_payload(candidate), source)
 
     data = candidate.get("data")
     if isinstance(data, Mapping):
-        return _event_payload_from_mapping(_with_renderer_edit_state(data, candidate))
+        return _event_payload_from_mapping(_with_renderer_edit_state(data, source), source)
 
     raise StructuredUserActionRequiredError(
         "plan approval requires a structured A2UI userAction event"
@@ -137,24 +174,87 @@ def _event_payload_from_event(
     payload = _with_renderer_edit_state(event, source)
     derived_payload = _derive_user_action_from_event_name(payload)
     if derived_payload is not None:
-        return derived_payload
-    return _event_payload_from_mapping(payload)
+        return _with_source_approval_edits(derived_payload, source)
+    return _event_payload_from_mapping(payload, source)
 
 
 def _derive_user_action_from_event_name(
     event: Mapping[str, Any],
 ) -> Mapping[str, Any] | None:
     event_name = event.get("name")
-    context = event.get("context")
+    context_value = event.get("context")
+    context = (
+        _decoded_mapping_context(context_value)
+        if isinstance(context_value, Mapping)
+        else _basic_catalog_payload_from(context_value)
+    )
     if not isinstance(event_name, str) or not isinstance(context, Mapping):
         return None
 
     if isinstance(context.get("type"), str):
         return None
 
+    return _user_action_payload_from_event_name_context(event_name, context)
+
+
+def _adk_rendered_user_action_payload(
+    user_action: Mapping[str, Any],
+    source: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    payload = _with_renderer_edit_state(user_action, source)
+    event_name = payload.get("name")
+    if not isinstance(event_name, str):
+        return None
+
+    context_value = payload.get("context")
+    context = (
+        _decoded_mapping_context(context_value)
+        if isinstance(context_value, Mapping)
+        else _basic_catalog_payload_from(context_value)
+    )
+    if not isinstance(context, Mapping):
+        return None
+
+    surface_id = (
+        payload.get("surfaceId")
+        or payload.get("surface_id")
+        or context.get("surfaceId")
+        or context.get("surface_id")
+    )
+    if not isinstance(surface_id, str):
+        return None
+
+    context_with_surface = {
+        **context,
+        "surfaceId": surface_id,
+    }
+    derived_payload = _user_action_payload_from_event_name_context(
+        event_name,
+        context_with_surface,
+    )
+    if derived_payload is None:
+        return None
+    derived_payload = _with_source_approval_edits(derived_payload, source)
+
+    action_id = payload.get("actionId") or payload.get("action_id")
+    if isinstance(action_id, str):
+        return {
+            **derived_payload,
+            "actionId": action_id,
+        }
+    return derived_payload
+
+
+def _user_action_payload_from_event_name_context(
+    event_name: str,
+    context: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
     surface_id = context.get("surfaceId") or context.get("surface_id")
     if not isinstance(surface_id, str):
         return None
+    action_type = context.get("type")
+    if not isinstance(action_type, str):
+        action_type = event_name
 
     action_payload = context.get("payload")
     context_payload = {
@@ -163,10 +263,22 @@ def _derive_user_action_from_event_name(
         if key not in {"payload"}
     }
     if isinstance(action_payload, Mapping):
-        _reject_conflicting_event_metadata(context_payload, action_payload)
+        is_plan_action = (
+            action_type in SUPPORTED_PLAN_USER_ACTION_TYPES
+            or surface_id.startswith(PLAN_APPROVAL_SURFACE_PREFIX)
+        )
+        if is_plan_action:
+            _reject_conflicting_event_metadata(context_payload, action_payload)
+        excluded_metadata = {"type"}
+        if not is_plan_action:
+            excluded_metadata.update({"surfaceId", "surface_id"})
         payload = {
+            **{
+                key: value
+                for key, value in context_payload.items()
+                if key not in excluded_metadata
+            },
             **action_payload,
-            **context_payload,
         }
     else:
         payload = {
@@ -176,9 +288,31 @@ def _derive_user_action_from_event_name(
         }
 
     return {
-        "type": event_name,
+        "type": action_type,
         "surfaceId": surface_id,
         "payload": payload,
+    }
+
+
+def _with_source_approval_edits(
+    payload: Mapping[str, Any],
+    source: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    approval_edits = _approval_edits_from(source)
+    action_payload = payload.get("payload")
+    if (
+        approval_edits is None
+        or not isinstance(action_payload, Mapping)
+        or "approvalEdits" in action_payload
+    ):
+        return payload
+
+    return {
+        **payload,
+        "payload": {
+            **action_payload,
+            "approvalEdits": approval_edits,
+        },
     }
 
 
@@ -257,16 +391,45 @@ def _direct_user_action_payload(candidate: Mapping[str, Any]) -> Mapping[str, An
         if key not in {"approvalEdits", "data", "values", "formData", "state"}
     }
     action_payload = direct_payload.get("payload")
-    normalized_payload = _basic_catalog_payload_from(action_payload)
+    normalized_payload = _basic_catalog_payload_from(
+        action_payload,
+        decode_json_literals=True,
+    )
     if normalized_payload is not None:
         direct_payload = {
             **direct_payload,
             "payload": normalized_payload,
         }
+    elif not isinstance(action_payload, Mapping):
+        direct_payload = _with_flattened_context_payload(direct_payload)
     return direct_payload
 
 
-def _basic_catalog_payload_from(value: Any) -> dict[str, Any] | None:
+def _with_flattened_context_payload(
+    direct_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(direct_payload)
+    extra_payload = {
+        key: _decoded_flattened_context_value(key, normalized.pop(key))
+        for key in list(normalized)
+        if key not in _USER_ACTION_FIELDS
+    }
+    if not extra_payload:
+        return normalized
+
+    for metadata_name in ("planId", "planVersion"):
+        if metadata_name in normalized:
+            extra_payload.setdefault(metadata_name, normalized[metadata_name])
+
+    normalized["payload"] = extra_payload
+    return normalized
+
+
+def _basic_catalog_payload_from(
+    value: Any,
+    *,
+    decode_json_literals: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(value, list):
         return None
 
@@ -277,8 +440,107 @@ def _basic_catalog_payload_from(value: Any) -> dict[str, Any] | None:
         key = item.get("key")
         if not isinstance(key, str) or not key:
             return None
-        payload[key] = item.get("value")
+        payload[key] = _basic_catalog_value_from(
+            item.get("value"),
+            key=key,
+            decode_json_literals=decode_json_literals or key == "payload",
+        )
     return payload
+
+
+def _basic_catalog_value_from(
+    value: Any,
+    *,
+    key: str | None = None,
+    decode_json_literals: bool = False,
+) -> Any:
+    nested_payload = _basic_catalog_payload_from(
+        value,
+        decode_json_literals=decode_json_literals,
+    )
+    if nested_payload is not None:
+        return nested_payload
+    if isinstance(value, Mapping):
+        if isinstance(value.get("literalString"), str):
+            return _decoded_literal_string(
+                value["literalString"],
+                key=key,
+                decode_json_literal=decode_json_literals,
+            )
+        if isinstance(value.get("literalNumber"), int | float) and not isinstance(
+            value.get("literalNumber"),
+            bool,
+        ):
+            return value["literalNumber"]
+        if isinstance(value.get("literalBoolean"), bool):
+            return value["literalBoolean"]
+        if isinstance(value.get("path"), str):
+            return {"path": value["path"]}
+    return value
+
+
+def _decoded_flattened_context_value(key: str, value: Any) -> Any:
+    if isinstance(value, str):
+        return _decoded_literal_string(value, key=key)
+    return value
+
+
+def _decoded_mapping_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: _decoded_mapping_context_value(
+            key,
+            value,
+            decode_json_literals=key == "payload",
+        )
+        for key, value in context.items()
+    }
+
+
+def _decoded_mapping_context_value(
+    key: Any,
+    value: Any,
+    *,
+    decode_json_literals: bool = False,
+) -> Any:
+    if isinstance(value, str):
+        return _decoded_literal_string(
+            value,
+            key=key if isinstance(key, str) else None,
+            decode_json_literal=decode_json_literals,
+        )
+    if isinstance(value, Mapping):
+        return {
+            nested_key: _decoded_mapping_context_value(
+                nested_key,
+                nested_value,
+            )
+            for nested_key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _decoded_mapping_context_value(
+                None,
+                item,
+            )
+            for item in value
+        ]
+    return value
+
+
+def _decoded_literal_string(
+    value: str,
+    *,
+    key: str | None,
+    decode_json_literal: bool = False,
+) -> Any:
+    if not decode_json_literal and key not in _JSON_LITERAL_CONTEXT_KEYS:
+        return value
+    if value[:1] not in {"[", "{"}:
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def _approval_edits_from(source: Mapping[str, Any]) -> Any | None:

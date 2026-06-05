@@ -360,6 +360,160 @@ def test_parser_preserves_context_plan_metadata_for_event_name_payload() -> None
     assert parsed.payload["approvedStepIds"] == ["step_relationship_summary"]
 
 
+def test_parser_preserves_nested_key_value_payload_for_event_name_context() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
+
+    event = {
+        "event": {
+            "name": "approve_plan",
+            "context": [
+                {"key": "surfaceId", "value": "surface_plan_meeting_prep"},
+                {
+                    "key": "payload",
+                    "value": [
+                        {"key": "planId", "value": "plan_meeting_prep"},
+                        {"key": "planVersion", "value": 1},
+                        {
+                            "key": "approvedStepIds",
+                            "value": ["step_relationship_summary"],
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    # Act
+    parsed = parse_plan_user_action(event)
+
+    # Assert
+    assert parsed.type == "approve_plan"
+    assert parsed.surface_id == "surface_plan_meeting_prep"
+    assert parsed.plan_id == "plan_meeting_prep"
+    assert parsed.plan_version == 1
+    assert parsed.payload == {
+        "surfaceId": "surface_plan_meeting_prep",
+        "planId": "plan_meeting_prep",
+        "planVersion": 1,
+        "approvedStepIds": ["step_relationship_summary"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("action_name", "context", "expected_payload"),
+    [
+        (
+            "approve_plan",
+            {
+                "planId": "plan_meeting_prep",
+                "planVersion": 1,
+                "approvedStepIds": ["step_relationship_summary"],
+            },
+            {
+                "planId": "plan_meeting_prep",
+                "planVersion": 1,
+                "approvedStepIds": ["step_relationship_summary"],
+            },
+        ),
+        (
+            "add_instruction",
+            {
+                "planId": "plan_meeting_prep",
+                "planVersion": 1,
+                "stepId": "step_internal_knowledge",
+                "instruction": "Prioritize covenant follow-ups.",
+            },
+            {
+                "planId": "plan_meeting_prep",
+                "planVersion": 1,
+                "stepId": "step_internal_knowledge",
+                "instruction": "Prioritize covenant follow-ups.",
+            },
+        ),
+        (
+            "reject_plan",
+            {
+                "planId": "plan_meeting_prep",
+                "reason": "Do not run this workflow.",
+            },
+            {
+                "planId": "plan_meeting_prep",
+                "reason": "Do not run this workflow.",
+            },
+        ),
+    ],
+)
+def test_parser_accepts_adk_rendered_user_action_click(
+    action_name: str,
+    context: dict[str, object],
+    expected_payload: dict[str, object],
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
+
+    event = {
+        "userAction": {
+            "name": action_name,
+            "surfaceId": "surface_plan_meeting_prep",
+            "context": context,
+        },
+    }
+
+    # Act
+    parsed = parse_plan_user_action(event)
+
+    # Assert
+    assert parsed.type == action_name
+    assert parsed.surface_id == "surface_plan_meeting_prep"
+    assert parsed.plan_id == "plan_meeting_prep"
+    if action_name == "reject_plan":
+        assert parsed.plan_version is None
+    else:
+        assert parsed.plan_version == 1
+    assert parsed.payload == expected_payload
+
+
+def test_parser_accepts_adk_rendered_user_action_key_value_context() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_plan_user_action
+
+    event = {
+        "userAction": {
+            "name": "approve_plan",
+            "surfaceId": "surface_plan_meeting_prep",
+            "context": [
+                {"key": "planId", "value": "plan_meeting_prep"},
+                {"key": "planVersion", "value": 1},
+                {
+                    "key": "payload",
+                    "value": [
+                        {
+                            "key": "approvedStepIds",
+                            "value": ["step_relationship_summary"],
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    # Act
+    parsed = parse_plan_user_action(event)
+
+    # Assert
+    assert parsed.type == "approve_plan"
+    assert parsed.surface_id == "surface_plan_meeting_prep"
+    assert parsed.plan_id == "plan_meeting_prep"
+    assert parsed.plan_version == 1
+    assert parsed.payload == {
+        "approvedStepIds": ["step_relationship_summary"],
+        "planId": "plan_meeting_prep",
+        "planVersion": 1,
+        "surfaceId": "surface_plan_meeting_prep",
+    }
+
+
 @pytest.mark.parametrize(
     ("payload_metadata", "expected_field"),
     [

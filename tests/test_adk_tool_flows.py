@@ -1,13 +1,32 @@
 from __future__ import annotations
 
-import json
 import inspect
+import json
+from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from a2a import types as a2a_types
+from google.adk.a2a.converters import part_converter
+from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
+from google.adk.events.ui_widget import UiWidget
+from google.adk.flows.llm_flows import functions as adk_functions
+from google.adk.tools.base_tool import BaseTool
 from google.genai import types
 
 from orchestrator_demo.agents import build_default_specialists
+from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2ui_support.renderer_contract import (
+    prepare_specialist_a2ui_for_renderer,
+)
+from orchestrator_demo.a2ui_support.schema_manager import A2UI_VERSION
+from orchestrator_demo.contracts import (
+    IntentSuggestion,
+    LlmIntentAssessment,
+    RoutingDecision,
+)
 from orchestrator_demo.orchestrator.agent import (
     ORCHESTRATOR_SESSION_STATE_KEY,
     AdkOrchestratorAdapter,
@@ -15,21 +34,24 @@ from orchestrator_demo.orchestrator.agent import (
     build_root_agent,
 )
 from orchestrator_demo.orchestrator.service import (
+    OrchestratorRequestResult,
     OrchestratorService,
     OrchestratorUserActionResult,
 )
+from orchestrator_demo.orchestrator.request_context import RequestContext
+from orchestrator_demo.orchestrator.surface_routes import SurfaceRouteRegistry
 
 
-class FakeActions:
-    def __init__(self) -> None:
-        self.skip_summarization = False
+A2UI_MIME_TYPE = "application/json+a2ui"
 
 
 class FakeToolContext:
     def __init__(self) -> None:
         self.state: dict[str, Any] = {}
-        self.actions = FakeActions()
+        self.actions = EventActions()
+        self.function_call_id = "call_a2ui"
         self.saved_artifacts: list[dict[str, Any]] = []
+        self.rendered_ui_widgets: list[UiWidget] = []
 
     async def save_artifact(
         self,
@@ -53,6 +75,9 @@ class FakeToolContext:
             }
         )
         return version
+
+    def render_ui_widget(self, ui_widget: UiWidget) -> None:
+        self.rendered_ui_widgets.append(ui_widget)
 
 
 def _artifact_document(saved_artifact: dict[str, Any]) -> dict[str, Any]:
@@ -127,6 +152,317 @@ def _assert_data_part_payloads(response: dict[str, Any]) -> None:
         and part["metadata"]["mimeType"] == "application/json+a2ui"
         for part in response["a2uiParts"]
     )
+
+
+def _assert_no_custom_renderer_transport_fields(payload: Any) -> None:
+    rendered = json.dumps(payload, sort_keys=True)
+    for forbidden in (
+        "/api/request",
+        "/api/user-action",
+        "/api/status",
+        "/api/status/stream",
+        "/api/artifacts",
+        "/static/renderer.js",
+    ):
+        assert forbidden not in rendered
+
+
+def _adk_response_event_for(
+    response: dict[str, Any],
+    *,
+    tool_context: Any | None = None,
+) -> Any:
+    tool = BaseTool(name="submit_orchestrator_request", description="test")
+    if tool_context is None:
+        tool_context = SimpleNamespace(
+            function_call_id="call_a2ui",
+            actions=EventActions(),
+        )
+    invocation_context = SimpleNamespace(
+        invocation_id="invocation_a2ui",
+        agent=SimpleNamespace(name="orchestrator"),
+        branch=None,
+    )
+    return adk_functions.__build_response_event(
+        tool,
+        response,
+        tool_context,
+        invocation_context,
+    )
+
+
+def _tagged_a2ui_data_part(data: Mapping[str, Any]) -> types.Part:
+    source_data_part = a2a_types.DataPart(
+        data=dict(data),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    )
+    inline_blob = (
+        part_converter.A2A_DATA_PART_START_TAG
+        + source_data_part.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        ).encode("utf-8")
+        + part_converter.A2A_DATA_PART_END_TAG
+    )
+    return types.Part(
+        inline_data=types.Blob(
+            data=inline_blob,
+            mime_type=part_converter.A2A_DATA_PART_TEXT_MIME_TYPE,
+        )
+    )
+
+
+def _assert_a2ui_transport_is_filtered_from_model_history(event: Event) -> None:
+    from google.adk.flows.llm_flows import contents as adk_contents
+
+    function_call = types.Part.from_function_call(
+        name="submit_orchestrator_request",
+        args={"user_input": "test request"},
+    )
+    function_call.function_call.id = "call_a2ui"
+    function_call_event = Event(
+        invocation_id="invocation_a2ui",
+        author="orchestrator",
+        content=types.Content(role="model", parts=[function_call]),
+    )
+
+    model_contents = adk_contents._get_contents(
+        None,
+        [function_call_event, event],
+        "orchestrator",
+    )
+
+    assert len(model_contents) == 2
+    response_content = model_contents[1]
+    assert response_content.parts is not None
+    assert len(response_content.parts) == 1
+    assert response_content.parts[0].function_response is not None
+    assert response_content.parts[0].inline_data is None
+    serialized = json.dumps(
+        [
+            content.model_dump(by_alias=True, mode="json", exclude_none=True)
+            for content in model_contents
+        ],
+        sort_keys=True,
+    )
+    assert "a2a_datapart_json" not in serialized
+
+
+def _a2ui_data_parts_from_event(event: Event) -> list[a2a_types.DataPart]:
+    assert event.content is not None
+    assert event.content.parts is not None
+
+    return _a2ui_data_parts_from_content_parts(event.content.parts)
+
+
+def _a2ui_data_parts_from_content_parts(
+    content_parts: list[types.Part],
+) -> list[a2a_types.DataPart]:
+    data_parts: list[a2a_types.DataPart] = []
+    for content_part in content_parts:
+        converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+        if converted_part is None:
+            continue
+        data_part = converted_part.root
+        assert isinstance(data_part, a2a_types.DataPart)
+        if (
+            isinstance(data_part.metadata, Mapping)
+            and data_part.metadata.get("mimeType") == A2UI_MIME_TYPE
+        ):
+            data_parts.append(data_part)
+    return data_parts
+
+
+def _assert_a2ui_transport_events_are_filtered_from_model_history(
+    events: list[Event],
+) -> None:
+    from google.adk.flows.llm_flows import contents as adk_contents
+
+    function_call = types.Part.from_function_call(
+        name="submit_orchestrator_request",
+        args={"user_input": "test request"},
+    )
+    function_call.function_call.id = "call_a2ui"
+    function_call_event = Event(
+        invocation_id="invocation_a2ui",
+        author="orchestrator",
+        content=types.Content(role="model", parts=[function_call]),
+    )
+
+    model_contents = adk_contents._get_contents(
+        None,
+        [function_call_event, *events],
+        "orchestrator",
+    )
+
+    assert len(model_contents) == 2
+    response_content = model_contents[1]
+    assert response_content.parts is not None
+    assert [part.function_response is not None for part in response_content.parts] == [
+        True
+    ]
+    assert all(part.inline_data is None for part in response_content.parts)
+    serialized = json.dumps(
+        [
+            content.model_dump(by_alias=True, mode="json", exclude_none=True)
+            for content in model_contents
+        ],
+        sort_keys=True,
+    )
+    assert "a2a_datapart_json" not in serialized
+
+
+def test_a2ui_history_filter_preserves_inbound_user_action_data_parts() -> None:
+    from google.adk.flows.llm_flows import contents as adk_contents
+
+    user_action_data = {
+        "userAction": {
+            "type": "approve_plan",
+            "surfaceId": "surface_plan_meeting_prep",
+            "payload": {
+                "planId": "plan_meeting_prep",
+                "editedPlanVersion": 2,
+                "approvedStepIds": ["step_relationship", "step_treasury"],
+            },
+        }
+    }
+    inbound_event = Event(
+        invocation_id="invocation_inbound_a2ui",
+        author="user",
+        content=types.Content(
+            role="user",
+            parts=[_tagged_a2ui_data_part(user_action_data)],
+        ),
+    )
+
+    for get_model_contents in (
+        adk_contents._get_contents,
+        adk_contents._get_current_turn_contents,
+    ):
+        model_contents = get_model_contents(
+            None,
+            [inbound_event],
+            "orchestrator",
+        )
+
+        assert len(model_contents) == 1
+        content = model_contents[0]
+        assert content.parts is not None
+        assert len(content.parts) == 1
+        assert content.parts[0].inline_data is not None
+
+        converted_part = part_converter.convert_genai_part_to_a2a_part(
+            content.parts[0],
+        )
+        assert converted_part is not None
+        data_part = converted_part.root
+        assert isinstance(data_part, a2a_types.DataPart)
+        assert data_part.metadata == {"mimeType": A2UI_MIME_TYPE}
+        assert data_part.data == user_action_data
+
+
+def _assert_a2ui_transport_is_wired_to_adk_content(
+    response: dict[str, Any],
+    *,
+    tool_context: Any | None = None,
+) -> dict[str, Any]:
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_content_parts_for_a2ui_response,
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    event = _adk_response_event_for(response, tool_context=tool_context)
+    payload = event.model_dump(by_alias=True, mode="json", exclude_none=True)
+    assert event.custom_metadata == {"a2a:response": True}
+    assert payload["customMetadata"] == {"a2a:response": True}
+    assert event.content is not None
+    assert event.content.parts is not None
+    assert len(event.content.parts) > 1
+
+    function_response = event.content.parts[0].function_response
+    assert function_response is not None
+    assert function_response.response == response
+    assert event.content.parts[0].inline_data is None
+
+    a2a_data_parts = _a2ui_data_parts_from_content_parts(event.content.parts[1:])
+    expected_dev_ui_parts = _a2ui_data_parts_from_content_parts(
+        adk_dev_ui_content_parts_for_a2ui_response(
+            response,
+            tool_context=tool_context,
+        )
+    )
+    standard_a2a_parts = _a2ui_data_parts_from_content_parts(
+        adk_content_parts_for_a2ui_response(
+            response,
+            tool_context=tool_context,
+        )
+    )
+    assert a2a_data_parts == expected_dev_ui_parts
+    assert all(
+        part.metadata
+        and part.metadata.get("mimeType") == "application/json+a2ui"
+        for part in a2a_data_parts
+    )
+    expected_a2ui_data = [
+        part["data"]
+        for part in response["a2uiParts"]
+        if isinstance(part, Mapping)
+        and isinstance(part.get("metadata"), Mapping)
+        and part["metadata"].get("mimeType") == A2UI_MIME_TYPE
+    ]
+    assert [part.data for part in standard_a2a_parts] == expected_a2ui_data
+    assert all("version" in part.data for part in standard_a2a_parts)
+    assert all(
+        not {"beginRendering", "surfaceUpdate", "dataModelUpdate"}.intersection(
+            part.data
+        )
+        for part in standard_a2a_parts
+    )
+    assert all(
+        {
+            "beginRendering",
+            "surfaceUpdate",
+            "dataModelUpdate",
+            "deleteSurface",
+        }.intersection(part.data)
+        for part in a2a_data_parts
+    )
+    _assert_a2ui_transport_is_filtered_from_model_history(event)
+
+    _assert_no_custom_renderer_transport_fields(response)
+    _assert_no_custom_renderer_transport_fields(payload)
+    return payload
+
+
+def _assert_latest_a2ui_widget(
+    tool_context: FakeToolContext,
+    *,
+    widget_id: str,
+    response: dict[str, Any],
+) -> None:
+    assert tool_context.rendered_ui_widgets
+    widget = tool_context.rendered_ui_widgets[-1]
+    assert isinstance(widget, UiWidget)
+    assert widget.id == widget_id
+    assert widget.provider == "a2ui"
+    assert widget.payload == {"parts": response["a2uiParts"]}
+    _assert_no_custom_renderer_transport_fields(response)
+    _assert_no_custom_renderer_transport_fields(widget.model_dump(mode="json"))
+
+
+def _first_a2ui_surface_id(response: dict[str, Any]) -> str:
+    for part in response["a2uiParts"]:
+        data = part["data"]
+        for message_type in (
+            "createSurface",
+            "updateComponents",
+            "deleteSurface",
+            "updateDataModel",
+        ):
+            message = data.get(message_type)
+            if isinstance(message, dict) and isinstance(message.get("surfaceId"), str):
+                return message["surfaceId"]
+    raise AssertionError("response did not include an A2UI surface id")
 
 
 def _assert_approval_surface_deleted(
@@ -206,6 +542,38 @@ def _assert_a2ui_update_reflects_plan(response: dict[str, Any]) -> None:
         assert payload["editedPlanVersion"] == response["planVersion"]
 
 
+def _direct_request_result_with_a2ui(
+    a2ui_parts: tuple[DataPart, ...],
+) -> OrchestratorRequestResult:
+    decision = RoutingDecision(
+        path="direct",
+        selected_agent="product_opportunity",
+        confidence=1.0,
+        reason="test direct specialist response",
+    )
+    context = RequestContext(
+        user_input="test direct specialist request",
+        slm_suggestion=IntentSuggestion(
+            intent="product_opportunity",
+            confidence=1.0,
+        ),
+        llm_assessment=LlmIntentAssessment(
+            intents=["product_opportunity"],
+            confidence=1.0,
+            complexity="simple",
+            rationale="test",
+            required_agents=["product_opportunity"],
+        ),
+        decision=decision,
+    )
+    return OrchestratorRequestResult(
+        path="direct",
+        decision=decision,
+        context=context,
+        a2ui_parts=a2ui_parts,
+    )
+
+
 def test_root_agent_exposes_required_draft_edit_tools_with_required_fields() -> None:
     # Arrange
     root_agent = build_root_agent(
@@ -281,6 +649,517 @@ def test_approval_tools_require_final_adk_contract_fields() -> None:
         assert required_field in reject_parameters
         assert reject_parameters[required_field].default is inspect.Parameter.empty
     assert reject_parameters["edited_plan_version"].default is None
+
+
+@pytest.mark.asyncio
+async def test_tools_emit_adk_a2ui_widgets_and_top_level_a2a_parts() -> None:
+    # Arrange
+    plan_context = FakeToolContext()
+    plan_adapter = AdkOrchestratorAdapter()
+    rejection_context = FakeToolContext()
+    rejection_adapter = AdkOrchestratorAdapter()
+    specialist_context = FakeToolContext()
+
+    # Act
+    submitted = await plan_adapter.submit_orchestrator_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=plan_context,
+    )
+    updated = await plan_adapter.add_plan_instruction(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        submitted["stepIds"][0],
+        "Prioritize covenant follow-up questions.",
+        edited_plan_version=submitted["planVersion"],
+        tool_context=plan_context,
+    )
+    approved = await plan_adapter.approve_orchestrator_plan(
+        updated["planId"],
+        updated["approvalSurfaceId"],
+        updated["stepIds"],
+        edited_plan_version=updated["planVersion"],
+        tool_context=plan_context,
+    )
+    submitted_for_rejection = await rejection_adapter.submit_orchestrator_request(
+        "Research this prospect and give me risks, opportunities, and talking points.",
+        tool_context=rejection_context,
+    )
+    rejected = await rejection_adapter.reject_orchestrator_plan(
+        submitted_for_rejection["planId"],
+        submitted_for_rejection["approvalSurfaceId"],
+        "Do not run this workflow.",
+        edited_plan_version=submitted_for_rejection["planVersion"],
+        tool_context=rejection_context,
+    )
+    specialist = await AdkOrchestratorAdapter().submit_orchestrator_request(
+        "What product opportunities should I consider for a cafe business?",
+        tool_context=specialist_context,
+    )
+
+    # Assert
+    _assert_plan_response_contract(submitted)
+    _assert_draft_updated_contract(updated, submitted)
+    assert submitted["plan"]
+    assert updated["plan"]
+    assert submitted["nextActions"]
+    assert updated["nextActions"]
+    assert approved["status"] == "approved"
+    assert rejected["status"] == "rejected"
+    assert specialist["status"] == "direct"
+    for response in (approved, rejected, specialist):
+        _assert_data_part_payloads(response)
+
+    history_events = [
+        _assert_a2ui_transport_is_wired_to_adk_content(
+            response,
+            tool_context=context,
+        )
+        for response, context in (
+            (submitted, plan_context),
+            (updated, plan_context),
+            (approved, plan_context),
+            (rejected, rejection_context),
+            (specialist, specialist_context),
+        )
+    ]
+
+    plan_widgets = plan_context.rendered_ui_widgets
+    assert len(plan_widgets) == 3
+    assert [widget.id for widget in plan_widgets] == [
+        submitted["approvalSurfaceId"],
+        updated["approvalSurfaceId"],
+        approved["approvalSurfaceId"],
+    ]
+    assert all(widget.provider == "a2ui" for widget in plan_widgets)
+    assert plan_widgets[0].payload == {"parts": submitted["a2uiParts"]}
+    assert plan_widgets[1].payload == {"parts": updated["a2uiParts"]}
+    assert plan_widgets[2].payload == {"parts": approved["a2uiParts"]}
+
+    _assert_latest_a2ui_widget(
+        rejection_context,
+        widget_id=rejected["approvalSurfaceId"],
+        response=rejected,
+    )
+    _assert_latest_a2ui_widget(
+        specialist_context,
+        widget_id=_first_a2ui_surface_id(specialist),
+        response=specialist,
+    )
+
+    for payload in (
+        submitted,
+        updated,
+        approved,
+        rejected,
+        specialist,
+        history_events,
+        [widget.model_dump(mode="json") for widget in plan_widgets],
+    ):
+        _assert_no_custom_renderer_transport_fields(payload)
+
+
+@pytest.mark.asyncio
+async def test_adk_delivery_preserves_standard_a2a_a2ui_data_part_shape() -> None:
+    # Arrange
+    from google.adk.a2a.converters.from_adk_event import convert_event_to_a2a_events
+
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        _a2ui_transport_response_events_for_delivery,
+    )
+
+    tool_context = FakeToolContext()
+    adapter = AdkOrchestratorAdapter()
+    submitted = await adapter.submit_orchestrator_request(
+        "Research this prospect and give me risks, opportunities, and talking points.",
+        tool_context=tool_context,
+    )
+
+    # Act
+    approved = await adapter.approve_orchestrator_plan(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        submitted["stepIds"],
+        edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
+    )
+    event = _adk_response_event_for(approved, tool_context=tool_context)
+    delivery_events = _a2ui_transport_response_events_for_delivery(event)
+
+    # Assert
+    assert approved["status"] == "approved"
+    assert delivery_events
+    assert all(
+        event.custom_metadata == {"a2a:response": True}
+        for event in delivery_events
+    )
+
+    exported_data = [
+        data_part.data
+        for delivery_event in delivery_events
+        for data_part in _a2ui_data_parts_from_event(delivery_event)
+    ]
+    assert exported_data
+    assert any(
+        {
+            "beginRendering",
+            "surfaceUpdate",
+            "dataModelUpdate",
+            "deleteSurface",
+        }.intersection(data)
+        for data in exported_data
+    )
+
+    a2a_events: list[Any] = []
+    agents_artifacts: dict[str, str] = {}
+    for delivery_event in delivery_events:
+        a2a_events.extend(
+            convert_event_to_a2a_events(
+                delivery_event,
+                agents_artifacts,
+                "task_a2ui",
+                "context_a2ui",
+            )
+        )
+
+    exported_data = [
+        part.root.data
+        for a2a_event in a2a_events
+        if getattr(a2a_event, "artifact", None) is not None
+        for part in a2a_event.artifact.parts
+        if isinstance(part.root, a2a_types.DataPart)
+        and isinstance(part.root.metadata, Mapping)
+        and part.root.metadata.get("mimeType") == A2UI_MIME_TYPE
+    ]
+    expected_data = [part["data"] for part in approved["a2uiParts"]]
+    assert exported_data == expected_data
+    assert all("version" in data for data in exported_data)
+    assert all(
+        not {"beginRendering", "surfaceUpdate", "dataModelUpdate"}.intersection(data)
+        for data in exported_data
+    )
+
+    surface_ids: list[str] = []
+    for delivery_event in delivery_events:
+        messages = [
+            next(
+                message
+                for message in data_part.data.values()
+                if isinstance(message, dict)
+                and isinstance(message.get("surfaceId"), str)
+            )
+            for data_part in _a2ui_data_parts_from_event(delivery_event)
+            if any(
+                isinstance(message, dict) and isinstance(message.get("surfaceId"), str)
+                for message in data_part.data.values()
+            )
+        ]
+        surface_ids.extend(message["surfaceId"] for message in messages)
+
+    assert submitted["approvalSurfaceId"] in surface_ids
+    assert any("product_opportunity" in surface_id for surface_id in surface_ids)
+
+    first_parts = delivery_events[0].content.parts
+    assert first_parts is not None
+    assert any(part.function_response is not None for part in first_parts)
+    for delivery_event in delivery_events[1:]:
+        assert delivery_event.content is not None
+        assert delivery_event.content.parts is not None
+        assert all(
+            part.function_response is None
+            for part in delivery_event.content.parts
+        )
+        assert delivery_event.actions.state_delta == {}
+        assert delivery_event.actions.artifact_delta == {}
+        assert delivery_event.actions.render_ui_widgets is None
+
+    _assert_a2ui_transport_events_are_filtered_from_model_history(delivery_events)
+
+
+def test_parallel_a2ui_response_merge_preserves_marker_and_filters_history() -> None:
+    # Arrange
+    from google.adk.flows.llm_flows import contents as adk_contents
+
+    a2ui_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": "surface_parallel_a2ui",
+                "components": [
+                    {
+                        "component": "Text",
+                        "id": "root",
+                        "text": "Parallel A2UI update.",
+                    }
+                ],
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    a2ui_event = _adk_response_event_for(
+        {"approvalSurfaceId": "surface_parallel_a2ui", "a2uiParts": [a2ui_part]}
+    )
+    other_context = SimpleNamespace(
+        function_call_id="call_other",
+        actions=EventActions(),
+    )
+    other_event = _adk_response_event_for(
+        {"status": "ok", "a2uiParts": []},
+        tool_context=other_context,
+    )
+
+    function_call = types.Part.from_function_call(
+        name="submit_orchestrator_request",
+        args={"user_input": "test request"},
+    )
+    function_call.function_call.id = "call_a2ui"
+    other_function_call = types.Part.from_function_call(
+        name="submit_orchestrator_request",
+        args={"user_input": "other request"},
+    )
+    other_function_call.function_call.id = "call_other"
+    function_call_event = Event(
+        invocation_id="invocation_a2ui",
+        author="orchestrator",
+        content=types.Content(
+            role="model",
+            parts=[function_call, other_function_call],
+        ),
+    )
+
+    # Act
+    merged_event = adk_functions.merge_parallel_function_response_events(
+        [other_event, a2ui_event]
+    )
+
+    # Assert
+    assert merged_event.custom_metadata == {"a2a:response": True}
+    assert len(_a2ui_data_parts_from_event(merged_event)) == 1
+
+    model_contents = adk_contents._get_contents(
+        None,
+        [function_call_event, merged_event],
+        "orchestrator",
+    )
+    assert len(model_contents) == 2
+    response_content = model_contents[1]
+    assert response_content.parts is not None
+    assert len(response_content.parts) == 2
+    assert all(part.function_response is not None for part in response_content.parts)
+    assert all(part.inline_data is None for part in response_content.parts)
+    serialized = json.dumps(
+        [
+            content.model_dump(by_alias=True, mode="json", exclude_none=True)
+            for content in model_contents
+        ],
+        sort_keys=True,
+    )
+    assert "a2a_datapart_json" not in serialized
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": "ok"},
+        {"status": "ok", "a2uiParts": []},
+    ],
+)
+def test_adk_response_event_ignores_stale_a2ui_cache_without_current_parts(
+    response: dict[str, Any],
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        _VALIDATED_A2UI_PARTS_BY_RESPONSE_ID_ATTR,
+    )
+
+    tool_context = SimpleNamespace(
+        function_call_id="call_stale_cache",
+        actions=EventActions(),
+    )
+    stale_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": "surface_stale_cache",
+                "components": [
+                    {
+                        "component": "Text",
+                        "id": "root",
+                        "text": "This stale payload must not be delivered.",
+                    }
+                ],
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    setattr(
+        tool_context,
+        _VALIDATED_A2UI_PARTS_BY_RESPONSE_ID_ATTR,
+        {id(response): [stale_part]},
+    )
+
+    # Act
+    event = _adk_response_event_for(response, tool_context=tool_context)
+
+    # Assert
+    assert _a2ui_data_parts_from_event(event) == []
+    assert event.custom_metadata != {"a2a:response": True}
+    cached_parts_by_response_id = getattr(
+        tool_context,
+        _VALIDATED_A2UI_PARTS_BY_RESPONSE_ID_ATTR,
+    )
+    assert id(response) not in cached_parts_by_response_id
+
+
+@pytest.mark.asyncio
+async def test_adk_delivery_preserves_validated_incremental_specialist_update() -> None:
+    # Arrange
+    surface_id = "surface_incremental_specialist"
+    registry = SurfaceRouteRegistry()
+    initial_parts = tuple(
+        prepare_specialist_a2ui_for_renderer(
+            {
+                "version": A2UI_VERSION,
+                "updateComponents": {
+                    "surfaceId": surface_id,
+                    "components": [
+                        {
+                            "component": "Column",
+                            "id": "root",
+                            "children": ["component_prior_label"],
+                        },
+                        {
+                            "component": "Text",
+                            "id": "component_prior_label",
+                            "text": "Apply recommendation",
+                        },
+                    ],
+                },
+            },
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+    )
+    incremental_parts = tuple(
+        prepare_specialist_a2ui_for_renderer(
+            {
+                "version": A2UI_VERSION,
+                "updateComponents": {
+                    "surfaceId": surface_id,
+                    "components": [
+                        {
+                            "component": "Button",
+                            "id": "component_followup_button",
+                            "child": "component_prior_label",
+                            "action": {
+                                "event": {
+                                    "name": "specialist_followup",
+                                    "context": {
+                                        "type": "request_followup",
+                                        "surfaceId": surface_id,
+                                        "payload": {"source": "incremental"},
+                                    },
+                                }
+                            },
+                        }
+                    ],
+                },
+            },
+            owner_agent_id="product_opportunity",
+            surface_registry=registry,
+        )
+    )
+
+    class IncrementalSpecialistAgent(OrchestratorAgent):
+        def __init__(self) -> None:
+            self._results = [
+                _direct_request_result_with_a2ui(initial_parts),
+                _direct_request_result_with_a2ui(incremental_parts),
+            ]
+            self._session_service = OrchestratorService()
+
+        async def handle_request(self, user_input: str) -> OrchestratorRequestResult:
+            return self._results.pop(0)
+
+        def export_session_snapshot(self) -> dict[str, Any]:
+            return self._session_service.export_session_snapshot()
+
+        def restore_session_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+            self._session_service.restore_session_snapshot(snapshot)
+
+        def reset_session_snapshot(self) -> None:
+            self._session_service = OrchestratorService()
+
+        def artifact_refs(self) -> dict[str, Any]:
+            return self._session_service.artifact_refs()
+
+        def record_artifact_refs(self, artifact_refs: Mapping[str, Any]) -> None:
+            self._session_service.record_artifact_refs(artifact_refs)
+
+    tool_context = FakeToolContext()
+    adapter = AdkOrchestratorAdapter(agent=IncrementalSpecialistAgent())
+
+    # Act
+    initial = await adapter.submit_orchestrator_request(
+        "show the initial specialist surface",
+        tool_context=tool_context,
+    )
+    incremental = await adapter.submit_orchestrator_request(
+        "send an incremental specialist surface update",
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert initial["status"] == "direct"
+    assert incremental["status"] == "direct"
+    assert incremental["a2uiParts"] == [
+        part.model_dump(by_alias=True, mode="json") for part in incremental_parts
+    ]
+    assert len(tool_context.rendered_ui_widgets) == 2
+    widget = tool_context.rendered_ui_widgets[-1]
+    assert widget.id == surface_id
+    assert widget.provider == "a2ui"
+    assert widget.payload == {"parts": incremental["a2uiParts"]}
+    assert (
+        widget.payload["parts"][0]["data"]["updateComponents"]["components"][0]["child"]
+        == "component_prior_label"
+    )
+    assert incremental.get("error", {}).get("code") != "a2ui_delivery_error"
+
+    event = _adk_response_event_for(incremental, tool_context=tool_context)
+    assert event.content is not None
+    assert event.content.parts is not None
+    assert len(event.content.parts) == 2
+    converted_part = part_converter.convert_genai_part_to_a2a_part(
+        event.content.parts[1]
+    )
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    assert data_part.metadata
+    assert data_part.metadata["mimeType"] == "application/json+a2ui"
+    assert "surfaceUpdate" in data_part.data
+    assert "updateComponents" not in data_part.data
+    button = data_part.data["surfaceUpdate"]["components"][0]
+    assert button["component"]["Button"]["child"] == "component_prior_label"
+
+    from google.adk.a2a.converters.from_adk_event import convert_event_to_a2a_events
+
+    a2a_events = convert_event_to_a2a_events(
+        event,
+        {},
+        "task_incremental_a2ui",
+        "context_incremental_a2ui",
+    )
+    exported_data = [
+        part.root.data
+        for a2a_event in a2a_events
+        if getattr(a2a_event, "artifact", None) is not None
+        for part in a2a_event.artifact.parts
+        if isinstance(part.root, a2a_types.DataPart)
+        and isinstance(part.root.metadata, Mapping)
+        and part.root.metadata.get("mimeType") == A2UI_MIME_TYPE
+    ]
+    assert exported_data == [incremental["a2uiParts"][0]["data"]]
 
 
 @pytest.mark.asyncio
@@ -460,6 +1339,235 @@ async def test_draft_edit_tools_update_plan_a2ui_and_session_without_execution()
         in reordered["plan"]["steps"][0]["instruction"]
     )
     assert reordered["plan"]["steps"][1]["agentId"] == "credit_risk"
+
+
+@pytest.mark.asyncio
+async def test_adk_context_list_edit_resolves_sibling_form_data_values() -> None:
+    # Arrange
+    service = OrchestratorService()
+    submitted = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    plan = submitted.approval_plan
+    assert plan is not None
+    step_id = plan.steps[0].step_id
+    instruction = "Prioritize covenant follow-up questions from the rendered field."
+
+    # Act
+    edited = await service.handle_user_action(
+        {
+            "userAction": {
+                "name": "add_instruction",
+                "surfaceId": plan.approval_surface_id,
+                "context": [
+                    {"key": "type", "value": {"literalString": "add_instruction"}},
+                    {"key": "planId", "value": {"literalString": plan.plan_id}},
+                    {"key": "planVersion", "value": {"literalNumber": plan.plan_version}},
+                    {"key": "stepId", "value": {"literalString": step_id}},
+                    {
+                        "key": "instruction",
+                        "value": {
+                            "path": f"/approvalEdits/{step_id}/instruction",
+                        },
+                    },
+                ],
+            },
+            "formData": {
+                "approvalEdits": {
+                    step_id: {
+                        "instruction": instruction,
+                    },
+                },
+            },
+        }
+    )
+
+    # Assert
+    assert edited.status == "draft_updated"
+    assert edited.approval_result is not None
+    updated_plan = edited.approval_result.draft_plan
+    assert updated_plan is not None
+    updated_step = next(step for step in updated_plan.steps if step.step_id == step_id)
+    assert f"Additional instruction: {instruction}" in updated_step.instruction
+
+
+@pytest.mark.asyncio
+async def test_nested_direct_user_action_resolves_sibling_form_data_values() -> None:
+    # Arrange
+    service = OrchestratorService()
+    submitted = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    plan = submitted.approval_plan
+    assert plan is not None
+    step_id = plan.steps[0].step_id
+    instruction = "Prioritize covenant follow-up questions from a direct click."
+
+    # Act
+    edited = await service.handle_user_action(
+        {
+            "userAction": {
+                "type": "add_instruction",
+                "surfaceId": plan.approval_surface_id,
+                "planId": plan.plan_id,
+                "planVersion": plan.plan_version,
+                "stepId": step_id,
+                "instruction": {
+                    "path": f"/approvalEdits/{step_id}/instruction",
+                },
+            },
+            "formData": {
+                "approvalEdits": {
+                    step_id: {
+                        "instruction": instruction,
+                    },
+                },
+            },
+        }
+    )
+
+    # Assert
+    assert edited.status == "draft_updated"
+    assert edited.approval_result is not None
+    updated_plan = edited.approval_result.draft_plan
+    assert updated_plan is not None
+    updated_step = next(step for step in updated_plan.steps if step.step_id == step_id)
+    assert f"Additional instruction: {instruction}" in updated_step.instruction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("envelope_shape", "action_type", "field_name", "field_value"),
+    [
+        (
+            "event_action",
+            "add_instruction",
+            "instruction",
+            "Prioritize covenant follow-up questions from the nested event field.",
+        ),
+        ("action_event", "replace_agent", "replacementAgentId", "credit_risk"),
+    ],
+)
+async def test_nested_adk_context_list_edit_resolves_sibling_form_data_values(
+    envelope_shape: str,
+    action_type: str,
+    field_name: str,
+    field_value: str,
+) -> None:
+    # Arrange
+    service = OrchestratorService()
+    submitted = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    plan = submitted.approval_plan
+    assert plan is not None
+    step_id = (
+        plan.steps[0].step_id
+        if action_type == "add_instruction"
+        else "step_relationship_summary"
+    )
+    context = [
+        {"key": "type", "value": {"literalString": action_type}},
+        {"key": "surfaceId", "value": {"literalString": plan.approval_surface_id}},
+        {"key": "planId", "value": {"literalString": plan.plan_id}},
+        {"key": "planVersion", "value": {"literalNumber": plan.plan_version}},
+        {"key": "stepId", "value": {"literalString": step_id}},
+        {
+            "key": field_name,
+            "value": {"path": f"/approvalEdits/{step_id}/{field_name}"},
+        },
+    ]
+    action = {"name": action_type, "context": context}
+    event_payload = (
+        {"event": {"action": action}}
+        if envelope_shape == "event_action"
+        else {"action": {"event": action}}
+    )
+
+    # Act
+    edited = await service.handle_user_action(
+        {
+            **event_payload,
+            "formData": {
+                "approvalEdits": {
+                    step_id: {
+                        field_name: field_value,
+                    },
+                },
+            },
+        }
+    )
+
+    # Assert
+    assert edited.status == "draft_updated"
+    assert edited.approval_result is not None
+    updated_plan = edited.approval_result.draft_plan
+    assert updated_plan is not None
+    updated_step = next(step for step in updated_plan.steps if step.step_id == step_id)
+    if action_type == "add_instruction":
+        assert f"Additional instruction: {field_value}" in updated_step.instruction
+    else:
+        assert updated_step.agent_id == field_value
+
+
+@pytest.mark.asyncio
+async def test_event_payload_mapping_preserves_json_looking_plan_text_values() -> None:
+    # Arrange
+    service = OrchestratorService()
+    submitted = await service.handle_user_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+    )
+    plan = submitted.approval_plan
+    assert plan is not None
+    step_id = plan.steps[0].step_id
+    instruction = '{"priority":"high"}'
+    rejection_reason = '{"reason":"narrow scope"}'
+
+    # Act
+    edited = await service.handle_user_action(
+        {
+            "event": {
+                "name": "add_instruction",
+                "context": {
+                    "surfaceId": plan.approval_surface_id,
+                    "payload": {
+                        "planId": plan.plan_id,
+                        "planVersion": plan.plan_version,
+                        "stepId": step_id,
+                        "instruction": instruction,
+                    },
+                },
+            },
+        }
+    )
+    assert edited.approval_result is not None
+    edited_plan = edited.approval_result.draft_plan
+    assert edited_plan is not None
+
+    rejected = await service.handle_user_action(
+        {
+            "event": {
+                "name": "reject_plan",
+                "context": {
+                    "surfaceId": plan.approval_surface_id,
+                    "payload": {
+                        "planId": plan.plan_id,
+                        "planVersion": edited_plan.plan_version,
+                        "reason": rejection_reason,
+                    },
+                },
+            },
+        }
+    )
+
+    # Assert
+    assert edited.status == "draft_updated"
+    updated_step = next(step for step in edited_plan.steps if step.step_id == step_id)
+    assert f"Additional instruction: {instruction}" in updated_step.instruction
+    assert rejected.status == "rejected"
+    assert rejected.approval_result is not None
+    assert rejected.approval_result.rejection_reason == rejection_reason
+    assert service.specialist_call_counts() == {}
 
 
 @pytest.mark.asyncio
