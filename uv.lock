@@ -64,7 +64,7 @@ dev = [
 requires-dist = [
     { name = "a2a-sdk", specifier = ">=0.3.4,<0.4" },
     { name = "a2ui-agent-sdk" },
-    { name = "google-adk" },
+    { name = "google-adk", specifier = "==2.1.0" },
     { name = "litellm" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
