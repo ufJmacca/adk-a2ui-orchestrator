@@ -1,7 +1,9 @@
 import logging
 import json
+from typing import Any
 
 import pytest
+from google.genai import types
 
 from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE, DataPart, TextPart
 from orchestrator_demo.a2ui_support.schema_manager import (
@@ -273,3 +275,113 @@ def test_adk_tool_error_payload_redacts_secret_and_traceback_text() -> None:
     assert leaked_secret not in rendered
     assert "Traceback" not in rendered
     assert "/tmp/secret/path.py" not in rendered
+
+
+def test_adk_artifact_document_redacts_secret_like_payload_values() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.artifacts import build_artifact_document
+
+    leaked_secret = "sk-or-v1-artifact-document-secret-should-not-leak"
+
+    # Act
+    document = build_artifact_document(
+        {
+            "status": "approved",
+            "path": "approved",
+            "planId": "plan_secret_document",
+            "artifacts": {
+                "final_response": {
+                    "agent_id": "synthesis",
+                    "structured_output": {
+                        "diagnostic": f"Authorization: Bearer {leaked_secret}",
+                    },
+                },
+            },
+            "statusEvents": [
+                {
+                    "message": f"completed with api_key={leaked_secret}",
+                }
+            ],
+        }
+    )
+    rendered = json.dumps(document, sort_keys=True)
+
+    # Assert
+    assert leaked_secret not in rendered
+    assert "Authorization" not in rendered
+    assert "<redacted-secret>" in rendered
+
+
+@pytest.mark.asyncio
+async def test_saved_adk_artifact_part_redacts_secret_like_payload_values() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.artifacts import save_response_artifact
+
+    class FakeToolContext:
+        def __init__(self) -> None:
+            self.saved_artifacts: list[dict[str, Any]] = []
+
+        async def save_artifact(
+            self,
+            filename: str,
+            artifact: Any,
+            custom_metadata: dict[str, Any] | None = None,
+        ) -> int:
+            self.saved_artifacts.append(
+                {
+                    "filename": filename,
+                    "artifact": artifact,
+                    "customMetadata": custom_metadata,
+                    "version": 0,
+                }
+            )
+            return 0
+
+    leaked_secret = "sk-or-v1-saved-artifact-secret-should-not-leak"
+    tool_context = FakeToolContext()
+
+    # Act
+    artifact_ref = await save_response_artifact(
+        tool_context,
+        filename="orchestrator_latest_result.json",
+        response={
+            "status": "approved",
+            "path": "approved",
+            "planId": "plan_review_saved",
+            "artifacts": {
+                "final_response": {
+                    "agent_id": "synthesis",
+                    "structured_output": {
+                        "diagnostic": f"Authorization: Bearer {leaked_secret}",
+                    },
+                },
+            },
+            "statusEvents": [
+                {
+                    "message": f"completed with api_key={leaked_secret}",
+                }
+            ],
+        },
+        document_type="approved_result",
+        plan_id="plan_review_saved",
+    )
+
+    # Assert
+    assert artifact_ref == {
+        "filename": "orchestrator_latest_result.json",
+        "version": 0,
+        "mimeType": "application/json",
+        "documentType": "approved_result",
+        "planId": "plan_review_saved",
+    }
+    assert len(tool_context.saved_artifacts) == 1
+    saved_artifact = tool_context.saved_artifacts[0]["artifact"]
+    assert isinstance(saved_artifact, types.Part)
+    assert saved_artifact.text is not None
+    assert saved_artifact.inline_data is None
+    assert leaked_secret not in saved_artifact.text
+    saved_document = json.loads(saved_artifact.text)
+    rendered_saved_document = json.dumps(saved_document, sort_keys=True)
+    assert leaked_secret not in rendered_saved_document
+    assert "Authorization" not in rendered_saved_document
+    assert "<redacted-secret>" in rendered_saved_document

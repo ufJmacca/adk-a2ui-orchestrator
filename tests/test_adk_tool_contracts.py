@@ -184,9 +184,9 @@ class FailingSaveToolContext(FakeToolContext):
 
 def _saved_artifact_json(saved_artifact: dict[str, Any]) -> dict[str, Any]:
     artifact = saved_artifact["artifact"]
-    assert artifact.inline_data is not None
-    assert artifact.inline_data.mime_type == "application/json"
-    return json.loads(artifact.inline_data.data.decode("utf-8"))
+    assert artifact.text is not None
+    assert artifact.inline_data is None
+    return json.loads(artifact.text)
 
 
 def test_root_instruction_includes_plan_version_for_followup_tools() -> None:
@@ -418,19 +418,33 @@ async def test_adk_adapter_persists_approved_graph_artifact_to_tool_context() ->
     )
 
     # Assert
+    latest_filename = "orchestrator_latest_result.json"
     filename = f"orchestrator_plan_{submitted['planId']}_execution.json"
     assert approved["status"] == "approved"
     assert [artifact["filename"] for artifact in tool_context.saved_artifacts] == [
+        latest_filename,
         filename
     ]
-    saved = tool_context.saved_artifacts[0]
+    latest_saved = tool_context.saved_artifacts[0]
+    saved = tool_context.saved_artifacts[1]
     document = _saved_artifact_json(saved)
+    latest_artifact_ref = {
+        "filename": latest_filename,
+        "version": latest_saved["version"],
+        "mimeType": "application/json",
+        "documentType": "approved_result",
+        "planId": submitted["planId"],
+    }
     artifact_ref = {
         "filename": filename,
         "version": saved["version"],
         "mimeType": "application/json",
         "documentType": "approved_plan_execution",
         "planId": submitted["planId"],
+    }
+    assert latest_saved["customMetadata"] == {
+        "documentType": "approved_result",
+        "mimeType": "application/json",
     }
     assert saved["customMetadata"] == {
         "documentType": "approved_plan_execution",
@@ -439,7 +453,11 @@ async def test_adk_adapter_persists_approved_graph_artifact_to_tool_context() ->
     assert document["status"] == "approved"
     assert document["planId"] == submitted["planId"]
     assert document["artifacts"]["final_response"]["agent_id"] == "synthesis"
+    assert approved["artifactRefs"][latest_filename] == latest_artifact_ref
     assert approved["artifactRefs"][filename] == artifact_ref
+    assert tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]["artifactRefs"][
+        latest_filename
+    ] == latest_artifact_ref
     assert tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]["artifactRefs"][
         filename
     ] == artifact_ref
@@ -526,6 +544,7 @@ async def test_adk_adapter_serializes_concurrent_session_restore_execute_persist
     # Assert
     first_plan_id = first_submitted["planId"]
     second_plan_id = second_submitted["planId"]
+    latest_filename = "orchestrator_latest_result.json"
     first_filename = f"orchestrator_plan_{first_plan_id}_execution.json"
     second_filename = f"orchestrator_plan_{second_plan_id}_execution.json"
     first_snapshot = first_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
@@ -539,14 +558,16 @@ async def test_adk_adapter_serializes_concurrent_session_restore_execute_persist
     assert second_snapshot["approvalRecords"][second_plan_id]["status"] == "approved"
     assert set(first_snapshot["requestContextsByPlanId"]) == {first_plan_id}
     assert set(second_snapshot["requestContextsByPlanId"]) == {second_plan_id}
-    assert set(first_snapshot["artifactRefs"]) == {first_filename}
-    assert set(second_snapshot["artifactRefs"]) == {second_filename}
-    assert set(first_approved["artifactRefs"]) == {first_filename}
-    assert set(second_approved["artifactRefs"]) == {second_filename}
+    assert set(first_snapshot["artifactRefs"]) == {latest_filename, first_filename}
+    assert set(second_snapshot["artifactRefs"]) == {latest_filename, second_filename}
+    assert set(first_approved["artifactRefs"]) == {latest_filename, first_filename}
+    assert set(second_approved["artifactRefs"]) == {latest_filename, second_filename}
     assert [artifact["filename"] for artifact in first_context.saved_artifacts] == [
+        latest_filename,
         first_filename
     ]
     assert [artifact["filename"] for artifact in second_context.saved_artifacts] == [
+        latest_filename,
         second_filename
     ]
 
@@ -582,6 +603,7 @@ async def test_adk_adapter_preserves_finalized_state_for_stale_approval_snapshot
     )
 
     # Assert
+    latest_filename = "orchestrator_latest_result.json"
     filename = f"orchestrator_plan_{submitted['planId']}_execution.json"
     replayed_snapshot = stale_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
 
@@ -589,6 +611,7 @@ async def test_adk_adapter_preserves_finalized_state_for_stale_approval_snapshot
     assert replayed["status"] == "error"
     assert replayed["error"]["code"] == "plan_already_final"
     assert [artifact["filename"] for artifact in live_context.saved_artifacts] == [
+        latest_filename,
         filename
     ]
     assert stale_context.saved_artifacts == []
@@ -598,7 +621,7 @@ async def test_adk_adapter_preserves_finalized_state_for_stale_approval_snapshot
     assert replayed_snapshot["requestContextsByPlanId"][submitted["planId"]][
         "approvedPlanId"
     ] == submitted["planId"]
-    assert set(replayed_snapshot["artifactRefs"]) == {filename}
+    assert set(replayed_snapshot["artifactRefs"]) == {latest_filename, filename}
 
 
 @pytest.mark.asyncio
