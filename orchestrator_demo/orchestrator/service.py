@@ -50,6 +50,10 @@ from orchestrator_demo.orchestrator.request_context import (
     call_specialist_with_guard,
 )
 from orchestrator_demo.orchestrator.router import RequestRouter
+from orchestrator_demo.orchestrator.session_snapshot import (
+    export_session_snapshot as _export_session_snapshot,
+    restore_session_snapshot as _restore_session_snapshot,
+)
 from orchestrator_demo.orchestrator.surface_routes import (
     SurfaceOwner,
     SurfaceOwnershipError,
@@ -121,6 +125,7 @@ class OrchestratorService:
         )
         self._surface_registry = surface_registry or SurfaceRouteRegistry()
         self._contexts_by_plan_id: dict[str, RequestContext] = {}
+        self._artifact_refs: dict[str, Any] = {}
 
         self._router = RequestRouter(
             slm_client=slm_client or MockSlmIntentClient(),
@@ -128,14 +133,7 @@ class OrchestratorService:
             registry=self._registry,
         )
         self._planner = DraftExecutionPlanner(registry=self._registry)
-        self._approval_store = ApprovalStateStore(
-            agent_descriptors=self._registry.descriptors,
-            graph_runtime=_GuardedGraphRuntime(
-                specialists=self._specialists,
-                contexts_by_plan_id=self._contexts_by_plan_id,
-            ),
-            plan_validator=self._require_specialist_handlers_available,
-        )
+        self._approval_store = self._new_approval_store()
 
     async def handle_user_request(self, user_input: str) -> OrchestratorRequestResult:
         """Classify a user request and either call one specialist or propose a plan."""
@@ -211,6 +209,42 @@ class OrchestratorService:
         """Return the stored approval record snapshot for a plan."""
 
         return self._approval_store.get(plan_id)
+
+    def export_session_snapshot(self) -> dict[str, Any]:
+        """Return the JSON-safe S02 session snapshot for ADK session state."""
+
+        return _export_session_snapshot(
+            approval_store=self._approval_store,
+            request_contexts_by_plan_id=self._contexts_by_plan_id,
+            surface_registry=self._surface_registry,
+            artifact_refs=self._artifact_refs,
+        )
+
+    def restore_session_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore approval, request, surface, and artifact state from a snapshot."""
+
+        restored = _restore_session_snapshot(
+            snapshot,
+            agent_descriptors=self._registry.descriptors,
+            plan_validator=self._require_specialist_handlers_available,
+        )
+        restored_approval_records = restored.approval_store.export_records()
+
+        self._contexts_by_plan_id = dict(restored.request_contexts_by_plan_id)
+        self._surface_registry = restored.surface_registry
+        self._artifact_refs = dict(restored.artifact_refs)
+        self._approval_store = self._new_approval_store()
+        self._approval_store.restore_records(restored_approval_records)
+
+    def _new_approval_store(self) -> ApprovalStateStore:
+        return ApprovalStateStore(
+            agent_descriptors=self._registry.descriptors,
+            graph_runtime=_GuardedGraphRuntime(
+                specialists=self._specialists,
+                contexts_by_plan_id=self._contexts_by_plan_id,
+            ),
+            plan_validator=self._require_specialist_handlers_available,
+        )
 
     async def _handle_direct_request(
         self,
