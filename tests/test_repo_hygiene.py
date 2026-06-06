@@ -46,8 +46,8 @@ REQUIRED_UV_GATE_COMMANDS = (
 REQUIRED_PRIMARY_RUNTIME_COMMAND = (
     "uv run adk api_server --a2a --with_ui orchestrator_demo "
     "--host 0.0.0.0 --port 8000 "
-    "--session_service_uri sqlite://.adk/orchestrator_sessions.sqlite "
-    "--artifact_service_uri file://.adk/artifacts"
+    "--session_service_uri sqlite:///.adk/orchestrator_sessions.sqlite "
+    "--artifact_service_uri file:./.adk/artifacts"
 )
 
 REQUIRED_DEV_UI_DEBUG_COMMAND = (
@@ -72,6 +72,11 @@ PROHIBITED_DEPENDENCY_MANAGER_FILES = {
     "conda.yaml",
     "environment.yml",
 }
+
+MALFORMED_LOCAL_STORAGE_URI_MARKERS = (
+    "sqlite://.adk",
+    "file://.adk",
+)
 
 
 def _dependency_name(requirement: str) -> str:
@@ -272,11 +277,11 @@ def test_readme_primary_runtime_section_documents_required_adk_a2a_command() -> 
     assert readme_command_lines.count(expected_command) == 1
 
 
-def test_readme_primary_runtime_command_uses_prd_required_local_storage_uris() -> None:
+def test_readme_primary_runtime_command_uses_adk_accepted_local_storage_uris() -> None:
     # Arrange
     readme_path = ROOT / "README.md"
-    expected_session_uri = "sqlite://.adk/orchestrator_sessions.sqlite"
-    expected_artifact_uri = "file://.adk/artifacts"
+    expected_session_uri = "sqlite:///.adk/orchestrator_sessions.sqlite"
+    expected_artifact_uri = "file:./.adk/artifacts"
 
     # Act
     readme = readme_path.read_text(encoding="utf-8")
@@ -293,16 +298,53 @@ def test_readme_primary_runtime_command_uses_prd_required_local_storage_uris() -
     assert REQUIRED_PRIMARY_RUNTIME_COMMAND in readme
     assert session_uri == expected_session_uri
     assert artifact_uri == expected_artifact_uri
+    assert all(marker not in readme for marker in MALFORMED_LOCAL_STORAGE_URI_MARKERS)
+    assert all(
+        marker not in REQUIRED_PRIMARY_RUNTIME_COMMAND
+        for marker in MALFORMED_LOCAL_STORAGE_URI_MARKERS
+    )
 
     session_parts = urlparse(session_uri)
     artifact_parts = urlparse(artifact_uri)
+    adk_sqlite_path = Path(session_parts.path.removeprefix("/"))
+    artifact_path = Path(artifact_parts.path)
 
     assert session_parts.scheme == "sqlite"
-    assert session_parts.netloc == ".adk"
-    assert session_parts.path == "/orchestrator_sessions.sqlite"
+    assert session_parts.netloc == ""
+    assert adk_sqlite_path == Path(".adk/orchestrator_sessions.sqlite")
     assert artifact_parts.scheme == "file"
-    assert artifact_parts.netloc == ".adk"
-    assert artifact_parts.path == "/artifacts"
+    assert artifact_parts.netloc == ""
+    assert artifact_parts.path == "./.adk/artifacts"
+    assert artifact_path == Path(".adk/artifacts")
+    assert not artifact_path.is_absolute()
+
+
+def test_primary_runtime_storage_uris_construct_adk_services() -> None:
+    # Arrange
+    from google.adk.cli.service_registry import get_service_registry
+
+    session_uri = _command_option_value(
+        REQUIRED_PRIMARY_RUNTIME_COMMAND,
+        "--session_service_uri",
+    )
+    artifact_uri = _command_option_value(
+        REQUIRED_PRIMARY_RUNTIME_COMMAND,
+        "--artifact_service_uri",
+    )
+    registry = get_service_registry()
+
+    # Act
+    session_service = registry.create_session_service(session_uri, agents_dir=str(ROOT))
+    artifact_service = registry.create_artifact_service(
+        artifact_uri,
+        agents_dir=str(ROOT),
+    )
+
+    # Assert
+    assert session_service is not None
+    assert getattr(session_service, "_db_path") == ".adk/orchestrator_sessions.sqlite"
+    assert artifact_service is not None
+    assert getattr(artifact_service, "root_dir") == (ROOT / ".adk/artifacts").resolve()
 
 
 def test_readme_dev_ui_debugging_section_keeps_adk_web_debugging_only() -> None:

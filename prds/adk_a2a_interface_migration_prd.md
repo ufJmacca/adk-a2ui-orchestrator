@@ -415,7 +415,7 @@ Tests may override host and port.
 The primary local runtime command must be:
 
 ```bash
-uv run adk api_server --a2a --with_ui orchestrator_demo --host 0.0.0.0 --port 8000 --session_service_uri sqlite://.adk/orchestrator_sessions.sqlite --artifact_service_uri file://.adk/artifacts
+uv run adk api_server --a2a --with_ui orchestrator_demo --host 0.0.0.0 --port 8000 --session_service_uri sqlite:///.adk/orchestrator_sessions.sqlite --artifact_service_uri file:./.adk/artifacts
 ```
 
 `uv run adk web orchestrator_demo --host 0.0.0.0 --port 8000` may remain

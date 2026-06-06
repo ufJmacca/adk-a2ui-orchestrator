@@ -57,7 +57,7 @@ the runtime from the repository root.
 
 ```bash
 uv sync --locked
-uv run adk api_server --a2a --with_ui orchestrator_demo --host 0.0.0.0 --port 8000 --session_service_uri sqlite://.adk/orchestrator_sessions.sqlite --artifact_service_uri file://.adk/artifacts
+uv run adk api_server --a2a --with_ui orchestrator_demo --host 0.0.0.0 --port 8000 --session_service_uri sqlite:///.adk/orchestrator_sessions.sqlite --artifact_service_uri file:./.adk/artifacts
 ```
 
 Open the forwarded `8000` URL and select the `orchestrator` agent in the ADK Dev
