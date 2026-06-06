@@ -177,6 +177,46 @@ class SurfaceRouteRegistry:
 
         self._owners_by_surface_id = dict(snapshot)
 
+    def export_snapshot(self) -> dict[str, Any]:
+        """Return JSON-safe surface ownership and validated component state."""
+
+        return {
+            "ownersBySurfaceId": {
+                surface_id: _surface_owner_to_snapshot(owner)
+                for surface_id, owner in self._owners_by_surface_id.items()
+            },
+            "componentsBySurfaceId": clone_surface_component_graphs(
+                self._components_by_surface_id
+            ),
+        }
+
+    def restore_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore JSON-safe surface ownership and validated component state."""
+
+        owners_snapshot = snapshot.get("ownersBySurfaceId")
+        if not isinstance(owners_snapshot, Mapping):
+            raise SurfaceOwnershipError("ownersBySurfaceId must be an object")
+
+        restored_owners: dict[str, SurfaceOwner] = {}
+        for surface_id, owner_snapshot in owners_snapshot.items():
+            if not isinstance(surface_id, str):
+                raise SurfaceOwnershipError("surface owner keys must be strings")
+            owner = _surface_owner_from_snapshot(owner_snapshot)
+            if owner.surface_id != surface_id:
+                raise SurfaceOwnershipError(
+                    "surface owner key must match owner surfaceId"
+                )
+            restored_owners[surface_id] = owner
+
+        components_snapshot = snapshot.get("componentsBySurfaceId", {})
+        if not isinstance(components_snapshot, Mapping):
+            raise SurfaceOwnershipError("componentsBySurfaceId must be an object")
+
+        self._owners_by_surface_id = restored_owners
+        self._components_by_surface_id = clone_surface_component_graphs(
+            components_snapshot
+        )
+
     def _clear_surface_from(
         self,
         owners_by_surface_id: dict[str, SurfaceOwner],
@@ -547,6 +587,50 @@ def _deleted_surface_ids_from_validated_a2ui(payload: Mapping[str, Any]) -> list
         return []
     surface_id = message.get("surfaceId")
     return [surface_id] if isinstance(surface_id, str) else []
+
+
+def _surface_owner_to_snapshot(owner: SurfaceOwner) -> dict[str, Any]:
+    return {
+        "surfaceId": owner.surface_id,
+        "ownerType": owner.owner_type,
+        "ownerId": owner.owner_id,
+        "planId": owner.plan_id,
+        "source": owner.source,
+    }
+
+
+def _surface_owner_from_snapshot(candidate: Any) -> SurfaceOwner:
+    if not isinstance(candidate, Mapping):
+        raise SurfaceOwnershipError("surface owner snapshot must be an object")
+
+    owner_type = candidate.get("ownerType")
+    if owner_type not in {"orchestrator", "specialist"}:
+        raise SurfaceOwnershipError("surface owner snapshot has invalid ownerType")
+
+    surface_id = candidate.get("surfaceId")
+    owner_id = candidate.get("ownerId")
+    if not isinstance(surface_id, str) or not isinstance(owner_id, str):
+        raise SurfaceOwnershipError(
+            "surface owner snapshot requires surfaceId and ownerId"
+        )
+
+    plan_id = _optional_snapshot_string(candidate.get("planId"))
+    source = _optional_snapshot_string(candidate.get("source"))
+    return SurfaceOwner(
+        surface_id=_validated_surface_id(surface_id),
+        owner_type=owner_type,
+        owner_id=owner_id,
+        plan_id=plan_id,
+        source=source,
+    )
+
+
+def _optional_snapshot_string(candidate: Any) -> str | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, str):
+        return candidate
+    raise SurfaceOwnershipError("surface owner snapshot field must be a string or null")
 
 
 __all__ = [

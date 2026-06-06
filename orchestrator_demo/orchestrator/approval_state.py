@@ -87,6 +87,63 @@ def _record_snapshot(record: ApprovalRecord) -> ApprovalRecord:
     return snapshot
 
 
+def _record_to_snapshot(record: ApprovalRecord) -> dict[str, Any]:
+    approved_plan = record.approved_plan
+    return {
+        "status": record.status,
+        "draftPlan": record.draft_plan.model_dump(mode="json"),
+        "approvedVersion": record.approved_version,
+        "rejectionReason": record.rejection_reason,
+        "executionFailureReason": record.execution_failure_reason,
+        "approvedPlan": (
+            approved_plan.model_dump(mode="json")
+            if approved_plan is not None
+            else None
+        ),
+    }
+
+
+def _record_from_snapshot(candidate: Any) -> ApprovalRecord:
+    if not isinstance(candidate, Mapping):
+        raise ApprovalStateError("approval record snapshot must be an object")
+
+    record = ApprovalRecord(
+        draft_plan=ExecutionPlan.model_validate(candidate.get("draftPlan")),
+        status=_snapshot_status(candidate.get("status")),
+        approved_version=_optional_int(candidate.get("approvedVersion")),
+        rejection_reason=_optional_snapshot_string(candidate.get("rejectionReason")),
+        execution_failure_reason=_optional_snapshot_string(
+            candidate.get("executionFailureReason")
+        ),
+    )
+    approved_plan_snapshot = candidate.get("approvedPlan")
+    if approved_plan_snapshot is not None:
+        record.approved_plan = ExecutionPlan.model_validate(approved_plan_snapshot)
+    return record
+
+
+def _snapshot_status(candidate: Any) -> PlanState:
+    if candidate in {"draft", "approved", "approved_execution_failed", "rejected"}:
+        return candidate
+    raise ApprovalStateError("approval record snapshot has invalid status")
+
+
+def _optional_int(candidate: Any) -> int | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, int):
+        return candidate
+    raise ApprovalStateError("approval record integer field must be an int or null")
+
+
+def _optional_snapshot_string(candidate: Any) -> str | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, str):
+        return candidate
+    raise ApprovalStateError("approval record string field must be a string or null")
+
+
 @dataclass(frozen=True)
 class ApprovalActionResult:
     """Result of applying a structured approval event."""
@@ -156,6 +213,32 @@ class ApprovalStateStore:
 
         with self._lock:
             return _record_snapshot(self._get_live_record(plan_id))
+
+    def export_records(self) -> dict[str, dict[str, Any]]:
+        """Return JSON-safe approval records keyed by plan id."""
+
+        with self._lock:
+            return {
+                plan_id: _record_to_snapshot(record)
+                for plan_id, record in self._records.items()
+            }
+
+    def restore_records(self, records: Mapping[str, Any]) -> None:
+        """Replace approval records from a JSON-safe snapshot."""
+
+        restored_records: dict[str, ApprovalRecord] = {}
+        for plan_id, record_snapshot in records.items():
+            if not isinstance(plan_id, str):
+                raise ApprovalStateError("approval record keys must be plan ids")
+            record = _record_from_snapshot(record_snapshot)
+            if record.draft_plan.plan_id != plan_id:
+                raise ApprovalStateError(
+                    "approval record key must match draft plan_id"
+                )
+            restored_records[plan_id] = record
+
+        with self._lock:
+            self._records = restored_records
 
     def reset_failed_approval(self, plan_id: str) -> ApprovalRecord:
         """Restore a failed approval attempt to its editable draft state."""
