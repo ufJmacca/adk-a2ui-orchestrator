@@ -12,7 +12,12 @@ from orchestrator_demo.a2a_support.transport import DataPart
 from orchestrator_demo.a2ui_support.adk_ui_delivery import A2UIWidgetDeliveryError
 from orchestrator_demo.a2ui_support.approval_canvas import A2UIEmissionError
 from orchestrator_demo.a2ui_support.renderer_contract import RendererContractError
-from orchestrator_demo.a2ui_support.secret_safety import redact_secret_like_values
+from orchestrator_demo.a2ui_support.response_redaction import (
+    redacted_response_json_safe as _redacted_json_safe,
+)
+from orchestrator_demo.a2ui_support.secret_safety import (
+    redact_secret_like_values,
+)
 from orchestrator_demo.contracts import ExecutionPlan, PlanStep
 from orchestrator_demo.orchestrator.approval_state import (
     ApprovalActionResult,
@@ -52,7 +57,7 @@ def build_request_response(result: OrchestratorRequestResult) -> dict[str, Any]:
     }
     if result.approval_plan is not None:
         payload.update(_plan_state_fields(result.approval_plan, editable=True))
-    return payload
+    return _redacted_json_safe(payload)
 
 
 def build_user_action_response(
@@ -99,7 +104,7 @@ def build_user_action_response(
                 else None
             )
 
-    return payload
+    return _redacted_json_safe(payload)
 
 
 def build_error_response(exc: BaseException) -> dict[str, Any]:
@@ -114,15 +119,17 @@ def build_error_response(exc: BaseException) -> dict[str, Any]:
     if detail:
         error["detail"] = detail
 
-    return {
-        "status": "error",
-        "path": "error",
-        "error": error,
-        "a2uiParts": [],
-        "nextActions": [],
-        "statusEvents": [],
-        "artifacts": {},
-    }
+    return _redacted_json_safe(
+        {
+            "status": "error",
+            "path": "error",
+            "error": error,
+            "a2uiParts": [],
+            "nextActions": [],
+            "statusEvents": [],
+            "artifacts": {},
+        }
+    )
 
 
 def _surface_route_error_payload(
@@ -140,16 +147,18 @@ def _surface_route_error_payload(
     if route_code != safe_error["code"]:
         safe_error["routeCode"] = route_code
 
-    return {
-        "status": "error",
-        "path": "error",
-        "error": safe_error,
-        "surfaceRouteResult": _surface_route_result_payload(route_result),
-        "a2uiParts": _data_parts_payload(result.a2ui_parts),
-        "nextActions": [],
-        "statusEvents": _jsonable_legacy(result.status_events),
-        "artifacts": _jsonable_legacy(result.final_artifacts),
-    }
+    return _redacted_json_safe(
+        {
+            "status": "error",
+            "path": "error",
+            "error": safe_error,
+            "surfaceRouteResult": _surface_route_result_payload(route_result),
+            "a2uiParts": _data_parts_payload(result.a2ui_parts),
+            "nextActions": [],
+            "statusEvents": _jsonable_legacy(result.status_events),
+            "artifacts": _jsonable_legacy(result.final_artifacts),
+        }
+    )
 
 
 def _surface_route_result_payload(
