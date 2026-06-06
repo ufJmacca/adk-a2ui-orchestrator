@@ -106,6 +106,18 @@ def test_pyproject_limits_package_discovery_to_application_package() -> None:
     assert "prds*" in package_discovery["exclude"]
 
 
+def test_pyproject_includes_orchestrator_agent_card_package_data() -> None:
+    # Arrange
+    pyproject_path = ROOT / "pyproject.toml"
+
+    # Act
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+
+    # Assert
+    assert package_data["orchestrator_demo.orchestrator"] == ["agent.json"]
+
+
 def test_pyproject_configures_pytest_ruff_and_mypy_quality_gates() -> None:
     # Arrange
     pyproject_path = ROOT / "pyproject.toml"

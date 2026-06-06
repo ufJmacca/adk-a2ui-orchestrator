@@ -1,0 +1,120 @@
+{
+  "name": "orchestrator",
+  "description": "Business banking orchestrator for direct specialist routing, A2UI draft plan review, structured plan editing, approval, rejection, and final result retrieval.",
+  "url": "http://127.0.0.1:8000/a2a/orchestrator",
+  "version": "0.1.0",
+  "protocolVersion": "0.3.0",
+  "preferredTransport": "JSONRPC",
+  "capabilities": {
+    "streaming": true,
+    "stateTransitionHistory": true
+  },
+  "defaultInputModes": [
+    "application/json",
+    "application/json+a2ui",
+    "text/plain"
+  ],
+  "defaultOutputModes": [
+    "application/json",
+    "application/json+a2ui",
+    "text/plain"
+  ],
+  "skills": [
+    {
+      "id": "submit_orchestrator_request",
+      "name": "Submit orchestrator request",
+      "description": "Submit a relationship-manager request for direct specialist routing or complex draft-plan creation.",
+      "tags": [
+        "orchestrator",
+        "submission"
+      ],
+      "inputModes": [
+        "application/json",
+        "text/plain"
+      ],
+      "outputModes": [
+        "application/json",
+        "application/json+a2ui",
+        "text/plain"
+      ],
+      "examples": [
+        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+      ]
+    },
+    {
+      "id": "review_orchestrator_plan",
+      "name": "Review A2UI plan",
+      "description": "Review structured draft plan JSON and A2UI approval-plan parts before specialist graph execution.",
+      "tags": [
+        "orchestrator",
+        "a2ui",
+        "approval-plan"
+      ],
+      "inputModes": [
+        "application/json",
+        "application/json+a2ui",
+        "text/plain"
+      ],
+      "outputModes": [
+        "application/json",
+        "application/json+a2ui",
+        "text/plain"
+      ]
+    },
+    {
+      "id": "edit_orchestrator_plan",
+      "name": "Edit orchestrator plan",
+      "description": "Apply discrete draft-plan edits through add instruction, remove step, replace agent, or reorder step tools without graph execution.",
+      "tags": [
+        "orchestrator",
+        "editing"
+      ],
+      "inputModes": [
+        "application/json",
+        "application/json+a2ui"
+      ],
+      "outputModes": [
+        "application/json",
+        "application/json+a2ui",
+        "text/plain"
+      ]
+    },
+    {
+      "id": "approve_orchestrator_plan",
+      "name": "Approve orchestrator plan",
+      "description": "Approve a draft only with matching plan identity, approval surface, edited version, and approved step IDs, then execute the graph.",
+      "tags": [
+        "orchestrator",
+        "approval"
+      ],
+      "inputModes": [
+        "application/json",
+        "application/json+a2ui"
+      ],
+      "outputModes": [
+        "application/json",
+        "application/json+a2ui",
+        "text/plain"
+      ]
+    },
+    {
+      "id": "reject_orchestrator_plan",
+      "name": "Reject orchestrator plan",
+      "description": "Reject a pending draft plan with a structured reason and complete without graph execution or specialist calls.",
+      "tags": [
+        "orchestrator",
+        "rejection"
+      ],
+      "inputModes": [
+        "application/json",
+        "application/json+a2ui"
+      ],
+      "outputModes": [
+        "application/json",
+        "application/json+a2ui",
+        "text/plain"
+      ]
+    }
+  ],
+  "supportsAuthenticatedExtendedCard": false
+}

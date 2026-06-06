@@ -16,6 +16,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "python-dotenv",
+    "sse-starlette>=3.4.4",
 ]
 
 [dependency-groups]
@@ -43,6 +44,7 @@ exclude = ["prds*", "tests*"]
 
 [tool.setuptools.package-data]
 "orchestrator_demo.app" = ["static/*", "static/**/*"]
+"orchestrator_demo.orchestrator" = ["agent.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

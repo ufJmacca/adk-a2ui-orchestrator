@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,6 +17,7 @@ from google.genai import types as genai_types
 from orchestrator_demo.a2ui_support.schema_manager import A2UI_VERSION
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 A2UI_MIME_TYPE = "application/json+a2ui"
 EXPECTED_TOOL_NAMES = {
     "submit_orchestrator_request",
@@ -147,6 +152,116 @@ def _assert_no_custom_renderer_messages(payload: Any) -> None:
     serialized = json.dumps(payload, sort_keys=True)
     for marker in FORBIDDEN_RENDERER_MARKERS:
         assert marker not in serialized
+
+
+def test_a2a_converter_captured_before_agent_import_exports_standard_a2ui() -> None:
+    script = r"""
+import json
+
+from a2a import types as a2a_types
+from google.adk.a2a.executor.config import A2aAgentExecutorConfig
+from google.adk.events.event import Event
+from google.genai import types as genai_types
+
+from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+    adk_dev_ui_content_parts_for_a2ui_response,
+)
+from orchestrator_demo.a2ui_support.schema_manager import A2UI_VERSION
+
+
+A2UI_MIME_TYPE = "application/json+a2ui"
+standard_data = {
+    "version": A2UI_VERSION,
+    "updateComponents": {
+        "surfaceId": "surface_stale_executor",
+        "components": [
+            {
+                "component": "Text",
+                "id": "root",
+                "text": "Review this draft plan.",
+            }
+        ],
+    },
+}
+response = {
+    "status": "plan_required",
+    "approvalSurfaceId": "surface_stale_executor",
+    "a2uiParts": [
+        {
+            "type": "data",
+            "data": standard_data,
+            "metadata": {"mimeType": A2UI_MIME_TYPE},
+        }
+    ],
+}
+function_response_part = genai_types.Part.from_function_response(
+    name="submit_orchestrator_request",
+    response=response,
+)
+event = Event(
+    invocation_id="invocation_stale_executor",
+    author="orchestrator",
+    content=genai_types.Content(
+        role="user",
+        parts=[
+            function_response_part,
+            *adk_dev_ui_content_parts_for_a2ui_response(response),
+        ],
+    ),
+    custom_metadata={"a2a:response": True},
+)
+
+
+def exported_a2ui_data(converter):
+    a2a_events = converter(
+        event,
+        {},
+        "task_stale_executor",
+        "context_stale_executor",
+    )
+    return [
+        part.root.data
+        for a2a_event in a2a_events
+        if getattr(a2a_event, "artifact", None) is not None
+        for part in a2a_event.artifact.parts
+        if isinstance(part.root, a2a_types.DataPart)
+        and isinstance(part.root.metadata, dict)
+        and part.root.metadata.get("mimeType") == A2UI_MIME_TYPE
+    ]
+
+
+config = A2aAgentExecutorConfig()
+captured_converter = config.adk_event_converter
+before_import = exported_a2ui_data(captured_converter)
+
+import orchestrator_demo.orchestrator.agent  # noqa: F401
+
+after_import = exported_a2ui_data(captured_converter)
+print(
+    json.dumps(
+        {
+            "before": before_import,
+            "after": after_import,
+            "expected": standard_data,
+        },
+        sort_keys=True,
+    )
+)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert len(payload["before"]) == 1
+    assert "surfaceUpdate" in payload["before"][0]
+    assert "updateComponents" not in payload["before"][0]
+    assert payload["after"] == [payload["expected"]]
 
 
 @pytest.mark.asyncio

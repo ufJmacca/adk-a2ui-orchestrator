@@ -45,6 +45,8 @@ class A2uiA2AProtocolPlugin(BasePlugin):
         content = event.content
         if content is None or not content.parts:
             return None
+        if _has_dev_ui_a2ui_transport_part(content.parts):
+            return None
 
         bridge_parts: list[genai_types.Part] = []
         existing_components_by_surface_id = _existing_components_by_surface_id(
@@ -145,6 +147,21 @@ def _a2ui_payloads_from_parts(
         if payload is not None:
             payloads.append(payload)
     return payloads
+
+
+def _has_dev_ui_a2ui_transport_part(parts: Sequence[genai_types.Part]) -> bool:
+    dev_ui_message_keys = frozenset(
+        {
+            "beginRendering",
+            "surfaceUpdate",
+            "dataModelUpdate",
+            "deleteSurface",
+        }
+    )
+    return any(
+        bool(dev_ui_message_keys.intersection(payload["data"]))
+        for payload in _a2ui_payloads_from_parts(parts)
+    )
 
 
 def _a2ui_payload_from_part(part: genai_types.Part) -> Mapping[str, Any] | None:

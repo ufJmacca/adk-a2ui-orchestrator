@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from types import FunctionType
 from typing import Any
 
 from a2a import types as a2a_types
@@ -375,23 +376,77 @@ def _wrap_a2a_event_converter(module: Any, function_name: str) -> None:
     ):
         return
 
+    implementation = _function_implementation_target(convert_event_to_a2a_events)
+    original_converter = _copy_function(implementation)
+
     def _convert_event_to_a2a_events_with_standard_a2ui(
         event: Any,
         *args: Any,
+        _original_converter: Any = original_converter,
+        _standardize_event: Any = _event_with_standard_a2ui_parts_for_a2a_export,
         **kwargs: Any,
     ) -> Any:
-        return convert_event_to_a2a_events(
-            _event_with_standard_a2ui_parts_for_a2a_export(event),
+        return _original_converter(
+            _standardize_event(event),
             *args,
             **kwargs,
         )
 
-    setattr(
+    _replace_function_implementation(
+        implementation,
         _convert_event_to_a2a_events_with_standard_a2ui,
+    )
+    setattr(
+        convert_event_to_a2a_events,
         _ADK_A2UI_A2A_STANDARD_EXPORT_ATTR,
         True,
     )
-    setattr(module, function_name, _convert_event_to_a2a_events_with_standard_a2ui)
+    setattr(module, function_name, convert_event_to_a2a_events)
+
+
+def _function_implementation_target(function: Any) -> Any:
+    if not isinstance(function, FunctionType):
+        return function
+
+    for cell in function.__closure__ or ():
+        try:
+            cell_contents = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(cell_contents, FunctionType) and (
+            cell_contents.__name__ == function.__name__
+        ):
+            return cell_contents
+    return function
+
+
+def _copy_function(function: Any) -> Any:
+    if not isinstance(function, FunctionType):
+        return function
+
+    copied = FunctionType(
+        function.__code__,
+        function.__globals__,
+        name=function.__name__,
+        argdefs=function.__defaults__,
+        closure=function.__closure__,
+    )
+    copied.__kwdefaults__ = function.__kwdefaults__
+    copied.__dict__.update(function.__dict__)
+    copied.__annotations__ = dict(getattr(function, "__annotations__", {}))
+    copied.__doc__ = function.__doc__
+    copied.__module__ = function.__module__
+    copied.__qualname__ = function.__qualname__
+    return copied
+
+
+def _replace_function_implementation(function: Any, replacement: Any) -> None:
+    if not isinstance(function, FunctionType):
+        return
+
+    function.__code__ = replacement.__code__
+    function.__defaults__ = replacement.__defaults__
+    function.__kwdefaults__ = replacement.__kwdefaults__
 
 
 def _install_a2ui_parallel_response_merge() -> None:

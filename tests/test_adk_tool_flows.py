@@ -875,6 +875,71 @@ async def test_adk_delivery_preserves_standard_a2a_a2ui_data_part_shape() -> Non
     _assert_a2ui_transport_events_are_filtered_from_model_history(delivery_events)
 
 
+@pytest.mark.asyncio
+async def test_a2a_protocol_plugin_skips_dev_ui_a2ui_transport_events() -> None:
+    # Arrange
+    from google.adk.a2a.converters.from_adk_event import convert_event_to_a2a_events
+
+    from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
+
+    a2ui_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": "surface_dev_ui_plugin_gate",
+                "components": [
+                    {
+                        "component": "Text",
+                        "id": "root",
+                        "text": "Review this draft plan.",
+                    }
+                ],
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {
+        "status": "plan_required",
+        "approvalSurfaceId": "surface_dev_ui_plugin_gate",
+        "a2uiParts": [a2ui_part],
+    }
+    event = _adk_response_event_for(response)
+
+    # Act
+    modified_event = await A2uiA2AProtocolPlugin().on_event_callback(
+        invocation_context=SimpleNamespace(),
+        event=event,
+    )
+
+    # Assert
+    assert modified_event is None
+    dev_ui_data = [part.data for part in _a2ui_data_parts_from_event(event)]
+    assert len(dev_ui_data) == 1
+    assert "surfaceUpdate" in dev_ui_data[0]
+    assert "updateComponents" not in dev_ui_data[0]
+    assert (
+        dev_ui_data[0]["surfaceUpdate"]["surfaceId"]
+        == "surface_dev_ui_plugin_gate"
+    )
+
+    a2a_events = convert_event_to_a2a_events(
+        event,
+        {},
+        "task_dev_ui_plugin_gate",
+        "context_dev_ui_plugin_gate",
+    )
+    exported_data = [
+        part.root.data
+        for a2a_event in a2a_events
+        if getattr(a2a_event, "artifact", None) is not None
+        for part in a2a_event.artifact.parts
+        if isinstance(part.root, a2a_types.DataPart)
+        and isinstance(part.root.metadata, Mapping)
+        and part.root.metadata.get("mimeType") == A2UI_MIME_TYPE
+    ]
+    assert exported_data == [a2ui_part["data"]]
+
+
 def test_parallel_a2ui_response_merge_preserves_marker_and_filters_history() -> None:
     # Arrange
     from google.adk.flows.llm_flows import contents as adk_contents

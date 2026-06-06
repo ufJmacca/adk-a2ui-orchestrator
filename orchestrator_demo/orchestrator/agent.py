@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import Agent
+from google.adk.apps.app import App
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 
 from orchestrator_demo.a2a_support.transport import DataPart
+from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
 from orchestrator_demo.a2ui_support.adk_ui_delivery import (
     deliver_a2ui_parts_to_adk_ui,
     install_a2ui_response_event_delivery,
@@ -676,34 +678,65 @@ def build_root_agent(
             "orchestrator demo."
         ),
         instruction=(
-            "Use the tools to submit relationship-manager requests to the "
-            "orchestrator. Return concise JSON-oriented summaries. If a request "
-            "returns path plan_required, tell the user the planId, planVersion, "
-            "approvalSurfaceId/surfaceId, step ids, and that they can call edit, "
-            "approval, or rejection tools with the current planVersion. "
-            "Use add_plan_instruction, remove_plan_step, replace_plan_agent, or "
-            "reorder_plan_steps before approve_orchestrator_plan when the user "
-            "requests plan changes. "
-            "This ADK Web surface emits validated A2UI parts and structured "
-            "JSON through tools for debugging."
+            "Always call tools for orchestrator operations; do not answer from "
+            "natural-language chat alone. Return concise JSON-oriented summaries. "
+            "If a request returns path plan_required, tell the user the planId, "
+            "planVersion, approvalSurfaceId/surfaceId, step ids, and that they "
+            "can call edit, approval, or rejection tools with the current "
+            "planVersion. Use add_plan_instruction, remove_plan_step, "
+            "replace_plan_agent, or reorder_plan_steps before "
+            "approve_orchestrator_plan when the user requests plan changes. "
+            "Approve execution only through explicit structured approval using "
+            "approve_orchestrator_plan with matching planId, current planVersion, "
+            "approvalSurfaceId, and approved step ids; natural-language approval "
+            "must not execute the graph. Use reject_orchestrator_plan only when "
+            "the user explicitly rejects the draft. This ADK Web surface emits "
+            "validated A2UI parts and structured JSON through tools for debugging."
         ),
         tools=resolved_adapter.tools(),
     )
 
 
+def build_app(*, root_agent: Agent | None = None) -> App:
+    """Build the ADK app exposed to ``adk api_server --a2a --with_ui``."""
+
+    return App(
+        name="orchestrator",
+        root_agent=root_agent or _get_root_agent(),
+        plugins=[A2uiA2AProtocolPlugin()],
+    )
+
+
 _ROOT_AGENT: Agent | None = None
+_APP: App | None = None
+
+if TYPE_CHECKING:
+    root_agent: Agent
+    app: App
 
 
-def __getattr__(name: str) -> Any:
-    """Lazily expose ``root_agent`` for Google ADK's agent loader."""
-
-    if name != "root_agent":
-        raise AttributeError(name)
-
+def _get_root_agent() -> Agent:
     global _ROOT_AGENT
     if _ROOT_AGENT is None:
         _ROOT_AGENT = build_root_agent()
     return _ROOT_AGENT
+
+
+def _get_app() -> App:
+    global _APP
+    if _APP is None:
+        _APP = build_app(root_agent=_get_root_agent())
+    return _APP
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose ADK loader exports without bootstrapping the model on import."""
+
+    if name == "root_agent":
+        return _get_root_agent()
+    if name == "app":
+        return _get_app()
+    raise AttributeError(name)
 
 
 def _runtime_orchestrator_agent(model: Any) -> OrchestratorAgent:
@@ -964,5 +997,8 @@ def _plan_field(plan: Mapping[str, Any], *field_names: str) -> Any:
 __all__ = [
     "AdkOrchestratorAdapter",
     "OrchestratorAgent",
+    "app",
+    "build_app",
     "build_root_agent",
+    "root_agent",
 ]
