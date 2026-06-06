@@ -1,7 +1,7 @@
 # ADK A2UI Orchestrator Demo
 
-Local Python-first ADK 2.0+ A2UI orchestrator demo for business banking
-relationship managers.
+Local Python-first Google ADK A2A and A2UI orchestrator demo for business
+banking relationship managers.
 
 ## Project Baseline
 
@@ -25,7 +25,8 @@ environments, and dependency-manager files such as `requirements.txt`,
 
 Runtime secrets must come from environment variables or a local `.env` file
 based on `.env.example`. Real secret values must not be committed, logged, added
-to fixtures, pasted into A2UI payloads, or written into this README.
+to fixtures, pasted into A2UI payloads, written to ADK session state, stored as
+artifacts, or written into this README.
 
 Required variables:
 
@@ -41,111 +42,86 @@ Optional variables:
 | `OPENROUTER_API_BASE` | `https://openrouter.ai/api/v1` | OpenRouter-compatible API base URL. |
 | `OR_APP_NAME` | unset | Optional OpenRouter app name metadata. |
 | `OR_SITE_URL` | unset | Optional OpenRouter site URL metadata. |
-| `ORCHESTRATOR_APP_HOST` | `127.0.0.1` | Local HTTP bind host. |
-| `ORCHESTRATOR_APP_PORT` | `8000` | Local HTTP bind port. |
 
-The app fails fast when `OPENROUTER_API_KEY` or `LLM_MODEL` is missing. Error
-messages name missing variables but do not reveal secret values.
+ADK loads the root agent lazily. `adk api_server` can start, serve the Dev UI,
+and publish the A2A card before these variables are validated. Missing
+`OPENROUTER_API_KEY` or `LLM_MODEL` is reported on the first agent request, and
+error messages name missing variables but do not reveal secret values.
 
-## Local Startup
+## Primary Local Runtime
 
-Synchronize the locked environment, provide the required runtime configuration
-through your shell, secret manager, or local `.env`, then start the app.
-
-```bash
-uv sync --locked
-uv run python -m orchestrator_demo.app
-```
-
-The startup line prints the local base URL, normally
-`http://127.0.0.1:8000`. The basic renderer is available at `GET /`, and the
-machine-readable endpoint contract is available at `GET /api`.
-
-## Google ADK Dev UI
-
-The repo also exposes a Google ADK-compatible `root_agent` for ADK Web. Run this
-from the repository root after providing the required runtime configuration:
+The primary local runtime is the Google ADK API server with A2A and the bundled
+Dev UI enabled. Synchronize the locked environment, provide the required runtime
+configuration through your shell, secret manager, or local `.env`, then start
+the runtime from the repository root.
 
 ```bash
 uv sync --locked
-uv run adk web orchestrator_demo --host 0.0.0.0 --port 8001
+uv run adk api_server --a2a --with_ui orchestrator_demo --host 0.0.0.0 --port 8000 --session_service_uri sqlite:///.adk/orchestrator_sessions.sqlite --artifact_service_uri file:./.adk/artifacts
 ```
 
-Open the forwarded `8001` URL and select the `orchestrator` app. ADK Web exposes
-the orchestrator through request, approve, and reject tools with JSON outputs.
-It does not render A2UI surfaces; use `uv run python -m orchestrator_demo.app`
-for the local A2UI renderer.
+Open the forwarded `8000` URL and select the `orchestrator` agent in the ADK Dev
+UI. External A2A clients can discover the orchestrator at
+`http://127.0.0.1:8000/a2a/orchestrator`. The command stores local ADK session
+and artifact state under `.adk/`, which is ignored by git.
 
-## Local Transport Contract
+## Dev UI Debugging
 
-The local app uses JSON HTTP endpoints to exercise the A2A/A2UI loop:
+Use ADK Web only for Dev UI debugging when the A2A server surface is not needed.
+The command still loads the same `orchestrator` root agent, but it is not the
+primary local runtime for this migration.
 
-| Interface | Endpoint | Purpose |
-| --- | --- | --- |
-| Request | `POST /api/request` | Submit a natural-language RM request. |
-| Action | `POST /api/user-action` | Submit a structured A2UI `userAction`. |
-| Status list | `GET /api/status` | Fetch accumulated status events. |
-| Status stream | `GET /api/status/stream` | Fetch status events as `text/event-stream`. |
-| Artifacts | `GET /api/artifacts` | Fetch the latest final artifacts and A2UI parts. |
-| Renderer | `GET /` | Open the trusted local renderer. |
-
-`POST /api/request` accepts JSON with `input` and returns `taskId`,
-`contextId`, route `path`, routing `decision`, optional `approvalPlan`,
-`a2uiParts`, `statusEvents`, and `artifacts`. Simple high-confidence requests
-route directly to one specialist. Complex requests return `path:
-plan_required`, an editable approval plan, and A2UI parts with
-`application/json+a2ui` metadata before any specialist execution.
-
-`POST /api/user-action` accepts the original A2UI event envelope:
-
-```json
-{
-  "userAction": {
-    "type": "approve_plan",
-    "surfaceId": "surface_plan_example",
-    "payload": {
-      "planId": "plan_example",
-      "approvedStepIds": ["step_1", "step_2"],
-      "editedPlanVersion": 1
-    }
-  }
-}
+```bash
+uv sync --locked
+uv run adk web orchestrator_demo --host 0.0.0.0 --port 8000
 ```
 
-The `surfaceId` is required. Plan events are handled by structured approval
-state, and downstream specialist events are routed through the surface ownership
-registry instead of an LLM decision.
+## ADK Tool Contract
+
+The root agent exposes stable tools for the full request, draft-edit, approval,
+and rejection loop:
+
+| Tool | Purpose |
+| --- | --- |
+| `submit_orchestrator_request` | Submit a natural-language RM request. |
+| `add_plan_instruction` | Add a user instruction to one draft plan step. |
+| `remove_plan_step` | Remove one draft plan step when allowed by plan invariants. |
+| `replace_plan_agent` | Replace the agent assigned to one draft plan step. |
+| `reorder_plan_steps` | Reorder the current draft plan steps. |
+| `approve_orchestrator_plan` | Approve a current draft plan and execute its graph. |
+| `reject_orchestrator_plan` | Reject a current draft plan without execution. |
+
+Tool responses are JSON-serializable dictionaries with stable camelCase fields
+for protocol consumers. Plan-required and draft-updated responses include both
+structured plan JSON and A2UI data parts so clients can either render the plan
+surface or inspect the JSON directly.
 
 ## Approval Flow
 
-Complex requests always require A2UI plan approval:
+Complex requests always require structured plan approval:
 
-1. `POST /api/request` classifies the request, generates an `approvalPlan`, and
-   returns an editable A2UI workflow canvas using the plan
-   `approval_surface_id`.
-2. The renderer may emit `add_instruction`, `reject_plan`, or `approve_plan`
-   events through `POST /api/user-action`.
-3. Draft edit events update the unapproved plan and refresh the A2UI surface.
-4. `reject_plan` records structured rejection state and does not execute the
-   graph.
-5. `approve_plan` freezes the approved plan, creates the ADK graph, executes
-   the graph, emits progress status events, and stores final artifacts.
+1. `submit_orchestrator_request` classifies the request, generates a draft plan,
+   persists pending approval state in ADK session state, and returns A2UI plan
+   review payloads.
+2. Draft edit tools mutate the current draft and return a refreshed A2UI plan
+   surface with an incremented plan version.
+3. `reject_orchestrator_plan` records structured rejection state and does not
+   execute the graph.
+4. `approve_orchestrator_plan` validates the current plan version and approved
+   step IDs, freezes the approved plan, executes the ADK graph, emits status
+   events, and stores final artifacts through ADK artifact storage.
 
-Approved plans are immutable for this MVP. Conversation text is not an approval
-mechanism.
+Approved and rejected plans are immutable for this MVP. Conversation text is not
+an approval mechanism.
 
-## Renderer Behavior
+## A2UI Presentation
 
-The renderer at `GET /` is a minimal trusted DOM mapper for the Basic Catalog
-A2UI payloads used in the demo. It renders approval surfaces, downstream
-specialist surfaces, status updates, and artifacts. It preserves A2UI
-`surfaceId` values, emits structured `userAction` events back to
-`POST /api/user-action`, and does not execute arbitrary code from generated UI
-payloads.
-
-Downstream specialist A2UI is validated and passed through without orchestrator
-layout rewrites. If a downstream surface creates actions, the orchestrator
-routes those actions deterministically by `surfaceId`.
+A2UI remains the presentation format for draft plan review, draft refreshes,
+approval and rejection controls, downstream specialist surfaces, and useful
+artifact summaries. These payloads now travel through ADK Dev UI rendering and
+A2A data parts with `application/json+a2ui` metadata. Structured JSON fields
+remain available so clients that do not render A2UI can still perform explicit
+edit, approve, or reject tool calls.
 
 ## ADK Graph Acceptance
 
@@ -166,10 +142,10 @@ uv run ruff check .
 uv run mypy orchestrator_demo
 ```
 
-Useful focused checks include `uv run pytest tests/test_app_transport.py` for
-request/action/status/artifact behavior,
-`uv run pytest tests/test_renderer_contract.py` for renderer behavior, and
-`uv run pytest tests/test_adk_graph_acceptance.py` for ADK graph acceptance.
+Useful focused checks include `uv run pytest tests/test_repo_hygiene.py` for
+repository and documentation hygiene, `uv run pytest tests/test_adk_tool_flows.py`
+for ADK tool behavior, and `uv run pytest tests/test_adk_a2a_plugin.py` for A2A
+exposure.
 
 ## Known Limitations
 
@@ -178,6 +154,5 @@ request/action/status/artifact behavior,
 - mocked search for deterministic web-search behavior.
 - local-only demo with no production deployment target.
 - deterministic tests rather than live model-quality evaluation.
-- minimal renderer intended to prove the A2UI loop, not production UX.
 - no regulated decisions, binding credit decisions, pricing decisions, or
   production compliance determinations.
