@@ -16,6 +16,9 @@ from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE
 from orchestrator_demo.a2ui_support.adk_a2a_delivery import (
     adk_a2a_bridge_parts_for_response,
 )
+from orchestrator_demo.a2ui_support.response_redaction import (
+    redacted_response_json_safe,
+)
 
 
 A2UI_A2A_TOOL_NAMES = {
@@ -48,26 +51,34 @@ class A2uiA2AProtocolPlugin(BasePlugin):
         if _has_dev_ui_a2ui_transport_part(content.parts):
             return None
 
+        original_event = event
+        event, responses = _event_with_redacted_tool_function_responses(event)
+        content = event.content
+        if content is None or not content.parts:
+            return None
+
         bridge_parts: list[genai_types.Part] = []
         existing_components_by_surface_id = _existing_components_by_surface_id(
             invocation_context
         )
-        for response in _a2ui_tool_function_responses(content.parts):
+        for response in responses:
             bridge_parts.extend(
                 adk_a2a_bridge_parts_for_response(
                     response,
-                    existing_components_by_surface_id=existing_components_by_surface_id,
+                    existing_components_by_surface_id=(
+                        existing_components_by_surface_id
+                    ),
                 )
             )
         if not bridge_parts:
-            return None
+            return event if event is not original_event else None
 
         missing_bridge_parts = _missing_a2ui_bridge_parts(
             existing_parts=content.parts,
             expected_parts=bridge_parts,
         )
         if not missing_bridge_parts:
-            return None
+            return event if event is not original_event else None
 
         modified_event = event.model_copy(deep=True)
         modified_content = content.model_copy(deep=True)
@@ -77,20 +88,43 @@ class A2uiA2AProtocolPlugin(BasePlugin):
         return modified_event
 
 
-def _a2ui_tool_function_responses(
-    parts: Sequence[genai_types.Part],
-) -> list[Mapping[str, Any]]:
+def _event_with_redacted_tool_function_responses(
+    event: Event,
+) -> tuple[Event, list[Mapping[str, Any]]]:
+    content = event.content
+    if content is None or not content.parts:
+        return event, []
+
+    redacted_event = event
+    redacted_parts = content.parts
     responses: list[Mapping[str, Any]] = []
-    for part in parts:
+    for index, part in enumerate(content.parts):
         function_response = part.function_response
         if function_response is None:
             continue
         if function_response.name not in A2UI_A2A_TOOL_NAMES:
             continue
         response = function_response.response
-        if isinstance(response, Mapping):
-            responses.append(response)
-    return responses
+        if not isinstance(response, Mapping):
+            continue
+
+        redacted_response = redacted_response_json_safe(response)
+        responses.append(redacted_response)
+        if redacted_response == response:
+            continue
+
+        if redacted_event is event:
+            redacted_event = event.model_copy(deep=True)
+            redacted_content = redacted_event.content
+            if redacted_content is None or not redacted_content.parts:
+                return event, responses
+            redacted_parts = redacted_content.parts
+
+        redacted_function_response = redacted_parts[index].function_response
+        if redacted_function_response is not None:
+            redacted_function_response.response = redacted_response
+
+    return redacted_event, responses
 
 
 def _existing_components_by_surface_id(

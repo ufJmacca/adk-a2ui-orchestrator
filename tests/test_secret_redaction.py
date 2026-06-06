@@ -11,6 +11,15 @@ from orchestrator_demo.a2ui_support.schema_manager import (
     BASIC_CATALOG_ID,
 )
 from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+from orchestrator_demo.contracts import (
+    ExecutionPlan,
+    IntentSuggestion,
+    LlmIntentAssessment,
+    PlanStep,
+    RoutingDecision,
+    StatusEvent,
+)
+from orchestrator_demo.orchestrator.request_context import RequestContext
 
 
 SECRET_SENTINEL = "secret-value-that-must-not-leak"
@@ -275,6 +284,431 @@ def test_adk_tool_error_payload_redacts_secret_and_traceback_text() -> None:
     assert leaked_secret not in rendered
     assert "Traceback" not in rendered
     assert "/tmp/secret/path.py" not in rendered
+
+
+def test_adk_tool_response_payload_redacts_secret_like_structured_fields() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.secret_safety import REDACTED_SECRET
+    from orchestrator_demo.orchestrator.response_payloads import build_request_response
+    from orchestrator_demo.orchestrator.service import OrchestratorRequestResult
+
+    leaked_secret = "sk-or-v1-tool-response-secret-should-not-leak"
+    user_input = (
+        "Prepare me for tomorrow's meeting with ABC Manufacturing "
+        f"using api_key={leaked_secret}"
+    )
+    decision = RoutingDecision(
+        path="plan_required",
+        selected_agent=None,
+        confidence=0.91,
+        reason=f"Planner diagnostic Authorization: Bearer {leaked_secret}",
+    )
+    context = RequestContext(
+        user_input=user_input,
+        slm_suggestion=IntentSuggestion(intent="meeting_prep", confidence=0.82),
+        llm_assessment=LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.91,
+            complexity="complex",
+            rationale=f"Need multiple specialists for api_key={leaked_secret}",
+            required_agents=["internal_knowledge", "synthesis"],
+        ),
+        decision=decision,
+        plan_scope_id="tool_response_redaction",
+    )
+    plan = ExecutionPlan(
+        plan_id="plan_meeting_prep_tool_response_redaction",
+        objective=user_input,
+        detected_intents=["meeting_prep"],
+        selected_agents=["internal_knowledge", "synthesis"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction=f"Review internal notes without emitting {leaked_secret}",
+                expected_output="Internal customer context.",
+            )
+        ],
+        data_source_categories=["internal_crm"],
+        risk_notes=[f"Do not log Authorization: Bearer {leaked_secret}"],
+        approval_surface_id="surface_plan_meeting_prep_tool_response_redaction",
+    )
+    result = OrchestratorRequestResult(
+        path="plan_required",
+        decision=decision,
+        context=context,
+        approval_plan=plan,
+        status_events=(
+            StatusEvent(
+                event_id="event_tool_response_redaction",
+                graph_id="graph_tool_response_redaction",
+                plan_id=plan.plan_id,
+                status="graph_created",
+                message=f"Prepared draft with api_key={leaked_secret}",
+            ),
+        ),
+        final_artifacts={
+            "diagnostic": f"Authorization: Bearer {leaked_secret}",
+        },
+    )
+
+    # Act
+    payload = build_request_response(result)
+    rendered = json.dumps(payload, sort_keys=True)
+
+    # Assert
+    assert payload["status"] == "plan_required"
+    assert payload["planId"] == plan.plan_id
+    assert leaked_secret not in rendered
+    assert "Authorization" not in rendered
+    assert REDACTED_SECRET in rendered
+
+
+def test_adk_tool_response_payload_preserves_contract_ids_with_secret_marker_words() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.response_payloads import build_request_response
+    from orchestrator_demo.orchestrator.service import OrchestratorRequestResult
+
+    decision = RoutingDecision(
+        path="plan_required",
+        selected_agent="credential_review",
+        confidence=0.91,
+        reason="Needs structured review.",
+    )
+    context = RequestContext(
+        user_input="Prepare a customer review.",
+        slm_suggestion=IntentSuggestion(intent="meeting_prep", confidence=0.82),
+        llm_assessment=LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.91,
+            complexity="complex",
+            rationale="Needs multiple specialists.",
+            required_agents=["credential_review", "token_analysis"],
+        ),
+        decision=decision,
+        plan_scope_id="credential_review",
+    )
+    plan = ExecutionPlan(
+        plan_id="plan_credential_review",
+        objective="Prepare a customer review.",
+        detected_intents=["meeting_prep"],
+        selected_agents=["credential_review", "token_analysis"],
+        steps=[
+            PlanStep(
+                step_id="step_credential_review",
+                agent_id="credential_review",
+                instruction="Review customer context.",
+                expected_output="Customer context.",
+            ),
+            PlanStep(
+                step_id="step_token_follow_up",
+                agent_id="token_analysis",
+                instruction="Prepare follow-up actions.",
+                expected_output="Follow-up actions.",
+                depends_on=["step_credential_review"],
+            ),
+        ],
+        data_source_categories=["credential_context"],
+        risk_notes=["Confirm before final outreach."],
+        approval_surface_id="surface_plan_credential_review",
+    )
+    a2ui_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": "surface_plan_credential_review",
+                "components": [
+                    {
+                        "component": "Column",
+                        "id": "root",
+                        "children": [
+                            "component_plan_credential_review_summary",
+                            "component_step_token_follow_up",
+                            "component_token_review_card",
+                        ],
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_plan_credential_review_summary",
+                        "text": "Review this draft.",
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_step_token_follow_up",
+                        "text": "Prepare follow-up actions.",
+                    },
+                    {
+                        "component": "Card",
+                        "id": "component_token_review_card",
+                        "child": "component_token_review_card_body",
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_token_review_card_body",
+                        "text": "Confirm the plan before execution.",
+                    },
+                ],
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    )
+    result = OrchestratorRequestResult(
+        path="plan_required",
+        decision=decision,
+        context=context,
+        approval_plan=plan,
+        a2ui_parts=(a2ui_part,),
+    )
+
+    # Act
+    payload = build_request_response(result)
+    approve_action = next(
+        action
+        for action in payload["nextActions"]
+        if action["toolName"] == "approve_orchestrator_plan"
+    )
+    a2ui_payload = payload["a2uiParts"][0]["data"]
+    components = a2ui_payload["updateComponents"]["components"]
+
+    # Assert
+    assert payload["planId"] == "plan_credential_review"
+    assert payload["approvalSurfaceId"] == "surface_plan_credential_review"
+    assert payload["selectedAgents"] == ["credential_review", "token_analysis"]
+    assert payload["stepIds"] == ["step_credential_review", "step_token_follow_up"]
+    assert payload["plan"]["steps"][0]["stepId"] == "step_credential_review"
+    assert payload["plan"]["steps"][0]["agentId"] == "credential_review"
+    assert payload["plan"]["steps"][1]["dependsOn"] == ["step_credential_review"]
+    assert approve_action["planId"] == "plan_credential_review"
+    assert approve_action["approvalSurfaceId"] == "surface_plan_credential_review"
+    assert approve_action["approvedStepIds"] == [
+        "step_credential_review",
+        "step_token_follow_up",
+    ]
+    assert a2ui_payload["updateComponents"]["surfaceId"] == (
+        "surface_plan_credential_review"
+    )
+    assert components[0]["id"] == "root"
+    assert components[0]["children"] == [
+        "component_plan_credential_review_summary",
+        "component_step_token_follow_up",
+        "component_token_review_card",
+    ]
+    assert components[3]["child"] == "component_token_review_card_body"
+    assert validate_outbound_a2ui(payload["a2uiParts"]).valid is True
+    assert "<redacted-key>" not in json.dumps(payload, sort_keys=True)
+
+
+def test_response_redaction_preserves_plan_graph_routing_identifiers() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.response_redaction import (
+        redacted_response_json_safe,
+    )
+    from orchestrator_demo.a2ui_support.secret_safety import REDACTED_SECRET
+
+    leaked_secret = "sk-or-v1-route-redaction-secret-should-not-leak"
+    payload = {
+        "plan": {
+            "steps": [
+                {
+                    "stepId": "step_token_review",
+                    "condition": "token_review_complete",
+                    "parallelGroup": "parallel_token_review",
+                }
+            ]
+        },
+        "statusEvents": [
+            {
+                "details": {
+                    "parallel_group": "parallel_credential_token_review",
+                    "route": "token_review_complete",
+                    "routes": ["credential_token_review"],
+                    "selectedRoute": "credential_token_review",
+                    "graphRoute": "policy_token_route",
+                    "routeCondition": "token_review_complete",
+                    "edgeRoutes": ["edge_token_review"],
+                    "diagnostic": f"provider failed with {leaked_secret}",
+                }
+            }
+        ],
+    }
+
+    # Act
+    redacted = redacted_response_json_safe(payload)
+    rendered = json.dumps(redacted, sort_keys=True)
+
+    # Assert
+    assert redacted["plan"]["steps"][0]["condition"] == "token_review_complete"
+    assert redacted["plan"]["steps"][0]["parallelGroup"] == "parallel_token_review"
+    details = redacted["statusEvents"][0]["details"]
+    assert details["parallel_group"] == "parallel_credential_token_review"
+    assert details["route"] == "token_review_complete"
+    assert details["routes"] == ["credential_token_review"]
+    assert details["selectedRoute"] == "credential_token_review"
+    assert details["graphRoute"] == "policy_token_route"
+    assert details["routeCondition"] == "token_review_complete"
+    assert details["edgeRoutes"] == ["edge_token_review"]
+    assert leaked_secret not in rendered
+    assert REDACTED_SECRET in rendered
+    assert "<redacted-key>" not in rendered
+
+
+def test_response_redaction_redacts_secret_like_field_child_values() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.response_redaction import (
+        redacted_response_json_safe,
+    )
+    from orchestrator_demo.a2ui_support.secret_safety import (
+        REDACTED_KEY,
+        REDACTED_SECRET,
+    )
+
+    payload = {
+        "structuredOutput": {
+            "password": "hunter2",
+        },
+        "artifacts": [
+            {
+                "apiKey": "abc123xyz",
+            }
+        ],
+        "safeText": "Review customer credentials without exposing secrets.",
+    }
+
+    # Act
+    redacted = redacted_response_json_safe(payload)
+    rendered = json.dumps(redacted, sort_keys=True)
+
+    # Assert
+    assert redacted["structuredOutput"][REDACTED_KEY] == REDACTED_SECRET
+    assert redacted["artifacts"][0][REDACTED_KEY] == REDACTED_SECRET
+    assert "hunter2" not in rendered
+    assert "abc123xyz" not in rendered
+
+
+def test_response_redaction_preserves_benign_user_facing_marker_words() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.response_redaction import (
+        redacted_response_json_safe,
+    )
+    from orchestrator_demo.a2ui_support.secret_safety import REDACTED_SECRET
+
+    leaked_secret = "sk-or-v1-free-text-secret-should-not-leak"
+    payload = {
+        "plan": {
+            "objective": "Review customer credentials and Token analysis.",
+            "steps": [
+                {
+                    "instruction": (
+                        "Confirm credentials context before token follow-up."
+                    ),
+                    "expectedOutput": "Credential summary.",
+                }
+            ],
+        },
+        "specialistResponses": [
+            {
+                "content": (
+                    "Token analysis completed for customer credentials. "
+                    f"Do not expose api_key={leaked_secret}"
+                )
+            }
+        ],
+        "a2uiParts": [
+            {
+                "data": {
+                    "updateComponents": {
+                        "components": [
+                            {
+                                "component": "Text",
+                                "id": "component_customer_credentials",
+                                "text": "Token analysis for customer credentials.",
+                            }
+                        ]
+                    }
+                }
+            }
+        ],
+    }
+
+    # Act
+    redacted = redacted_response_json_safe(payload)
+    rendered = json.dumps(redacted, sort_keys=True)
+
+    # Assert
+    assert redacted["plan"]["objective"] == (
+        "Review customer credentials and Token analysis."
+    )
+    assert redacted["plan"]["steps"][0]["instruction"] == (
+        "Confirm credentials context before token follow-up."
+    )
+    assert redacted["plan"]["steps"][0]["expectedOutput"] == "Credential summary."
+    assert redacted["specialistResponses"][0]["content"] == (
+        f"Token analysis completed for customer credentials. "
+        f"Do not expose {REDACTED_SECRET}"
+    )
+    component = redacted["a2uiParts"][0]["data"]["updateComponents"]["components"][0]
+    assert component["text"] == "Token analysis for customer credentials."
+    assert leaked_secret not in rendered
+    assert "<redacted-key>" not in rendered
+
+
+def test_adk_tool_response_payload_redacts_secret_values_in_contract_ids() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.secret_safety import REDACTED_SECRET
+    from orchestrator_demo.orchestrator.response_payloads import build_request_response
+    from orchestrator_demo.orchestrator.service import OrchestratorRequestResult
+
+    leaked_secret = "sk-or-v1-contract-id-secret-should-not-leak"
+    decision = RoutingDecision(
+        path="plan_required",
+        selected_agent=None,
+        confidence=0.91,
+        reason="Needs structured review.",
+    )
+    context = RequestContext(
+        user_input="Prepare a customer review.",
+        slm_suggestion=IntentSuggestion(intent="meeting_prep", confidence=0.82),
+        llm_assessment=LlmIntentAssessment(
+            intents=["meeting_prep"],
+            confidence=0.91,
+            complexity="complex",
+            rationale="Needs multiple specialists.",
+            required_agents=["internal_knowledge", "synthesis"],
+        ),
+        decision=decision,
+        plan_scope_id="contract_id_redaction",
+    )
+    plan = ExecutionPlan(
+        plan_id=f"plan_{leaked_secret}",
+        objective="Prepare a customer review.",
+        detected_intents=["meeting_prep"],
+        selected_agents=["internal_knowledge", "synthesis"],
+        steps=[
+            PlanStep(
+                step_id="step_internal_knowledge",
+                agent_id="internal_knowledge",
+                instruction="Review customer context.",
+                expected_output="Customer context.",
+            )
+        ],
+        data_source_categories=["internal_crm"],
+        risk_notes=["Confirm before final outreach."],
+        approval_surface_id=f"surface_plan_{leaked_secret}",
+    )
+    result = OrchestratorRequestResult(
+        path="plan_required",
+        decision=decision,
+        context=context,
+        approval_plan=plan,
+    )
+
+    # Act
+    payload = build_request_response(result)
+    rendered = json.dumps(payload, sort_keys=True)
+
+    # Assert
+    assert leaked_secret not in rendered
+    assert REDACTED_SECRET in rendered
 
 
 def test_adk_artifact_document_redacts_secret_like_payload_values() -> None:

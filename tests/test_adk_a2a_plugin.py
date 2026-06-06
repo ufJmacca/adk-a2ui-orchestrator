@@ -84,6 +84,50 @@ def _incremental_a2ui_part(surface_id: str) -> dict[str, Any]:
     }
 
 
+def _referenced_a2ui_part(surface_id: str) -> dict[str, Any]:
+    return {
+        "type": "data",
+        "data": {
+            "version": A2UI_VERSION,
+            "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                    {
+                        "component": "Column",
+                        "id": "root",
+                        "children": [
+                            "component_plan_credential_review_summary",
+                            "component_step_token_follow_up",
+                            "component_token_review_card",
+                        ],
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_plan_credential_review_summary",
+                        "text": "Review this draft.",
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_step_token_follow_up",
+                        "text": "Prepare follow-up actions.",
+                    },
+                    {
+                        "component": "Card",
+                        "id": "component_token_review_card",
+                        "child": "component_token_review_card_body",
+                    },
+                    {
+                        "component": "Text",
+                        "id": "component_token_review_card_body",
+                        "text": "Confirm the plan before execution.",
+                    },
+                ],
+            },
+        },
+        "metadata": {"mimeType": A2UI_MIME_TYPE},
+    }
+
+
 def _invocation_context_with_existing_component(surface_id: str) -> SimpleNamespace:
     return SimpleNamespace(
         session=SimpleNamespace(
@@ -369,6 +413,71 @@ async def test_a2ui_a2a_protocol_plugin_handles_all_orchestrator_tools(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": "ok"},
+        {"status": "ok", "a2uiParts": []},
+    ],
+)
+async def test_a2ui_a2a_protocol_plugin_tolerates_absent_or_empty_a2ui_parts(
+    response: dict[str, Any],
+) -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
+
+    event = _function_response_event("submit_orchestrator_request", response)
+
+    # Act
+    modified_event = await A2uiA2AProtocolPlugin().on_event_callback(
+        invocation_context=SimpleNamespace(),
+        event=event,
+    )
+
+    # Assert
+    assert modified_event is None
+
+
+@pytest.mark.asyncio
+async def test_a2ui_a2a_protocol_plugin_surfaces_invalid_a2ui_parts() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_a2a_delivery import A2UIA2ADeliveryError
+    from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
+
+    response = {
+        "status": "plan_required",
+        "a2uiParts": [
+            {
+                "type": "data",
+                "data": {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": "surface_invalid_plugin",
+                        "components": [
+                            {
+                                "component": "Text",
+                                "text": "Missing the required component id.",
+                            }
+                        ],
+                    },
+                },
+                "metadata": {"mimeType": A2UI_MIME_TYPE},
+            }
+        ],
+    }
+    event = _function_response_event("submit_orchestrator_request", response)
+
+    # Act / Assert
+    with pytest.raises(A2UIA2ADeliveryError) as exc_info:
+        await A2uiA2AProtocolPlugin().on_event_callback(
+            invocation_context=SimpleNamespace(),
+            event=event,
+        )
+
+    assert "A2UI payload failed outbound validation" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_a2ui_a2a_protocol_plugin_preserves_incremental_validation_context() -> (
     None
 ):
@@ -393,6 +502,117 @@ async def test_a2ui_a2a_protocol_plugin_preserves_incremental_validation_context
     assert [part.data for part in _a2ui_data_parts_from_event(modified_event)] == [
         response["a2uiParts"][0]["data"]
     ]
+
+
+@pytest.mark.asyncio
+async def test_a2ui_a2a_protocol_plugin_preserves_contract_ids_with_marker_words() -> (
+    None
+):
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
+
+    response = {
+        "status": "plan_required",
+        "path": "plan_required",
+        "planId": "plan_credential_review",
+        "approvalSurfaceId": "surface_plan_credential_review",
+        "selectedAgents": ["credential_review", "token_analysis"],
+        "a2uiParts": [_referenced_a2ui_part("surface_plan_credential_review")],
+    }
+    event = _function_response_event("submit_orchestrator_request", response)
+
+    # Act
+    modified_event = await A2uiA2AProtocolPlugin().on_event_callback(
+        invocation_context=SimpleNamespace(),
+        event=event,
+    )
+
+    # Assert
+    assert modified_event is not None
+    function_response = modified_event.content.parts[0].function_response
+    assert function_response is not None
+    assert function_response.response["planId"] == "plan_credential_review"
+    assert function_response.response["approvalSurfaceId"] == (
+        "surface_plan_credential_review"
+    )
+    assert function_response.response["selectedAgents"] == [
+        "credential_review",
+        "token_analysis",
+    ]
+
+    a2ui_data_parts = _a2ui_data_parts_from_event(modified_event)
+    assert len(a2ui_data_parts) == 1
+    a2ui_payload = a2ui_data_parts[0].data
+    components = a2ui_payload["updateComponents"]["components"]
+    assert a2ui_payload["updateComponents"]["surfaceId"] == (
+        "surface_plan_credential_review"
+    )
+    assert components[0]["id"] == "root"
+    assert components[0]["children"] == [
+        "component_plan_credential_review_summary",
+        "component_step_token_follow_up",
+        "component_token_review_card",
+    ]
+    assert components[3]["child"] == "component_token_review_card_body"
+    assert "<redacted-key>" not in modified_event.model_dump_json(
+        by_alias=True,
+        exclude_none=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a2ui_a2a_protocol_plugin_redacts_secret_bearing_tool_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.secret_safety import REDACTED_SECRET
+    from orchestrator_demo.a2ui_support.adk_a2a_plugin import A2uiA2AProtocolPlugin
+
+    leaked_secret = "sk-or-v1-a2a-plugin-secret-should-not-leak"
+    response = {
+        "status": "plan_required",
+        "diagnostic": f"Authorization: Bearer {leaked_secret}",
+        "a2uiParts": [
+            {
+                "type": "data",
+                "data": {
+                    "version": A2UI_VERSION,
+                    "updateComponents": {
+                        "surfaceId": "surface_plugin_redaction",
+                        "components": [
+                            {
+                                "component": "Text",
+                                "id": "root",
+                                "text": f"Never emit api_key={leaked_secret}",
+                            }
+                        ],
+                    },
+                },
+                "metadata": {"mimeType": A2UI_MIME_TYPE},
+            }
+        ],
+    }
+    event = _function_response_event("submit_orchestrator_request", response)
+
+    # Act
+    modified_event = await A2uiA2AProtocolPlugin().on_event_callback(
+        invocation_context=SimpleNamespace(),
+        event=event,
+    )
+
+    # Assert
+    assert modified_event is not None
+    serialized_event = modified_event.model_dump_json(
+        by_alias=True,
+        exclude_none=True,
+    )
+    assert leaked_secret not in serialized_event
+    assert "Authorization" not in serialized_event
+    assert REDACTED_SECRET in serialized_event
+
+    a2ui_data_parts = _a2ui_data_parts_from_event(modified_event)
+    assert len(a2ui_data_parts) == 1
+    assert a2ui_data_parts[0].metadata == {"mimeType": A2UI_MIME_TYPE}
+    bridged_text = a2ui_data_parts[0].data["updateComponents"]["components"][0]["text"]
+    assert bridged_text == f"Never emit {REDACTED_SECRET}"
 
 
 @pytest.mark.asyncio
