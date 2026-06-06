@@ -1534,6 +1534,28 @@ def test_a2ui_validation_accepts_sdk_kind_data_part_payload() -> None:
     assert result.renderer_part.metadata["mimeType"] == A2UI_MIME_TYPE
 
 
+def test_a2ui_validation_accepts_sdk_mime_alias_data_part_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
+
+    payload = _valid_canvas_payload()
+    sdk_data_part = {
+        "kind": "data",
+        "data": payload,
+        "metadata": {"mimeType": "application/a2ui+json"},
+    }
+
+    # Act
+    result = validate_outbound_a2ui(sdk_data_part)
+
+    # Assert
+    assert result.valid is True
+    assert result.validation_errors == []
+    assert isinstance(result.renderer_part, DataPart)
+    assert result.renderer_part.data == payload
+    assert result.renderer_part.metadata["mimeType"] == A2UI_MIME_TYPE
+
+
 def test_a2ui_validation_accepts_sdk_created_a2ui_part_instance() -> None:
     # Arrange
     from a2ui.a2a.parts import create_a2ui_part
