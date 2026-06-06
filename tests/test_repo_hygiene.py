@@ -78,6 +78,20 @@ MALFORMED_LOCAL_STORAGE_URI_MARKERS = (
     "file://.adk",
 )
 
+UNSUPPORTED_CUSTOM_SURFACE_PATHS = {
+    "orchestrator_demo/app/__main__.py",
+    "orchestrator_demo/app/server.py",
+    "orchestrator_demo/app/static/index.html",
+    "orchestrator_demo/app/static/renderer.js",
+    "orchestrator_demo/app/static/styles.css",
+}
+
+OBSOLETE_CUSTOM_SURFACE_TESTS = {
+    "tests/test_app_entrypoint.py",
+    "tests/test_app_transport.py",
+    "tests/test_renderer_contract.py",
+}
+
 
 def _dependency_name(requirement: str) -> str:
     return re.split(r"[\[<>=!~; ]", requirement, maxsplit=1)[0].lower()
@@ -192,6 +206,48 @@ def test_pyproject_includes_orchestrator_agent_card_package_data() -> None:
 
     # Assert
     assert package_data["orchestrator_demo.orchestrator"] == ["agent.json"]
+
+
+def test_pyproject_does_not_package_static_renderer_assets() -> None:
+    # Arrange
+    pyproject_path = ROOT / "pyproject.toml"
+
+    # Act
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+    static_package_data = {
+        package: patterns
+        for package, patterns in package_data.items()
+        if package == "orchestrator_demo.app"
+        or any("static" in pattern for pattern in patterns)
+    }
+
+    # Assert
+    assert static_package_data == {}
+
+
+def test_custom_http_runtime_and_static_renderer_files_are_removed() -> None:
+    # Arrange
+    unsupported_paths = UNSUPPORTED_CUSTOM_SURFACE_PATHS
+
+    # Act
+    present_paths = sorted(
+        path for path in unsupported_paths if (ROOT / path).exists()
+    )
+
+    # Assert
+    assert present_paths == []
+
+
+def test_obsolete_custom_transport_and_renderer_tests_are_removed() -> None:
+    # Arrange
+    obsolete_tests = OBSOLETE_CUSTOM_SURFACE_TESTS
+
+    # Act
+    present_tests = sorted(path for path in obsolete_tests if (ROOT / path).exists())
+
+    # Assert
+    assert present_tests == []
 
 
 def test_pyproject_configures_pytest_ruff_and_mypy_quality_gates() -> None:
