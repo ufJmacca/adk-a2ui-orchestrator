@@ -2,6 +2,9 @@ import json
 from typing import Any
 
 import pytest
+from a2a import types as a2a_types
+from google.adk.a2a.converters import part_converter
+from google.adk.events.ui_widget import UiWidget
 
 from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE, DataPart, TextPart
 from orchestrator_demo.a2ui_support.schema_manager import (
@@ -172,6 +175,14 @@ def _valid_workflow_canvas_payload() -> dict[str, Any]:
     }
 
 
+class RecordingDeliveryContext:
+    def __init__(self) -> None:
+        self.rendered_ui_widgets: list[UiWidget] = []
+
+    def render_ui_widget(self, ui_widget: UiWidget) -> None:
+        self.rendered_ui_widgets.append(ui_widget)
+
+
 def test_a2ui_validation_success_emits_data_part_without_repair() -> None:
     # Arrange
     from orchestrator_demo.a2ui_support.validation import validate_outbound_a2ui
@@ -188,6 +199,1267 @@ def test_a2ui_validation_success_emits_data_part_without_repair() -> None:
     assert isinstance(result.renderer_part, DataPart)
     assert result.renderer_part.metadata["mimeType"] == A2UI_MIME_TYPE
     assert result.renderer_part.data == payload
+
+
+def test_adk_ui_delivery_validates_parts_before_emitting_adk_content_part() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_content_parts_for_a2ui_response,
+        adk_dev_ui_content_parts_for_a2ui_response,
+        deliver_a2ui_parts_to_adk_ui,
+    )
+
+    tool_context = RecordingDeliveryContext()
+    part = DataPart(
+        data=_valid_canvas_payload(),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {
+        "approvalSurfaceId": "surface_plan_meeting_prep",
+        "a2uiParts": [part],
+    }
+
+    # Act
+    deliver_a2ui_parts_to_adk_ui(response, tool_context)
+
+    # Assert
+    assert len(tool_context.rendered_ui_widgets) == 1
+    widget = tool_context.rendered_ui_widgets[0]
+    assert widget.id == "surface_plan_meeting_prep"
+    assert widget.provider == "a2ui"
+    assert widget.payload == {"parts": [part]}
+
+    content_parts = adk_content_parts_for_a2ui_response(response)
+    assert len(content_parts) == 1
+    converted_part = part_converter.convert_genai_part_to_a2a_part(
+        content_parts[0]
+    )
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    assert data_part.kind == "data"
+    assert data_part.metadata == {"mimeType": A2UI_MIME_TYPE}
+    assert data_part.data == part["data"]
+    assert "updateComponents" in part["data"]
+
+    dev_ui_content_parts = adk_dev_ui_content_parts_for_a2ui_response(response)
+    assert len(dev_ui_content_parts) == 1
+    converted_part = part_converter.convert_genai_part_to_a2a_part(
+        dev_ui_content_parts[0]
+    )
+    assert converted_part is not None
+    dev_ui_data_part = converted_part.root
+    assert isinstance(dev_ui_data_part, a2a_types.DataPart)
+    assert "updateComponents" not in dev_ui_data_part.data
+    assert "surfaceUpdate" in dev_ui_data_part.data
+    surface_update = dev_ui_data_part.data["surfaceUpdate"]
+    assert surface_update["surfaceId"] == "surface_plan_meeting_prep"
+    root_component = surface_update["components"][0]
+    assert root_component["component"]["Column"]["children"] == {
+        "explicitList": [
+            "component_plan_meeting_prep_metadata",
+            "component_plan_meeting_prep_objective",
+            "component_plan_meeting_prep_agents",
+            "component_plan_meeting_prep_steps",
+            "component_plan_meeting_prep_dependencies",
+            "component_plan_meeting_prep_parallel_groups",
+            "component_plan_meeting_prep_controls",
+        ]
+    }
+    text_component = surface_update["components"][1]
+    assert text_component["component"]["Text"]["text"]["literalString"].startswith(
+        "surfaceId: surface_plan_meeting_prep"
+    )
+
+
+def test_adk_ui_delivery_translates_create_surface_for_dev_ui_render_signal() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    create_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "createSurface": {
+                "surfaceId": "surface_plan_meeting_prep",
+                "catalogId": BASIC_CATALOG_ID,
+                "theme": {"agentDisplayName": "Meeting Prep"},
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    update_part = DataPart(
+        data=_valid_canvas_payload(),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {
+        "approvalSurfaceId": "surface_plan_meeting_prep",
+        "a2uiParts": [create_part, update_part],
+    }
+
+    # Act
+    content_parts = adk_dev_ui_content_parts_for_a2ui_response(response)
+
+    # Assert
+    decoded_payloads: list[dict[str, Any]] = []
+    for content_part in content_parts:
+        converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+        assert converted_part is not None
+        data_part = converted_part.root
+        assert isinstance(data_part, a2a_types.DataPart)
+        decoded_payloads.append(data_part.data)
+
+    assert [set(payload) for payload in decoded_payloads] == [
+        {"surfaceUpdate"},
+        {"beginRendering"},
+    ]
+    assert decoded_payloads[1]["beginRendering"] == {
+        "surfaceId": "surface_plan_meeting_prep",
+        "root": "root",
+        "catalogId": BASIC_CATALOG_ID,
+        "styles": {"agentDisplayName": "Meeting Prep"},
+    }
+    assert response["a2uiParts"] == [create_part, update_part]
+
+
+def test_adk_ui_delivery_translates_templated_children_for_dev_ui() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_product_list",
+            components=[
+                {
+                    "component": "List",
+                    "id": "root",
+                    "children": {
+                        "componentId": "component_product_item",
+                        "path": "items",
+                    },
+                },
+                {
+                    "component": "Text",
+                    "id": "component_product_item",
+                    "text": {"path": "name"},
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_product_list", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    components = data_part.data["surfaceUpdate"]["components"]
+    assert components[0]["component"]["List"]["children"] == {
+        "template": {
+            "componentId": "component_product_item",
+            "dataBinding": {"path": "items"},
+        }
+    }
+    assert components[1]["component"]["Text"]["text"] == {"path": "name"}
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_translates_control_fields_for_dev_ui() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_plan_meeting_prep",
+            components=[
+                {
+                    "component": "Column",
+                    "id": "root",
+                    "children": ["control_notes", "control_apply"],
+                },
+                {
+                    "component": "TextField",
+                    "id": "control_notes",
+                    "label": "Instruction",
+                    "value": {
+                        "path": "/approvalEdits/step_internal_knowledge/instruction"
+                    },
+                    "variant": "longText",
+                },
+                {
+                    "component": "Button",
+                    "id": "control_apply",
+                    "child": "control_apply_label",
+                    "variant": "primary",
+                    "action": {
+                        "event": {
+                            "name": "add_instruction",
+                            "context": {
+                                "type": "add_instruction",
+                                "surfaceId": "surface_plan_meeting_prep",
+                                "payload": {
+                                    "planId": "plan_meeting_prep",
+                                    "planVersion": 2,
+                                    "stepId": "step_internal_knowledge",
+                                    "instruction": {
+                                        "path": (
+                                            "/approvalEdits/step_internal_knowledge"
+                                            "/instruction"
+                                        )
+                                    },
+                                },
+                            },
+                        }
+                    },
+                },
+                {
+                    "component": "Text",
+                    "id": "control_apply_label",
+                    "text": "Apply edit",
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_plan_meeting_prep", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    components = data_part.data["surfaceUpdate"]["components"]
+    text_field = components[1]["component"]["TextField"]
+    assert text_field == {
+        "label": {"literalString": "Instruction"},
+        "text": {"path": "/approvalEdits/step_internal_knowledge/instruction"},
+        "type": "longText",
+    }
+    button = components[2]["component"]["Button"]
+    assert button["child"] == "control_apply_label"
+    assert button["variant"] == "primary"
+    assert button["action"] == {
+        "name": "add_instruction",
+        "context": [
+            {"key": "type", "value": {"literalString": "add_instruction"}},
+            {
+                "key": "surfaceId",
+                "value": {"literalString": "surface_plan_meeting_prep"},
+            },
+            {"key": "planId", "value": {"literalString": "plan_meeting_prep"}},
+            {"key": "planVersion", "value": {"literalNumber": 2}},
+            {
+                "key": "stepId",
+                "value": {"literalString": "step_internal_knowledge"},
+            },
+            {
+                "key": "instruction",
+                "value": {
+                    "path": "/approvalEdits/step_internal_knowledge/instruction"
+                },
+            },
+        ],
+    }
+    parsed_action = parse_user_action({"event": button["action"]})
+    assert parsed_action.type == "add_instruction"
+    assert parsed_action.surface_id == "surface_plan_meeting_prep"
+    assert parsed_action.plan_id == "plan_meeting_prep"
+    assert parsed_action.plan_version == 2
+    assert parsed_action.payload == {
+        "planId": "plan_meeting_prep",
+        "planVersion": 2,
+        "stepId": "step_internal_knowledge",
+        "instruction": {"path": "/approvalEdits/step_internal_knowledge/instruction"},
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_converts_label_only_button_for_dev_ui() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_specialist_action",
+            components=[
+                {
+                    "component": "Column",
+                    "id": "root",
+                    "children": ["control_follow_up"],
+                },
+                {
+                    "component": "Button",
+                    "id": "control_follow_up",
+                    "label": "Request follow-up",
+                    "action": {
+                        "event": {
+                            "name": "specialist_followup",
+                            "context": {
+                                "type": "request_followup",
+                                "surfaceId": "surface_specialist_action",
+                                "payload": {
+                                    "agentId": "product_opportunity",
+                                    "action": "request_followup",
+                                },
+                            },
+                        }
+                    },
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {
+        "approvalSurfaceId": "surface_specialist_action",
+        "a2uiParts": [part],
+    }
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    components = data_part.data["surfaceUpdate"]["components"]
+    button = components[1]["component"]["Button"]
+    assert button["child"] == "control_follow_up_label"
+    assert "label" not in button
+    assert components[2] == {
+        "id": "control_follow_up_label",
+        "component": {"Text": {"text": {"literalString": "Request follow-up"}}},
+    }
+    parsed_action = parse_user_action({"event": button["action"]})
+    assert parsed_action.type == "request_followup"
+    assert parsed_action.surface_id == "surface_specialist_action"
+    assert parsed_action.payload == {
+        "agentId": "product_opportunity",
+        "action": "request_followup",
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_avoids_known_surface_id_for_synthetic_button_label() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    tool_context = RecordingDeliveryContext()
+    tool_context.state = {
+        "orchestrator_session": {
+            "surfaceRegistry": {
+                "componentsBySurfaceId": {
+                    "surface_specialist_action": {
+                        "control_follow_up_label": {
+                            "component": "Text",
+                            "id": "control_follow_up_label",
+                            "text": "Existing label",
+                        }
+                    }
+                }
+            }
+        }
+    }
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_specialist_action",
+            components=[
+                {
+                    "component": "Button",
+                    "id": "control_follow_up",
+                    "label": "Request follow-up",
+                    "action": {
+                        "event": {
+                            "name": "specialist_followup",
+                            "context": {
+                                "type": "request_followup",
+                                "surfaceId": "surface_specialist_action",
+                                "payload": {"agentId": "product_opportunity"},
+                            },
+                        }
+                    },
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {
+        "approvalSurfaceId": "surface_specialist_action",
+        "a2uiParts": [part],
+    }
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(
+        response,
+        tool_context=tool_context,
+    )[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    components = data_part.data["surfaceUpdate"]["components"]
+    assert (
+        components[0]["component"]["Button"]["child"]
+        == "control_follow_up_label_2"
+    )
+    assert components[1] == {
+        "id": "control_follow_up_label_2",
+        "component": {"Text": {"text": {"literalString": "Request follow-up"}}},
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_wraps_specialist_component_primitives_for_dev_ui() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_specialist_catalog",
+            components=[
+                {
+                    "component": "Column",
+                    "id": "root",
+                    "children": [
+                        "specialist_image",
+                        "specialist_icon",
+                        "specialist_checkbox",
+                        "specialist_slider",
+                        "specialist_audio",
+                        "specialist_video",
+                    ],
+                },
+                {
+                    "component": "Image",
+                    "id": "specialist_image",
+                    "url": "https://example.com/specialist-card.png",
+                    "description": "Specialist opportunity chart",
+                    "fit": "cover",
+                    "variant": "header",
+                },
+                {
+                    "component": "Icon",
+                    "id": "specialist_icon",
+                    "name": "warning",
+                },
+                {
+                    "component": "CheckBox",
+                    "id": "specialist_checkbox",
+                    "label": "Include treasury controls",
+                    "value": True,
+                },
+                {
+                    "component": "Slider",
+                    "id": "specialist_slider",
+                    "label": "Confidence",
+                    "min": 0,
+                    "max": 100,
+                    "value": 72.5,
+                },
+                {
+                    "component": "AudioPlayer",
+                    "id": "specialist_audio",
+                    "url": "https://example.com/specialist-briefing.mp3",
+                    "description": "Specialist briefing audio",
+                },
+                {
+                    "component": "Video",
+                    "id": "specialist_video",
+                    "url": "https://example.com/specialist-briefing.mp4",
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_specialist_catalog", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    components = {
+        component["id"]: next(iter(component["component"].values()))
+        for component in data_part.data["surfaceUpdate"]["components"]
+    }
+
+    image = components["specialist_image"]
+    assert image["url"] == {"literalString": "https://example.com/specialist-card.png"}
+    assert image["description"] == {"literalString": "Specialist opportunity chart"}
+    assert image["fit"] == "cover"
+    assert image["variant"] == "header"
+
+    assert components["specialist_icon"]["name"] == {"literalString": "warning"}
+    assert components["specialist_checkbox"] == {
+        "label": {"literalString": "Include treasury controls"},
+        "value": {"literalBoolean": True},
+    }
+    assert components["specialist_slider"] == {
+        "label": {"literalString": "Confidence"},
+        "minValue": 0,
+        "maxValue": 100,
+        "value": {"literalNumber": 72.5},
+    }
+    assert components["specialist_audio"] == {
+        "url": {"literalString": "https://example.com/specialist-briefing.mp3"},
+        "description": {"literalString": "Specialist briefing audio"},
+    }
+    assert components["specialist_video"] == {
+        "url": {"literalString": "https://example.com/specialist-briefing.mp4"}
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_translates_renderer_specific_control_contracts() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_specialist_controls",
+            components=[
+                {
+                    "component": "Column",
+                    "id": "root",
+                    "children": [
+                        "control_schedule",
+                        "control_priority",
+                        "control_agent",
+                        "control_tabs",
+                        "control_modal",
+                    ],
+                },
+                {
+                    "component": "DateTimeInput",
+                    "id": "control_schedule",
+                    "label": "Follow-up date",
+                    "value": "2026-06-05",
+                    "enableDate": True,
+                    "enableTime": False,
+                },
+                {
+                    "component": "Slider",
+                    "id": "control_priority",
+                    "label": "Priority",
+                    "min": 1,
+                    "max": 5,
+                    "value": 3,
+                },
+                {
+                    "component": "ChoicePicker",
+                    "id": "control_agent",
+                    "label": "Specialist",
+                    "value": ["treasury"],
+                    "filterable": False,
+                    "options": [
+                        {"label": "Treasury", "value": "treasury"},
+                        {"label": "Credit", "value": "credit"},
+                    ],
+                },
+                {
+                    "component": "Tabs",
+                    "id": "control_tabs",
+                    "tabs": [
+                        {"title": "Summary", "child": "tab_summary"},
+                        {"title": "Detail", "child": "tab_detail"},
+                    ],
+                },
+                {
+                    "component": "Modal",
+                    "id": "control_modal",
+                    "trigger": "modal_trigger",
+                    "content": "modal_content",
+                },
+                {
+                    "component": "Text",
+                    "id": "tab_summary",
+                    "text": "Summary content",
+                },
+                {
+                    "component": "Text",
+                    "id": "tab_detail",
+                    "text": "Detail content",
+                },
+                {
+                    "component": "Text",
+                    "id": "modal_trigger",
+                    "text": "Open details",
+                },
+                {
+                    "component": "Text",
+                    "id": "modal_content",
+                    "text": "Modal content",
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_specialist_controls", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    components = {
+        component["id"]: component["component"]
+        for component in data_part.data["surfaceUpdate"]["components"]
+    }
+
+    date_time = components["control_schedule"]["DateTimeInput"]
+    assert date_time["enableDate"] is True
+    assert date_time["enableTime"] is False
+    assert date_time["label"] == {"literalString": "Follow-up date"}
+    assert date_time["value"] == {"literalString": "2026-06-05"}
+
+    slider = components["control_priority"]["Slider"]
+    assert slider == {
+        "label": {"literalString": "Priority"},
+        "minValue": 1,
+        "maxValue": 5,
+        "value": {"literalNumber": 3},
+    }
+
+    choice = components["control_agent"]
+    assert set(choice) == {"MultipleChoice"}
+    assert choice["MultipleChoice"] == {
+        "label": {"literalString": "Specialist"},
+        "selections": ["treasury"],
+        "filterable": {"literalBoolean": False},
+        "options": [
+            {"label": {"literalString": "Treasury"}, "value": "treasury"},
+            {"label": {"literalString": "Credit"}, "value": "credit"},
+        ],
+    }
+
+    tabs = components["control_tabs"]["Tabs"]
+    assert tabs == {
+        "tabItems": [
+            {"title": {"literalString": "Summary"}, "child": "tab_summary"},
+            {"title": {"literalString": "Detail"}, "child": "tab_detail"},
+        ]
+    }
+
+    modal = components["control_modal"]["Modal"]
+    assert modal == {
+        "entryPointChild": "modal_trigger",
+        "contentChild": "modal_content",
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_rendered_mapping_context_decodes_json_literal_lists() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    approved_step_ids = ["step_internal_knowledge", "step_relationship_summary"]
+    ordered_step_ids = ["step_relationship_summary", "step_internal_knowledge"]
+    editable_fields = ["objective", "riskNotes"]
+
+    # Act
+    approval_action = parse_user_action(
+        {
+            "userAction": {
+                "name": "approve_plan",
+                "surfaceId": "surface_plan_meeting_prep",
+                "context": {
+                    "type": "approve_plan",
+                    "planId": "plan_meeting_prep",
+                    "planVersion": 3,
+                    "approvedStepIds": json.dumps(approved_step_ids),
+                },
+            }
+        }
+    )
+    reorder_action = parse_user_action(
+        {
+            "userAction": {
+                "name": "reorder_steps",
+                "surfaceId": "surface_plan_meeting_prep",
+                "context": {
+                    "type": "reorder_steps",
+                    "planId": "plan_meeting_prep",
+                    "planVersion": 3,
+                    "orderedStepIds": json.dumps(ordered_step_ids),
+                },
+            }
+        }
+    )
+    edit_action = parse_user_action(
+        {
+            "userAction": {
+                "name": "edit_plan",
+                "surfaceId": "surface_plan_meeting_prep",
+                "context": {
+                    "type": "edit_plan",
+                    "planId": "plan_meeting_prep",
+                    "planVersion": 3,
+                    "editableFields": json.dumps(editable_fields),
+                },
+            }
+        }
+    )
+
+    # Assert
+    assert approval_action.payload["approvedStepIds"] == approved_step_ids
+    assert reorder_action.payload["orderedStepIds"] == ordered_step_ids
+    assert edit_action.payload["editableFields"] == editable_fields
+
+
+def test_adk_wrapped_user_action_context_type_wins_over_event_name() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    surface_id = "surface_product_opportunity_followup"
+
+    # Act
+    parsed_action = parse_user_action(
+        {
+            "userAction": {
+                "name": "specialist_followup",
+                "surfaceId": surface_id,
+                "context": {
+                    "type": "request_followup",
+                    "surfaceId": surface_id,
+                    "payload": {"source": "incremental"},
+                },
+            }
+        }
+    )
+
+    # Assert
+    assert parsed_action.type == "request_followup"
+    assert parsed_action.surface_id == surface_id
+    assert parsed_action.payload["source"] == "incremental"
+
+
+def test_adk_ui_delivery_namespaces_basic_catalog_payload_list_context() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_product_opportunity",
+            components=[
+                {
+                    "component": "Button",
+                    "id": "control_specialist",
+                    "child": "control_specialist_label",
+                    "action": {
+                        "event": {
+                            "name": "specialist_action",
+                            "context": {
+                                "type": "specialist_action",
+                                "surfaceId": "surface_product_opportunity",
+                                "payload": [
+                                    {
+                                        "key": "agentId",
+                                        "value": "product_opportunity",
+                                    },
+                                    {"key": "action", "value": "show_more_detail"},
+                                    {
+                                        "key": "filters",
+                                        "value": ["cash_visibility", "controls"],
+                                    },
+                                ],
+                            },
+                        }
+                    },
+                },
+                {
+                    "component": "Text",
+                    "id": "control_specialist_label",
+                    "text": "Show detail",
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_product_opportunity", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    button = data_part.data["surfaceUpdate"]["components"][0]["component"]["Button"]
+    assert button["action"] == {
+        "name": "specialist_action",
+        "context": [
+            {"key": "type", "value": {"literalString": "specialist_action"}},
+            {
+                "key": "surfaceId",
+                "value": {"literalString": "surface_product_opportunity"},
+            },
+            {
+                "key": "payload",
+                "value": [
+                    {
+                        "key": "agentId",
+                        "value": {"literalString": "product_opportunity"},
+                    },
+                    {"key": "action", "value": {"literalString": "show_more_detail"}},
+                    {
+                        "key": "filters",
+                        "value": {"literalString": '["cash_visibility","controls"]'},
+                    },
+                ],
+            },
+        ],
+    }
+    parsed_action = parse_user_action({"event": button["action"]})
+    assert parsed_action.type == "specialist_action"
+    assert parsed_action.surface_id == "surface_product_opportunity"
+    assert parsed_action.payload == {
+        "agentId": "product_opportunity",
+        "action": "show_more_detail",
+        "filters": ["cash_visibility", "controls"],
+    }
+
+
+def test_adk_ui_delivery_preserves_colliding_specialist_payload_fields() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_product_opportunity",
+            components=[
+                {
+                    "component": "Button",
+                    "id": "control_specialist",
+                    "child": "control_specialist_label",
+                    "action": {
+                        "event": {
+                            "name": "specialist_action",
+                            "context": {
+                                "type": "specialist_action",
+                                "surfaceId": "surface_product_opportunity",
+                                "payload": {
+                                    "type": "show_detail",
+                                    "surfaceId": "surface_payload_detail",
+                                    "agentId": "product_opportunity",
+                                    "settings": {
+                                        "mode": "detail",
+                                        "columns": ["cash", "risk"],
+                                    },
+                                },
+                            },
+                        }
+                    },
+                },
+                {
+                    "component": "Text",
+                    "id": "control_specialist_label",
+                    "text": "Show detail",
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_product_opportunity", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    button = data_part.data["surfaceUpdate"]["components"][0]["component"]["Button"]
+    assert button["action"] == {
+        "name": "specialist_action",
+        "context": [
+            {"key": "type", "value": {"literalString": "specialist_action"}},
+            {
+                "key": "surfaceId",
+                "value": {"literalString": "surface_product_opportunity"},
+            },
+            {
+                "key": "payload",
+                "value": [
+                    {"key": "type", "value": {"literalString": "show_detail"}},
+                    {
+                        "key": "surfaceId",
+                        "value": {"literalString": "surface_payload_detail"},
+                    },
+                    {
+                        "key": "agentId",
+                        "value": {"literalString": "product_opportunity"},
+                    },
+                    {
+                        "key": "settings",
+                        "value": {
+                            "literalString": (
+                                '{"mode":"detail","columns":["cash","risk"]}'
+                            )
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+    parsed_action = parse_user_action({"event": button["action"]})
+    assert parsed_action.type == "specialist_action"
+    assert parsed_action.surface_id == "surface_product_opportunity"
+    assert parsed_action.payload == {
+        "type": "show_detail",
+        "surfaceId": "surface_payload_detail",
+        "agentId": "product_opportunity",
+        "settings": {"mode": "detail", "columns": ["cash", "risk"]},
+    }
+
+
+def test_adk_rendered_specialist_user_action_omits_routing_surface_payload() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    def _click(payload_entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "userAction": {
+                "name": "specialist_action",
+                "surfaceId": "surface_product_opportunity",
+                "context": [
+                    {"key": "type", "value": {"literalString": "specialist_action"}},
+                    {
+                        "key": "surfaceId",
+                        "value": {"literalString": "surface_product_opportunity"},
+                    },
+                    {"key": "payload", "value": payload_entries},
+                ],
+            }
+        }
+
+    # Act
+    parsed_action = parse_user_action(
+        _click(
+            [
+                {
+                    "key": "agentId",
+                    "value": {"literalString": "product_opportunity"},
+                },
+                {"key": "action", "value": {"literalString": "show_more_detail"}},
+            ]
+        )
+    )
+    explicit_surface_action = parse_user_action(
+        _click(
+            [
+                {
+                    "key": "surfaceId",
+                    "value": {"literalString": "surface_payload_detail"},
+                },
+                {
+                    "key": "agentId",
+                    "value": {"literalString": "product_opportunity"},
+                },
+            ]
+        )
+    )
+
+    # Assert
+    assert parsed_action.type == "specialist_action"
+    assert parsed_action.surface_id == "surface_product_opportunity"
+    assert parsed_action.payload == {
+        "agentId": "product_opportunity",
+        "action": "show_more_detail",
+    }
+    assert explicit_surface_action.payload == {
+        "surfaceId": "surface_payload_detail",
+        "agentId": "product_opportunity",
+    }
+
+
+def test_adk_ui_delivery_preserves_preencoded_basic_catalog_payload_values() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+    from orchestrator_demo.a2ui_support.event_parser import parse_user_action
+
+    part = DataPart(
+        data=_a2ui_update(
+            surface_id="surface_product_opportunity",
+            components=[
+                {
+                    "component": "Button",
+                    "id": "control_specialist",
+                    "child": "control_specialist_label",
+                    "action": {
+                        "event": {
+                            "name": "specialist_action",
+                            "context": {
+                                "type": "specialist_action",
+                                "surfaceId": "surface_product_opportunity",
+                                "payload": [
+                                    {
+                                        "key": "agentId",
+                                        "value": {
+                                            "literalString": "product_opportunity"
+                                        },
+                                    },
+                                    {
+                                        "key": "action",
+                                        "value": {"literalString": "show_more_detail"},
+                                    },
+                                    {
+                                        "key": "filters",
+                                        "value": {
+                                            "literalString": (
+                                                '["cash_visibility","controls"]'
+                                            )
+                                        },
+                                    },
+                                ],
+                            },
+                        }
+                    },
+                },
+                {
+                    "component": "Text",
+                    "id": "control_specialist_label",
+                    "text": "Show detail",
+                },
+            ],
+        ),
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_product_opportunity", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    button = data_part.data["surfaceUpdate"]["components"][0]["component"]["Button"]
+    assert button["action"]["context"] == [
+        {"key": "type", "value": {"literalString": "specialist_action"}},
+        {
+            "key": "surfaceId",
+            "value": {"literalString": "surface_product_opportunity"},
+        },
+        {
+            "key": "payload",
+            "value": [
+                {"key": "agentId", "value": {"literalString": "product_opportunity"}},
+                {"key": "action", "value": {"literalString": "show_more_detail"}},
+                {
+                    "key": "filters",
+                    "value": {"literalString": '["cash_visibility","controls"]'},
+                },
+            ],
+        },
+    ]
+    parsed_action = parse_user_action({"event": button["action"]})
+    assert parsed_action.payload == {
+        "agentId": "product_opportunity",
+        "action": "show_more_detail",
+        "filters": ["cash_visibility", "controls"],
+    }
+
+
+def test_adk_ui_delivery_translates_delete_surface_for_dev_ui_canvas() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    delete_part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "deleteSurface": {"surfaceId": "surface_plan_meeting_prep"},
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    )
+    response = {
+        "approvalSurfaceId": "surface_plan_meeting_prep",
+        "a2uiParts": [delete_part.model_dump(by_alias=True, mode="json")],
+    }
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(
+        response,
+        validated_a2ui_parts=[delete_part],
+    )[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    assert data_part.data == {
+        "surfaceUpdate": {
+            "surfaceId": "surface_plan_meeting_prep",
+            "components": [
+                {
+                    "id": "root",
+                    "component": {
+                        "Column": {
+                            "children": {"explicitList": ["root_surface_closed"]}
+                        }
+                    },
+                },
+                {
+                    "id": "root_surface_closed",
+                    "component": {
+                        "Text": {
+                            "text": {"literalString": "Plan review closed."},
+                            "usageHint": "secondary",
+                        }
+                    },
+                },
+            ],
+        }
+    }
+    assert "deleteSurface" not in data_part.data
+    assert response["a2uiParts"] == [delete_part.model_dump(by_alias=True, mode="json")]
+
+
+def test_adk_ui_delivery_preserves_scalar_data_model_target_path() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "updateDataModel": {
+                "surfaceId": "surface_plan_meeting_prep",
+                "path": "/customer/name",
+                "value": "ABC Manufacturing",
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_plan_meeting_prep", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    assert data_part.data["dataModelUpdate"] == {
+        "surfaceId": "surface_plan_meeting_prep",
+        "path": "/customer",
+        "contents": [{"key": "name", "valueString": "ABC Manufacturing"}],
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_serializes_list_data_model_values_as_json() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        adk_dev_ui_content_parts_for_a2ui_response,
+    )
+
+    products = [
+        {"name": "Treasury", "score": 0.91},
+        {"name": "Merchant services", "score": 0.84},
+    ]
+    part = DataPart(
+        data={
+            "version": A2UI_VERSION,
+            "updateDataModel": {
+                "surfaceId": "surface_plan_meeting_prep",
+                "path": "/products",
+                "value": products,
+            },
+        },
+        metadata={"mimeType": A2UI_MIME_TYPE},
+    ).model_dump(by_alias=True, mode="json")
+    response = {"approvalSurfaceId": "surface_plan_meeting_prep", "a2uiParts": [part]}
+
+    # Act
+    content_part = adk_dev_ui_content_parts_for_a2ui_response(response)[0]
+    converted_part = part_converter.convert_genai_part_to_a2a_part(content_part)
+
+    # Assert
+    assert converted_part is not None
+    data_part = converted_part.root
+    assert isinstance(data_part, a2a_types.DataPart)
+    assert data_part.data["dataModelUpdate"] == {
+        "surfaceId": "surface_plan_meeting_prep",
+        "path": "/",
+        "contents": [
+            {
+                "key": "products",
+                "valueString": json.dumps(products, separators=(",", ":")),
+            }
+        ],
+    }
+    assert response["a2uiParts"] == [part]
+
+
+def test_adk_ui_delivery_rejects_invalid_a2ui_without_content_part() -> None:
+    # Arrange
+    from orchestrator_demo.a2ui_support.adk_ui_delivery import (
+        A2UIWidgetDeliveryError,
+        deliver_a2ui_parts_to_adk_ui,
+    )
+
+    tool_context = RecordingDeliveryContext()
+    response = {
+        "approvalSurfaceId": "surface_plan_meeting_prep",
+        "a2uiParts": [
+            {
+                "type": "data",
+                "data": {"version": A2UI_VERSION, "unknownMessage": {}},
+                "metadata": {"mimeType": A2UI_MIME_TYPE},
+            }
+        ],
+    }
+
+    # Act / Assert
+    with pytest.raises(A2UIWidgetDeliveryError):
+        deliver_a2ui_parts_to_adk_ui(response, tool_context)
+    assert tool_context.rendered_ui_widgets == []
 
 
 def test_a2ui_validation_accepts_structured_workflow_canvas_payload() -> None:
