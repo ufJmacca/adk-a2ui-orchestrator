@@ -210,6 +210,30 @@ def test_a2ui_data_part_requires_exact_mime_type() -> None:
     }
 
 
+def test_a2ui_data_part_accepts_sdk_mime_alias_and_serializes_canonical() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.transport import A2UI_MIME_TYPE, DataPart
+
+    payload = {"surfaceId": "surface_plan_meeting_prep", "components": []}
+
+    # Act
+    part = DataPart.model_validate(
+        {
+            "kind": "data",
+            "data": payload,
+            "metadata": {"mimeType": "application/a2ui+json"},
+        }
+    )
+
+    # Assert
+    assert part.metadata["mimeType"] == A2UI_MIME_TYPE
+    assert part.model_dump(by_alias=True, mode="json") == {
+        "type": "data",
+        "data": payload,
+        "metadata": {"mimeType": "application/json+a2ui"},
+    }
+
+
 def test_a2a_message_accepts_and_serializes_a2ui_data_part_wire_payload() -> None:
     # Arrange
     from orchestrator_demo.a2a_support.transport import (
@@ -256,6 +280,42 @@ def test_a2a_message_accepts_and_serializes_a2ui_data_part_wire_payload() -> Non
     assert part.mime_type == "application/json+a2ui"
     assert part.data["surfaceId"] == "surface_plan_meeting_prep"
     assert serialized_message == wire_message
+
+
+def test_a2a_message_accepts_a2ui_mime_alias_and_serializes_canonical() -> None:
+    # Arrange
+    from orchestrator_demo.a2a_support.transport import A2AMessage, DataPart
+
+    payload = {"surfaceId": "surface_plan_meeting_prep", "components": []}
+    wire_message = {
+        "messageId": "msg_agent_alias_mime",
+        "contextId": "ctx_abc_manufacturing",
+        "taskId": "task_meeting_prep",
+        "role": "agent",
+        "timestamp": "2026-05-30T12:02:00Z",
+        "parts": [
+            {
+                "kind": "data",
+                "data": payload,
+                "metadata": {"mimeType": "application/a2ui+json"},
+            }
+        ],
+        "metadata": {},
+    }
+
+    # Act
+    message = A2AMessage.model_validate(wire_message)
+    serialized_message = message.model_dump(by_alias=True, mode="json")
+
+    # Assert
+    assert isinstance(message.parts[0], DataPart)
+    assert serialized_message["parts"] == [
+        {
+            "type": "data",
+            "data": payload,
+            "metadata": {"mimeType": "application/json+a2ui"},
+        }
+    ]
 
 
 def test_a2a_message_accepts_sdk_kind_discriminators_for_parts() -> None:

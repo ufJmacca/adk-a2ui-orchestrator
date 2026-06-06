@@ -23,6 +23,12 @@ from orchestrator_demo.contracts import UserAction
 
 
 A2UI_MIME_TYPE: Final[Literal["application/json+a2ui"]] = "application/json+a2ui"
+_A2UI_MIME_TYPE_ALIASES: Final[frozenset[str]] = frozenset(
+    {
+        A2UI_MIME_TYPE,
+        "application/a2ui+json",
+    }
+)
 
 MessageRole = Literal["user", "agent"]
 TaskState = Literal[
@@ -117,6 +123,15 @@ class DataPart(A2APart):
     @model_validator(mode="before")
     @classmethod
     def normalize_a2ui_mime_type(cls, value: Any) -> Any:
+        root = getattr(value, "root", None)
+        if root is not None:
+            value = root
+
+        if not isinstance(value, dict):
+            model_dump = getattr(value, "model_dump", None)
+            if callable(model_dump):
+                value = model_dump(by_alias=True, mode="json", exclude_none=True)
+
         if not isinstance(value, dict):
             return value
 
@@ -128,8 +143,12 @@ class DataPart(A2APart):
             return normalized
 
         metadata = dict(metadata)
-        wire_mime_type = normalized.pop("mimeType", None)
-        python_mime_type = normalized.pop("mime_type", None)
+        wire_mime_type = _canonicalize_a2ui_mime_type(
+            normalized.pop("mimeType", None)
+        )
+        python_mime_type = _canonicalize_a2ui_mime_type(
+            normalized.pop("mime_type", None)
+        )
         if (
             wire_mime_type is not None
             and python_mime_type is not None
@@ -139,10 +158,16 @@ class DataPart(A2APart):
 
         mime_type = wire_mime_type if wire_mime_type is not None else python_mime_type
         if mime_type is not None:
-            existing_mime_type = metadata.get("mimeType")
+            existing_mime_type = _canonicalize_a2ui_mime_type(
+                metadata.get("mimeType")
+            )
             if existing_mime_type is not None and existing_mime_type != mime_type:
                 raise ValueError("metadata.mimeType must match mimeType")
             metadata["mimeType"] = mime_type
+        elif metadata.get("mimeType") is not None:
+            metadata["mimeType"] = _canonicalize_a2ui_mime_type(
+                metadata.get("mimeType")
+            )
 
         normalized["metadata"] = metadata
         return normalized
@@ -157,6 +182,13 @@ class DataPart(A2APart):
     @property
     def mime_type(self) -> Literal["application/json+a2ui"]:
         return A2UI_MIME_TYPE
+
+
+def _canonicalize_a2ui_mime_type(value: Any) -> Any:
+    if isinstance(value, str) and value in _A2UI_MIME_TYPE_ALIASES:
+        return A2UI_MIME_TYPE
+
+    return value
 
 
 def _part_discriminator(value: Any) -> str | None:
