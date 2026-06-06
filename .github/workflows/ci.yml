@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: ".python-version"
+
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.19"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Check lockfile is up to date
+        run: uv lock --check
+
+      - name: Install locked environment
+        run: uv sync --locked
+
+      - name: Ruff
+        run: uv run --locked ruff check --output-format=github .
+
+      - name: Mypy
+        run: uv run --locked mypy orchestrator_demo
+
+      - name: Tests
+        run: uv run --locked pytest
