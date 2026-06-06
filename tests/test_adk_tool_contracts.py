@@ -261,6 +261,18 @@ async def test_adk_adapter_registers_advertised_next_action_tools() -> None:
         .default
         is None
     )
+    assert (
+        tool_signatures["approve_orchestrator_plan"]
+        .parameters["tool_context"]
+        .default
+        is inspect.Parameter.empty
+    )
+    assert (
+        tool_signatures["reject_orchestrator_plan"]
+        .parameters["tool_context"]
+        .default
+        is inspect.Parameter.empty
+    )
 
 
 @pytest.mark.asyncio
@@ -788,8 +800,10 @@ async def test_response_builders_cover_success_statuses_with_json_contract() -> 
 async def test_adk_adapter_maps_approval_failures_to_safe_error_payloads() -> None:
     # Arrange
     adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
     submitted = await adapter.submit_orchestrator_request(
-        "Prepare me for tomorrow's meeting with ABC Manufacturing."
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=tool_context,
     )
 
     # Act
@@ -798,6 +812,7 @@ async def test_adk_adapter_maps_approval_failures_to_safe_error_payloads() -> No
         submitted["approvalSurfaceId"],
         ["step_does_not_match_current_plan"],
         edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
     )
 
     # Assert
@@ -813,8 +828,10 @@ async def test_adk_adapter_maps_approval_failures_to_safe_error_payloads() -> No
 async def test_adk_adapter_rejects_edited_plan_when_version_is_omitted() -> None:
     # Arrange
     adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
     submitted = await adapter.submit_orchestrator_request(
-        "Research this prospect and give me risks, opportunities, and talking points."
+        "Research this prospect and give me risks, opportunities, and talking points.",
+        tool_context=tool_context,
     )
     updated = await adapter.add_plan_instruction(
         submitted["planId"],
@@ -822,6 +839,7 @@ async def test_adk_adapter_rejects_edited_plan_when_version_is_omitted() -> None
         submitted["stepIds"][0],
         "Focus the prep on near-term credit exposure.",
         edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
     )
 
     # Act
@@ -829,6 +847,7 @@ async def test_adk_adapter_rejects_edited_plan_when_version_is_omitted() -> None
         updated["planId"],
         updated["approvalSurfaceId"],
         "Too broad for this meeting.",
+        tool_context=tool_context,
     )
 
     # Assert
@@ -845,9 +864,11 @@ async def test_adk_adapter_rejects_edited_plan_when_version_is_omitted() -> None
 async def test_adk_adapter_rejection_response_redacts_secret_like_reason() -> None:
     # Arrange
     adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
     leaked_secret = "sk-or-v1-rejection-secret-should-not-leak"
     submitted = await adapter.submit_orchestrator_request(
-        "Research this prospect and give me risks, opportunities, and talking points."
+        "Research this prospect and give me risks, opportunities, and talking points.",
+        tool_context=tool_context,
     )
 
     # Act
@@ -856,6 +877,7 @@ async def test_adk_adapter_rejection_response_redacts_secret_like_reason() -> No
         submitted["approvalSurfaceId"],
         f"Too broad. api_key={leaked_secret}",
         edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
     )
     rendered = json.dumps(rejected, sort_keys=True)
 

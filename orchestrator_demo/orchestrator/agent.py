@@ -238,7 +238,7 @@ class AdkOrchestratorAdapter:
         approval_surface_id: str,
         approved_step_ids: list[str],
         edited_plan_version: int,
-        tool_context: ToolContext | None = None,
+        tool_context: ToolContext,
     ) -> dict[str, Any]:
         """Approve a pending A2UI plan and execute the approved workflow."""
 
@@ -258,8 +258,9 @@ class AdkOrchestratorAdapter:
         plan_id: str,
         approval_surface_id: str,
         reason: str,
+        *,
+        tool_context: ToolContext,
         edited_plan_version: int | None = None,
-        tool_context: ToolContext | None = None,
     ) -> dict[str, Any]:
         """Reject a pending A2UI plan without executing specialists."""
 
