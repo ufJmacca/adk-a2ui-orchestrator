@@ -1,4 +1,5 @@
 import logging
+import json
 
 import pytest
 
@@ -248,3 +249,27 @@ def test_registry_descriptor_secret_field_diagnostics_are_redacted(
     assert "secret-like field" in rendered_diagnostic
     assert "input_schema.properties.<redacted>" in rendered_diagnostic
     assert secret_field_name not in rendered_diagnostic
+
+
+def test_adk_tool_error_payload_redacts_secret_and_traceback_text() -> None:
+    # Arrange
+    from orchestrator_demo.orchestrator.approval_state import PlanMutationError
+    from orchestrator_demo.orchestrator.response_payloads import build_error_response
+
+    leaked_secret = "sk-or-v1-response-secret-should-not-leak"
+    unsafe_error = PlanMutationError(
+        "approval failed: api_key="
+        f"{leaked_secret}\nTraceback (most recent call last):\n"
+        "  File '/tmp/secret/path.py', line 1, in <module>"
+    )
+
+    # Act
+    payload = build_error_response(unsafe_error)
+    rendered = json.dumps(payload, sort_keys=True)
+
+    # Assert
+    assert payload["status"] == "error"
+    assert payload["error"]["code"] == "invalid_plan_mutation"
+    assert leaked_secret not in rendered
+    assert "Traceback" not in rendered
+    assert "/tmp/secret/path.py" not in rendered
