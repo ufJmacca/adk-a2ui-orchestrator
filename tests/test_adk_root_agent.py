@@ -1,3 +1,4 @@
+import inspect
 import sys
 from pathlib import Path
 
@@ -32,6 +33,13 @@ def test_build_root_agent_returns_adk_agent_with_orchestrator_tools() -> None:
         "approve_orchestrator_plan",
         "reject_orchestrator_plan",
     }
+    submit_tool = next(
+        tool for tool in agent.tools if tool.name == "submit_orchestrator_request"
+    )
+    assert list(inspect.signature(submit_tool.func).parameters) == [
+        "user_input",
+        "tool_context",
+    ]
 
 
 @pytest.mark.asyncio
