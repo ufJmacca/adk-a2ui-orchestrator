@@ -1,6 +1,6 @@
 {
   "name": "orchestrator",
-  "description": "Business banking orchestrator for direct specialist routing, A2UI draft plan review, structured plan editing, approval, rejection, and final result retrieval.",
+  "description": "Business banking relationship-manager orchestrator for request routing, draft plan review, plan approval, and approved graph execution.",
   "url": "http://127.0.0.1:8000/a2a/orchestrator",
   "version": "0.1.0",
   "protocolVersion": "0.3.0",
@@ -10,8 +10,6 @@
     "stateTransitionHistory": true
   },
   "defaultInputModes": [
-    "application/json",
-    "application/json+a2ui",
     "text/plain"
   ],
   "defaultOutputModes": [
@@ -42,13 +40,14 @@
       ]
     },
     {
-      "id": "review_orchestrator_plan",
+      "id": "review_orchestrator_a2ui_plan",
       "name": "Review A2UI plan",
       "description": "Review structured draft plan JSON and A2UI approval-plan parts before specialist graph execution.",
       "tags": [
         "orchestrator",
         "a2ui",
-        "approval-plan"
+        "approval-plan",
+        "plan-review"
       ],
       "inputModes": [
         "application/json",
@@ -67,7 +66,7 @@
       "description": "Apply discrete draft-plan edits through add instruction, remove step, replace agent, or reorder step tools without graph execution.",
       "tags": [
         "orchestrator",
-        "editing"
+        "draft-editing"
       ],
       "inputModes": [
         "application/json",
