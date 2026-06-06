@@ -26,15 +26,12 @@ from orchestrator_demo.orchestrator.graph_runtime import (
     AdkGraphApiError,
     GraphRuntimeError,
 )
+from orchestrator_demo.orchestrator.artifacts import ArtifactStorageError
 from orchestrator_demo.orchestrator.service import (
     OrchestratorRequestResult,
     OrchestratorUserActionResult,
 )
 from orchestrator_demo.orchestrator.surface_routes import SurfaceOwnershipError
-
-
-class ArtifactStorageError(RuntimeError):
-    """Raised when ADK artifact persistence fails."""
 
 
 def build_request_response(result: OrchestratorRequestResult) -> dict[str, Any]:

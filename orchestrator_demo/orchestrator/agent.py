@@ -5,24 +5,25 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from copy import deepcopy
-import json
-import re
 from typing import Any
 
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
-from google.genai import types
 
 from orchestrator_demo.a2ui_support.secret_safety import (
-    redact_secret_like_values,
     safe_path_component,
 )
 from orchestrator_demo.app.bootstrap_llm import build_litellm_model
 from orchestrator_demo.intent.classifier import LiteLlmIntentClassifier
 from orchestrator_demo.orchestrator.approval_state import PlanAlreadyFinalError
-from orchestrator_demo.orchestrator.response_payloads import (
+from orchestrator_demo.orchestrator.artifacts import (
+    LATEST_RESULT_ARTIFACT_NAME,
     ArtifactStorageError,
+    plan_execution_artifact_name,
+    save_response_artifact,
+)
+from orchestrator_demo.orchestrator.response_payloads import (
     build_error_response,
     build_request_response,
     build_user_action_response,
@@ -337,7 +338,7 @@ class AdkOrchestratorAdapter:
             return
         await self._save_json_artifact(
             tool_context,
-            filename="orchestrator_latest_result.json",
+            filename=LATEST_RESULT_ARTIFACT_NAME,
             response=response,
             document_type="direct_result",
         )
@@ -359,11 +360,14 @@ class AdkOrchestratorAdapter:
         plan_id = approval_result.plan_id
         await self._save_json_artifact(
             tool_context,
-            filename=(
-                "orchestrator_plan_"
-                f"{_artifact_plan_id_token(plan_id)}"
-                "_execution.json"
-            ),
+            filename=LATEST_RESULT_ARTIFACT_NAME,
+            response=response,
+            document_type="approved_result",
+            plan_id=plan_id,
+        )
+        await self._save_json_artifact(
+            tool_context,
+            filename=plan_execution_artifact_name(plan_id),
             response=response,
             document_type="approved_plan_execution",
             plan_id=plan_id,
@@ -378,38 +382,15 @@ class AdkOrchestratorAdapter:
         document_type: str,
         plan_id: str | None = None,
     ) -> None:
-        artifacts = response.get("artifacts")
-        if tool_context is None or not artifacts:
+        artifact_ref = await save_response_artifact(
+            tool_context,
+            filename=filename,
+            response=response,
+            document_type=document_type,
+            plan_id=plan_id,
+        )
+        if artifact_ref is None:
             return
-
-        document = _artifact_document(response)
-        try:
-            version = await tool_context.save_artifact(
-                filename,
-                types.Part.from_bytes(
-                    data=json.dumps(
-                        document,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8"),
-                    mime_type="application/json",
-                ),
-                custom_metadata={
-                    "documentType": document_type,
-                    "mimeType": "application/json",
-                },
-            )
-        except Exception as exc:
-            raise ArtifactStorageError("ADK artifact persistence failed.") from exc
-
-        artifact_ref: dict[str, Any] = {
-            "filename": filename,
-            "version": version,
-            "mimeType": "application/json",
-            "documentType": document_type,
-        }
-        if plan_id is not None:
-            artifact_ref["planId"] = safe_path_component(plan_id)
 
         self._agent.record_artifact_refs({filename: artifact_ref})
         response["artifactRefs"] = self._agent.artifact_refs()
@@ -885,8 +866,7 @@ def _artifact_ref_belongs_to_plan(
 
     return (
         isinstance(filename, str)
-        and filename
-        == f"orchestrator_plan_{_artifact_plan_id_token(plan_id)}_execution.json"
+        and filename == plan_execution_artifact_name(plan_id)
     )
 
 
@@ -925,39 +905,6 @@ def _plan_field(plan: Mapping[str, Any], *field_names: str) -> Any:
         if value is not None:
             return value
     return None
-
-
-def _artifact_document(response: Mapping[str, Any]) -> dict[str, Any]:
-    document: dict[str, Any] = {
-        "status": response.get("status"),
-        "path": response.get("path"),
-        "artifacts": response.get("artifacts", {}),
-        "statusEvents": response.get("statusEvents", []),
-    }
-    for field_name in ("planId", "planVersion"):
-        if response.get(field_name) is not None:
-            document[field_name] = response[field_name]
-    return _redacted_json_safe(document)
-
-
-def _redacted_json_safe(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            safe_path_component(str(key)): _redacted_json_safe(child)
-            for key, child in value.items()
-        }
-    if isinstance(value, list | tuple):
-        return [_redacted_json_safe(child) for child in value]
-    if isinstance(value, set | frozenset):
-        return sorted(_redacted_json_safe(child) for child in value)
-    if isinstance(value, str):
-        return redact_secret_like_values(value)
-    return value
-
-
-def _artifact_plan_id_token(plan_id: str) -> str:
-    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", safe_path_component(plan_id))
-    return token.strip("._-") or "unknown"
 
 
 __all__ = [
