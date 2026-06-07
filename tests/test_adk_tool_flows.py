@@ -2049,6 +2049,37 @@ async def test_submit_direct_request_enables_summarization_only_for_deterministi
 
 
 @pytest.mark.asyncio
+async def test_plan_and_reject_tools_enable_summarization_for_deterministic_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
+
+    # Act
+    submitted = await adapter.submit_orchestrator_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=tool_context,
+    )
+    plan_skip_summarization = tool_context.actions.skip_summarization
+    rejected = await adapter.reject_orchestrator_plan(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        "Too broad for today.",
+        edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert submitted["status"] == "plan_required"
+    assert rejected["status"] == "rejected"
+    assert plan_skip_summarization is False
+    assert tool_context.actions.skip_summarization is False
+
+
+@pytest.mark.asyncio
 async def test_submit_error_response_skips_summarization() -> None:
     # Arrange
     tool_context = FakeToolContext()
