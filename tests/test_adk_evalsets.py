@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
@@ -103,6 +104,7 @@ def _load_cli_root_agent(
                 sys.modules[module_name] = module
 
 
+@pytest.mark.adk_eval_runner
 @pytest.mark.asyncio
 async def test_programmatic_fixed_evalset_runner_executes_checked_in_evalset(
     monkeypatch: pytest.MonkeyPatch,
@@ -160,6 +162,7 @@ async def test_programmatic_fixed_evalset_runner_executes_checked_in_evalset(
     assert eval_config.criteria
 
 
+@pytest.mark.adk_eval_runner
 @pytest.mark.asyncio
 async def test_programmatic_fixed_evalset_runner_failure_names_case_metric_and_trajectories(
     monkeypatch: pytest.MonkeyPatch,
@@ -230,6 +233,7 @@ async def test_programmatic_fixed_evalset_runner_failure_names_case_metric_and_t
     assert "submit_orchestrator_request" in failure_message
 
 
+@pytest.mark.adk_eval_runner
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "runtime_error_type",
@@ -297,6 +301,7 @@ async def test_programmatic_fixed_evalset_runner_runtime_agent_errors_fail_with_
     assert "actual trajectory with args" in failure_message
 
 
+@pytest.mark.adk_eval_runner
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "eval_error",
@@ -349,6 +354,9 @@ async def test_fixed_eval_runner_clears_agent_module_cache_after_eval_paths(
 def test_ci_quality_job_keeps_existing_required_gates(repository_root: Path) -> None:
     # Arrange
     workflow = _load_ci_workflow(repository_root)
+    pytest_config = tomllib.loads(
+        (repository_root / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["pytest"]["ini_options"]
 
     # Act
     quality_job = workflow["jobs"].get("quality")
@@ -365,6 +373,11 @@ def test_ci_quality_job_keeps_existing_required_gates(repository_root: Path) -> 
         "uv run --locked pytest",
     ]
     assert eval_env_locations == []
+    assert pytest_config["addopts"] == ["-m", "not adk_eval_runner"]
+    assert pytest_config["markers"] == [
+        "adk_eval_runner: opt-in ADK eval runner tests for non-required "
+        "eval-basic lane."
+    ]
 
 
 def test_ci_eval_basic_job_runs_fixed_eval_wrapper_separately(
@@ -404,7 +417,8 @@ def test_ci_eval_basic_job_runs_fixed_eval_wrapper_separately(
         pytest_pipeline
     )
     assert pytest_pipeline == (
-        "uv run --locked pytest tests/test_adk_evalsets.py -ra 2>&1 "
+        "uv run --locked pytest tests/test_adk_evalsets.py "
+        "-m adk_eval_runner -ra 2>&1 "
         "| tee .ai-native/eval-basic/eval-basic.log"
     )
 

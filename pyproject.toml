@@ -48,3 +48,7 @@ exclude = ["prds*", "tests*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = ["-m", "not adk_eval_runner"]
+markers = [
+    "adk_eval_runner: opt-in ADK eval runner tests for non-required eval-basic lane.",
+]

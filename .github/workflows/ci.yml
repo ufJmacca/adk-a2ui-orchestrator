@@ -76,7 +76,7 @@ jobs:
         run: |
           mkdir -p .ai-native/eval-basic
           set -o pipefail
-          uv run --locked pytest tests/test_adk_evalsets.py -ra 2>&1 | tee .ai-native/eval-basic/eval-basic.log
+          uv run --locked pytest tests/test_adk_evalsets.py -m adk_eval_runner -ra 2>&1 | tee .ai-native/eval-basic/eval-basic.log
 
       - name: Upload eval-basic results
         if: ${{ always() }}

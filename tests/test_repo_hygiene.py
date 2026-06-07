@@ -1,9 +1,13 @@
+import json
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import tomllib
+from typing import Any, Mapping
 from urllib.parse import urlparse
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,6 +147,31 @@ def _readme_h2_sections(readme: str) -> dict[str, str]:
 
 def _squash_whitespace(value: str) -> str:
     return " ".join(value.split())
+
+
+def _load_github_actions_workflow(path: Path) -> Mapping[str, Any]:
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+
+    if True in workflow and "on" not in workflow:
+        workflow["on"] = workflow.pop(True)
+
+    return workflow
+
+
+def _workflow_step(job: Mapping[str, Any], step_name: str) -> Mapping[str, Any]:
+    steps = job.get("steps", [])
+    assert isinstance(steps, list)
+    matching_steps = [
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("name") == step_name
+    ]
+    assert len(matching_steps) == 1, (
+        f"expected one workflow step named {step_name!r}; "
+        f"found {[step.get('name') for step in steps if isinstance(step, dict)]}"
+    )
+    return matching_steps[0]
 
 
 def _command_option_value(command: str, option: str) -> str:
@@ -461,6 +490,92 @@ def test_eval_readme_documents_local_fixed_eval_workflow_and_capture_safety() ->
     assert "fixed evals do not require `openrouter_api_key`" in normalized_readme
     assert "deterministic mode" in normalized_readme
     assert "must not log secrets" in normalized_readme
+
+
+def test_user_sim_workflow_is_manual_and_documents_cost_controls() -> None:
+    # Arrange
+    workflow_path = ROOT / ".github" / "workflows" / "eval-user-sim.yml"
+    readme_path = ROOT / "orchestrator_demo" / "evals" / "README.md"
+    config_path = ROOT / "orchestrator_demo" / "evals" / "user_sim_eval_config.json"
+
+    # Act
+    workflow = _load_github_actions_workflow(workflow_path)
+    readme = readme_path.read_text(encoding="utf-8")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    normalized_readme = _squash_whitespace(readme.casefold())
+    trigger = workflow["on"]
+    jobs = workflow["jobs"]
+    eval_job = jobs["eval-user-sim"]
+    eval_job_env = eval_job.get("env", {})
+    eval_steps = [step for step in eval_job["steps"] if isinstance(step, dict)]
+    credential_step = _workflow_step(
+        eval_job,
+        "Validate credentials and invocation limit",
+    )
+    user_sim_step = _workflow_step(
+        eval_job,
+        "Run dynamic ADK User Simulation evals",
+    )
+    artifact_steps = [
+        step
+        for step in eval_steps
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    job_run_script = "\n".join(
+        str(step["run"]) for step in eval_steps if "run" in step
+    )
+
+    # Assert
+    assert workflow["name"] == "ADK User Simulation Eval"
+    assert set(trigger) == {"workflow_dispatch"}
+    assert "pull_request" not in trigger
+    assert "push" not in trigger
+    assert "schedule" not in trigger
+    assert "eval-user-sim" in jobs
+    assert "quality" not in jobs
+    assert "eval-basic" not in jobs
+    assert eval_job_env["MAX_ALLOWED_INVOCATIONS"] == "12"
+    assert (
+        config["user_simulator_config"]["max_allowed_invocations"]
+        <= int(eval_job_env["MAX_ALLOWED_INVOCATIONS"])
+    )
+    assert eval_job_env["GOOGLE_CLOUD_PROJECT"] == (
+        "${{ secrets.GOOGLE_CLOUD_PROJECT }}"
+    )
+    assert credential_step["env"]["GOOGLE_APPLICATION_CREDENTIALS_JSON"] == (
+        "${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}"
+    )
+    assert "uv run --locked adk eval_set create" in user_sim_step["run"]
+    assert "uv run --locked adk eval_set add_eval_case" in user_sim_step["run"]
+    assert "uv run --locked adk eval" in user_sim_step["run"]
+    assert (
+        "--config_file_path orchestrator_demo/evals/user_sim_eval_config.json"
+        in user_sim_step["run"]
+    )
+    assert "tee .ai-native/eval-user-sim/eval-user-sim.log" in user_sim_step["run"]
+    assert "secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON" not in job_run_script
+    assert "secrets.GOOGLE_CLOUD_PROJECT" not in job_run_script
+    assert not re.search(
+        r"\becho\b[^\n]*\$\{?GOOGLE_APPLICATION_CREDENTIALS_JSON\}?",
+        job_run_script,
+    )
+    assert not re.search(
+        r"\bcat\b[^\n]*GOOGLE_APPLICATION_CREDENTIALS",
+        job_run_script,
+    )
+    assert len(artifact_steps) == 1
+    assert artifact_steps[0]["if"] == "${{ always() }}"
+    assert artifact_steps[0]["with"]["name"] == "eval-user-sim-results"
+    assert artifact_steps[0]["with"]["path"] == ".ai-native/eval-user-sim/"
+    assert artifact_steps[0]["with"]["include-hidden-files"] is True
+    assert "eval-user-sim" in normalized_readme
+    assert ".github/workflows/eval-user-sim.yml" in readme
+    assert "workflow_dispatch" in normalized_readme
+    assert "google_cloud_project" in normalized_readme
+    assert "google_application_credentials_json" in normalized_readme
+    assert "max_allowed_invocations" in normalized_readme
+    assert "not run on pull requests" in normalized_readme
+    assert "artifact" in normalized_readme
 
 
 def test_readme_no_longer_documents_custom_http_runtime_paths() -> None:
