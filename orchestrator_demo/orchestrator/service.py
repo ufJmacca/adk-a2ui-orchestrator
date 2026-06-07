@@ -33,6 +33,8 @@ from orchestrator_demo.orchestrator.approval_state import (
     ApprovalActionResult,
     ApprovalRecord,
     ApprovalStateStore,
+    PlanAlreadyExistsError,
+    PlanAlreadyFinalError,
     PlanMutationError,
 )
 from orchestrator_demo.orchestrator.graph_runtime import (
@@ -386,7 +388,7 @@ class OrchestratorService:
                 context=context,
             )
 
-        self._approval_store.add_draft(plan)
+        plan = self._add_draft_with_unique_plan_id(context, plan)
         self._contexts_by_plan_id[plan.plan_id] = context
         log_audit_event(
             "plan_proposed",
@@ -416,6 +418,23 @@ class OrchestratorService:
             approval_plan=plan,
             a2ui_parts=tuple(a2ui_parts),
         )
+
+    def _add_draft_with_unique_plan_id(
+        self,
+        context: RequestContext,
+        plan: ExecutionPlan,
+    ) -> ExecutionPlan:
+        base_plan_scope_id = context.plan_scope_id
+        suffix = 2
+
+        while True:
+            try:
+                self._approval_store.add_draft(plan)
+                return plan
+            except (PlanAlreadyExistsError, PlanAlreadyFinalError):
+                context.plan_scope_id = f"{base_plan_scope_id}_{suffix}"
+                suffix += 1
+                plan = self._planner.create_plan(context)
 
     def _handle_orchestrator_owned_user_action(
         self,

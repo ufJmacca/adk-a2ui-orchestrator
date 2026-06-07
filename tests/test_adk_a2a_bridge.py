@@ -64,7 +64,7 @@ def test_google_adk_2_1_0_is_locked() -> None:
     declared_requirements = [
         requirement
         for requirement in pyproject["project"]["dependencies"]
-        if requirement.split("==", maxsplit=1)[0] == "google-adk"
+        if requirement.split("==", maxsplit=1)[0].startswith("google-adk")
     ]
     locked_versions = [
         package["version"]
@@ -73,7 +73,7 @@ def test_google_adk_2_1_0_is_locked() -> None:
     ]
 
     # Assert
-    assert declared_requirements == ["google-adk==2.1.0"]
+    assert declared_requirements == ["google-adk[eval]==2.1.0"]
     assert locked_versions == ["2.1.0"]
     assert google.adk.__version__ == "2.1.0"
 

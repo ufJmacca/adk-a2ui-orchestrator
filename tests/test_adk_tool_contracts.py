@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from orchestrator_demo.agents import build_default_specialists
 from orchestrator_demo.orchestrator.agent import (
+    ADK_EVAL_MODE_ENV,
+    DETERMINISTIC_MODEL_ENV,
     ORCHESTRATOR_SESSION_STATE_KEY,
     AdkOrchestratorAdapter,
     build_root_agent,
@@ -128,9 +131,22 @@ def _assert_plan_contract(payload: dict[str, Any]) -> None:
 
 
 class FakeToolContext:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        app_name: str | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
         self.state: dict[str, Any] = {}
         self.saved_artifacts: list[dict[str, Any]] = []
+        if session_id is not None:
+            self.session = SimpleNamespace(
+                app_name=app_name or "orchestrator",
+                user_id=user_id or "relationship_manager",
+                id=session_id,
+            )
+            self.user_id = user_id or "relationship_manager"
 
     async def save_artifact(
         self,
@@ -702,6 +718,168 @@ async def test_adk_adapter_preserves_newer_draft_for_stale_plan_actions() -> Non
         assert "This stale edit must not be applied." not in rendered_snapshot
 
     assert all(stale_context.saved_artifacts == [] for stale_context in stale_contexts)
+
+
+@pytest.mark.asyncio
+async def test_adk_adapter_scopes_deterministic_plan_cache_by_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv(DETERMINISTIC_MODEL_ENV, "1")
+    monkeypatch.setenv(ADK_EVAL_MODE_ENV, "1")
+    adapter = AdkOrchestratorAdapter()
+    first_context = FakeToolContext(session_id="session_a")
+    second_context = FakeToolContext(session_id="session_b")
+    user_input = "Prepare me for tomorrow's meeting with ABC Manufacturing."
+
+    first_submitted = await adapter.submit_orchestrator_request(
+        user_input,
+        tool_context=first_context,
+    )
+    second_submitted = await adapter.submit_orchestrator_request(
+        user_input,
+        tool_context=second_context,
+    )
+
+    # Act
+    first_updated = await adapter.add_plan_instruction(
+        first_submitted["planId"],
+        first_submitted["approvalSurfaceId"],
+        first_submitted["stepIds"][0],
+        "Prioritize recent deposit trends.",
+        edited_plan_version=first_submitted["planVersion"],
+        tool_context=first_context,
+    )
+    second_rejected = await adapter.reject_orchestrator_plan(
+        second_submitted["planId"],
+        second_submitted["approvalSurfaceId"],
+        "Not needed for this synthetic session.",
+        edited_plan_version=second_submitted["planVersion"],
+        tool_context=second_context,
+    )
+
+    # Assert
+    assert first_submitted["planId"] == second_submitted["planId"]
+    assert first_updated["status"] == "draft_updated"
+    assert first_updated["planVersion"] == first_submitted["planVersion"] + 1
+    assert second_rejected["status"] == "rejected"
+
+    first_snapshot = first_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
+    second_snapshot = second_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
+    first_record = first_snapshot["approvalRecords"][first_submitted["planId"]]
+    second_record = second_snapshot["approvalRecords"][second_submitted["planId"]]
+    assert first_record["status"] == "draft"
+    assert first_record["draftPlan"]["plan_version"] == first_updated["planVersion"]
+    assert second_record["status"] == "rejected"
+    assert second_record["draftPlan"]["plan_version"] == second_submitted["planVersion"]
+
+
+@pytest.mark.asyncio
+async def test_adk_adapter_accepts_fresh_deterministic_draft_after_empty_state_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv(DETERMINISTIC_MODEL_ENV, "1")
+    monkeypatch.setenv(ADK_EVAL_MODE_ENV, "1")
+    adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext(session_id="session_reset")
+    user_input = "Prepare me for tomorrow's meeting with ABC Manufacturing."
+
+    first_submitted = await adapter.submit_orchestrator_request(
+        user_input,
+        tool_context=tool_context,
+    )
+    first_rejected = await adapter.reject_orchestrator_plan(
+        first_submitted["planId"],
+        first_submitted["approvalSurfaceId"],
+        "Not needed for this synthetic session.",
+        edited_plan_version=first_submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Simulate a fresh ADK eval/session turn reusing the same session identity.
+    tool_context.state.clear()
+
+    # Act
+    second_submitted = await adapter.submit_orchestrator_request(
+        user_input,
+        tool_context=tool_context,
+    )
+    second_rejected = await adapter.reject_orchestrator_plan(
+        second_submitted["planId"],
+        second_submitted["approvalSurfaceId"],
+        "Still not needed for this synthetic session.",
+        edited_plan_version=second_submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert first_rejected["status"] == "rejected"
+    assert second_submitted["status"] == "plan_required"
+    assert second_submitted["planId"] == first_submitted["planId"]
+    assert second_rejected["status"] == "rejected"
+    assert second_rejected["graphCreated"] is False
+    assert second_rejected["specialistsCalled"] is False
+
+    snapshot = tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
+    record = snapshot["approvalRecords"][second_submitted["planId"]]
+    assert record["status"] == "rejected"
+    assert record["draftPlan"]["plan_version"] == second_submitted["planVersion"]
+
+
+@pytest.mark.asyncio
+async def test_adk_adapter_clears_edited_draft_cache_after_empty_state_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv(DETERMINISTIC_MODEL_ENV, "1")
+    monkeypatch.setenv(ADK_EVAL_MODE_ENV, "1")
+    adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext(session_id="session_edited_reset")
+    user_input = "Prepare me for tomorrow's meeting with ABC Manufacturing."
+
+    first_submitted = await adapter.submit_orchestrator_request(
+        user_input,
+        tool_context=tool_context,
+    )
+    first_updated = await adapter.add_plan_instruction(
+        first_submitted["planId"],
+        first_submitted["approvalSurfaceId"],
+        first_submitted["stepIds"][0],
+        "Prioritize recent deposit trends.",
+        edited_plan_version=first_submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Simulate a fresh ADK eval/session turn reusing the same session identity.
+    tool_context.state.clear()
+
+    # Act
+    second_submitted = await adapter.submit_orchestrator_request(
+        user_input,
+        tool_context=tool_context,
+    )
+    second_rejected = await adapter.reject_orchestrator_plan(
+        second_submitted["planId"],
+        second_submitted["approvalSurfaceId"],
+        "Do not run this synthetic workflow.",
+        edited_plan_version=second_submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert first_updated["status"] == "draft_updated"
+    assert first_updated["planVersion"] == first_submitted["planVersion"] + 1
+    assert second_submitted["status"] == "plan_required"
+    assert second_submitted["planId"] == first_submitted["planId"]
+    assert second_submitted["planVersion"] == first_submitted["planVersion"]
+    assert second_rejected["status"] == "rejected"
+    assert second_rejected["planVersion"] == second_submitted["planVersion"]
+
+    snapshot = tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY]
+    record = snapshot["approvalRecords"][second_submitted["planId"]]
+    assert record["status"] == "rejected"
+    assert record["draftPlan"]["plan_version"] == second_submitted["planVersion"]
 
 
 @pytest.mark.asyncio

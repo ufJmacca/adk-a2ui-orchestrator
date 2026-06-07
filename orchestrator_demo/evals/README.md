@@ -1,19 +1,20 @@
 # ADK Evaluation Compatibility
 
-This directory is reserved for ADK evalsets and User Simulation artifacts. The
-first compatibility slice keeps production behavior unchanged and records the
-locked evaluator surface before adding checked-in eval cases.
+This directory contains ADK evalsets and User Simulation artifacts. The fixed
+evalset keeps production behavior unchanged while exercising deterministic
+tool routing, plan approval, rejection, and safe final-response behavior.
 
 ## Locked Version
 
-The repository remains pinned to `google-adk==2.1.0` in `pyproject.toml` and
-`uv.lock`. No additional eval extras or dependencies are required for the
-current compatibility checks.
+The repository remains pinned to ADK 2.1.0 with `google-adk[eval]==2.1.0` in
+`pyproject.toml` and `uv.lock`, so the locked environment includes the optional
+eval dependencies required by the ADK CLI.
 
 Confirmed import command:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
   uv run --locked python -c "from google.adk.evaluation.agent_evaluator import AgentEvaluator; from google.adk.evaluation.eval_set import EvalSet; from google.adk.evaluation.eval_config import EvalConfig"
 ```
 
@@ -56,6 +57,7 @@ The focused compatibility test is:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
   uv run --locked pytest tests/test_adk_evalsets.py -q
 ```
 
@@ -67,11 +69,12 @@ with a locked-version reason that names the missing module or symbol.
 CLI compatibility finding for this slice:
 
 `uv run --locked adk eval --help` confirms that ADK 2.1.0 exposes this command
-shape. Once the checked-in evalset and config exist, use the loader-compatible
-orchestrator directory with the deterministic model enabled:
+shape. Use the loader-compatible orchestrator directory with both deterministic
+eval flags enabled:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
   uv run --locked adk eval \
   orchestrator_demo/orchestrator \
   orchestrator_demo/evals/basic_evalset.evalset.json \
@@ -81,9 +84,8 @@ ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
 
 The CLI help describes `EVAL_SET_FILE_PATH_OR_ID` as one or more eval set file
 paths or eval set IDs, with optional `:eval_case_id` suffix filtering. The
-checked-in `basic_evalset.evalset.json` and config are added in a later slice,
-so this slice confirms the CLI accepts an eval set file path argument but does
-not yet run a repository evalset fixture.
+checked-in `basic_evalset.evalset.json` and config run under this command in
+the locked environment.
 
 ## ADK Web Capture
 
