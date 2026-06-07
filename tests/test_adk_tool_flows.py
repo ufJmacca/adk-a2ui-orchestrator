@@ -2008,6 +2008,77 @@ async def test_submit_direct_request_saves_latest_artifact_and_skips_summarizati
     ] == expected_ref
 
 
+@pytest.mark.parametrize(
+    ("deterministic_model", "adk_eval_mode", "expected_skip_summarization"),
+    [
+        pytest.param(False, False, True, id="normal-runtime"),
+        pytest.param(True, False, True, id="deterministic-runtime"),
+        pytest.param(False, True, True, id="eval-with-live-model-runtime"),
+        pytest.param(True, True, False, id="deterministic-eval-runtime"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_submit_direct_request_enables_summarization_only_for_deterministic_eval(
+    monkeypatch: pytest.MonkeyPatch,
+    deterministic_model: bool,
+    adk_eval_mode: bool,
+    expected_skip_summarization: bool,
+) -> None:
+    # Arrange
+    if deterministic_model:
+        monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    else:
+        monkeypatch.delenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", raising=False)
+    if adk_eval_mode:
+        monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    else:
+        monkeypatch.delenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", raising=False)
+
+    tool_context = FakeToolContext()
+
+    # Act
+    response = await AdkOrchestratorAdapter().submit_orchestrator_request(
+        "Summarize the internal notes for ABC Manufacturing.",
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert response["status"] == "direct"
+    assert response["path"] == "direct"
+    assert tool_context.actions.skip_summarization is expected_skip_summarization
+
+
+@pytest.mark.asyncio
+async def test_plan_and_reject_tools_enable_summarization_for_deterministic_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    adapter = AdkOrchestratorAdapter()
+    tool_context = FakeToolContext()
+
+    # Act
+    submitted = await adapter.submit_orchestrator_request(
+        "Prepare me for tomorrow's meeting with ABC Manufacturing.",
+        tool_context=tool_context,
+    )
+    plan_skip_summarization = tool_context.actions.skip_summarization
+    rejected = await adapter.reject_orchestrator_plan(
+        submitted["planId"],
+        submitted["approvalSurfaceId"],
+        "Too broad for today.",
+        edited_plan_version=submitted["planVersion"],
+        tool_context=tool_context,
+    )
+
+    # Assert
+    assert submitted["status"] == "plan_required"
+    assert rejected["status"] == "rejected"
+    assert plan_skip_summarization is False
+    assert tool_context.actions.skip_summarization is False
+
+
 @pytest.mark.asyncio
 async def test_submit_error_response_skips_summarization() -> None:
     # Arrange

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncGenerator
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -52,9 +53,11 @@ from orchestrator_demo.orchestrator.service import (
 
 ORCHESTRATOR_SESSION_STATE_KEY = "orchestrator_session"
 DETERMINISTIC_MODEL_ENV = "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL"
+ADK_EVAL_MODE_ENV = "ORCHESTRATOR_DEMO_ADK_EVAL_MODE"
 _FINAL_APPROVAL_STATUSES = frozenset(
     {"approved", "approved_execution_failed", "rejected"}
 )
+_GLOBAL_PLAN_SNAPSHOT_CACHE_SCOPE = "global"
 
 install_a2ui_response_event_delivery()
 
@@ -110,8 +113,14 @@ class AdkOrchestratorAdapter:
     def __init__(self, agent: OrchestratorAgent | None = None) -> None:
         self._agent = agent or OrchestratorAgent()
         self._session_lock = asyncio.Lock()
-        self._finalized_plan_snapshots_by_id: dict[str, dict[str, Any]] = {}
-        self._latest_draft_plan_snapshots_by_id: dict[str, dict[str, Any]] = {}
+        self._finalized_plan_snapshots_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        self._latest_draft_plan_snapshots_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
 
     def tools(self) -> list[Any]:
         """Return ADK function tools backed by one stateful orchestrator agent."""
@@ -452,15 +461,22 @@ class AdkOrchestratorAdapter:
 
         snapshot = tool_context.state.get(ORCHESTRATOR_SESSION_STATE_KEY)
         if snapshot is None:
+            self._clear_plan_snapshot_cache_for_context(tool_context)
             self._agent.reset_session_snapshot()
             return _empty_session_snapshot()
         if not isinstance(snapshot, Mapping):
             raise ValueError("orchestrator_session must be a JSON object")
-        restored_snapshot = self._snapshot_preserving_finalized_plans(snapshot)
-        restored_snapshot = self._snapshot_preserving_latest_drafts(restored_snapshot)
+        restored_snapshot = self._snapshot_preserving_finalized_plans(
+            snapshot,
+            tool_context,
+        )
+        restored_snapshot = self._snapshot_preserving_latest_drafts(
+            restored_snapshot,
+            tool_context,
+        )
         self._agent.restore_session_snapshot(restored_snapshot)
-        self._remember_finalized_plans(restored_snapshot)
-        self._remember_latest_drafts(restored_snapshot)
+        self._remember_finalized_plans(restored_snapshot, tool_context)
+        self._remember_latest_drafts(restored_snapshot, tool_context)
         return restored_snapshot
 
     def _persist_session_to_context(
@@ -474,12 +490,25 @@ class AdkOrchestratorAdapter:
 
         try:
             snapshot = self._agent.export_session_snapshot()
-            self._remember_finalized_plans(snapshot)
-            self._remember_latest_drafts(snapshot)
+            self._remember_finalized_plans(snapshot, tool_context)
+            self._remember_latest_drafts(snapshot, tool_context)
             tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = snapshot
         except Exception:
             if not suppress_errors:
                 raise
+
+    def _clear_plan_snapshot_cache_for_context(
+        self,
+        tool_context: ToolContext | None,
+    ) -> None:
+        session_scope = _plan_snapshot_session_scope(tool_context)
+        for cache in (
+            self._finalized_plan_snapshots_by_key,
+            self._latest_draft_plan_snapshots_by_key,
+        ):
+            for cache_key in list(cache):
+                if cache_key[0] == session_scope:
+                    cache.pop(cache_key, None)
 
     def _skip_model_summarization(self, tool_context: ToolContext | None) -> None:
         if tool_context is None:
@@ -490,13 +519,14 @@ class AdkOrchestratorAdapter:
             return
 
         try:
-            actions.skip_summarization = True
+            actions.skip_summarization = not _deterministic_adk_eval_mode_enabled()
         except AttributeError:
             return
 
     def _snapshot_preserving_finalized_plans(
         self,
         snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
     ) -> Mapping[str, Any]:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
@@ -511,7 +541,9 @@ class AdkOrchestratorAdapter:
                 continue
             if incoming_record.get("status") != "draft":
                 continue
-            finalized = self._finalized_plan_snapshots_by_id.get(plan_id)
+            finalized = self._finalized_plan_snapshots_by_key.get(
+                _plan_snapshot_cache_key(tool_context, plan_id)
+            )
             if finalized is None:
                 continue
             finalized_record = finalized.get("approvalRecord")
@@ -537,6 +569,7 @@ class AdkOrchestratorAdapter:
     def _snapshot_preserving_latest_drafts(
         self,
         snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
     ) -> Mapping[str, Any]:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
@@ -551,7 +584,9 @@ class AdkOrchestratorAdapter:
                 continue
             if incoming_record.get("status") != "draft":
                 continue
-            latest = self._latest_draft_plan_snapshots_by_id.get(plan_id)
+            latest = self._latest_draft_plan_snapshots_by_key.get(
+                _plan_snapshot_cache_key(tool_context, plan_id)
+            )
             if latest is None:
                 continue
             latest_record = latest.get("approvalRecord")
@@ -584,7 +619,11 @@ class AdkOrchestratorAdapter:
 
         return snapshot if merged_snapshot is None else merged_snapshot
 
-    def _remember_finalized_plans(self, snapshot: Mapping[str, Any]) -> None:
+    def _remember_finalized_plans(
+        self,
+        snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
+    ) -> None:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
             return
@@ -595,9 +634,10 @@ class AdkOrchestratorAdapter:
         for plan_id, record in approval_records.items():
             if not isinstance(plan_id, str) or not _approval_record_is_final(record):
                 continue
+            cache_key = _plan_snapshot_cache_key(tool_context, plan_id)
             approval_surface_id = _approval_surface_id_for_record(record, plan_id)
-            self._latest_draft_plan_snapshots_by_id.pop(plan_id, None)
-            self._finalized_plan_snapshots_by_id[plan_id] = {
+            self._latest_draft_plan_snapshots_by_key.pop(cache_key, None)
+            self._finalized_plan_snapshots_by_key[cache_key] = {
                 "approvalRecord": deepcopy(record),
                 "requestContext": (
                     deepcopy(request_contexts.get(plan_id))
@@ -614,7 +654,11 @@ class AdkOrchestratorAdapter:
                 ),
             }
 
-    def _remember_latest_drafts(self, snapshot: Mapping[str, Any]) -> None:
+    def _remember_latest_drafts(
+        self,
+        snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
+    ) -> None:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
             return
@@ -624,12 +668,13 @@ class AdkOrchestratorAdapter:
         for plan_id, record in approval_records.items():
             if not isinstance(plan_id, str) or not isinstance(record, Mapping):
                 continue
+            cache_key = _plan_snapshot_cache_key(tool_context, plan_id)
             if record.get("status") != "draft":
                 if _approval_record_is_final(record):
-                    self._latest_draft_plan_snapshots_by_id.pop(plan_id, None)
+                    self._latest_draft_plan_snapshots_by_key.pop(cache_key, None)
                 continue
 
-            latest = self._latest_draft_plan_snapshots_by_id.get(plan_id)
+            latest = self._latest_draft_plan_snapshots_by_key.get(cache_key)
             latest_record = (
                 latest.get("approvalRecord")
                 if isinstance(latest, Mapping)
@@ -649,7 +694,8 @@ class AdkOrchestratorAdapter:
                 continue
 
             approval_surface_id = _approval_surface_id_for_record(record, plan_id)
-            self._latest_draft_plan_snapshots_by_id[plan_id] = {
+            self._finalized_plan_snapshots_by_key.pop(cache_key, None)
+            self._latest_draft_plan_snapshots_by_key[cache_key] = {
                 "approvalRecord": deepcopy(record),
                 "requestContext": (
                     deepcopy(request_contexts.get(plan_id))
@@ -765,6 +811,10 @@ def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
+def _deterministic_adk_eval_mode_enabled() -> bool:
+    return _truthy_env(DETERMINISTIC_MODEL_ENV) and _truthy_env(ADK_EVAL_MODE_ENV)
+
+
 class DeterministicOrchestratorModel(BaseLlm):
     """Local model used by subprocess A2A integration tests."""
 
@@ -775,14 +825,46 @@ class DeterministicOrchestratorModel(BaseLlm):
         llm_request: LlmRequest,
         stream: bool = False,
     ) -> AsyncGenerator[LlmResponse, None]:
-        if _current_turn_function_response(llm_request) is not None:
+        current_tool_response = _current_turn_function_response(llm_request)
+        if current_tool_response is not None:
             yield _text_response(
-                "Structured orchestrator tool response returned to the A2A client."
+                _deterministic_tool_response_summary(current_tool_response)
             )
             return
 
         if "submit_orchestrator_request" in llm_request.tools_dict:
             user_input = _latest_user_text(llm_request)
+            draft_response = _latest_draft_plan_tool_response(llm_request)
+            if draft_response is not None:
+                if (
+                    "reject_orchestrator_plan" in llm_request.tools_dict
+                    and _looks_like_rejection(user_input)
+                ):
+                    identifiers = _draft_plan_identifiers(draft_response)
+                    function_call = types.Part.from_function_call(
+                        name="reject_orchestrator_plan",
+                        args={
+                            "plan_id": identifiers["plan_id"],
+                            "approval_surface_id": identifiers["approval_surface_id"],
+                            "reason": _rejection_reason_from_text(user_input),
+                            "edited_plan_version": identifiers["plan_version"],
+                        },
+                    )
+                    if function_call.function_call is not None:
+                        function_call.function_call.id = (
+                            "call_reject_orchestrator_plan"
+                        )
+                    yield LlmResponse(
+                        content=types.Content(role="model", parts=[function_call])
+                    )
+                    return
+
+                if _looks_like_natural_language_approval(user_input):
+                    yield _text_response(
+                        _structured_approval_guidance(draft_response)
+                    )
+                    return
+
             function_call = types.Part.from_function_call(
                 name="submit_orchestrator_request",
                 args={"user_input": user_input},
@@ -813,6 +895,31 @@ def _current_turn_function_response(llm_request: LlmRequest) -> Any:
     return None
 
 
+def _latest_draft_plan_tool_response(llm_request: LlmRequest) -> Mapping[str, Any] | None:
+    finalized_plan_ids: set[str] = set()
+    for content in reversed(llm_request.contents):
+        for part in reversed(content.parts or []):
+            function_response = part.function_response
+            if function_response is None or not isinstance(
+                function_response.response,
+                Mapping,
+            ):
+                continue
+            response = function_response.response
+            status = _text_field(response, "status", "path")
+            if status in _FINAL_APPROVAL_STATUSES:
+                plan_id = _plan_id_from_tool_response(response)
+                if plan_id:
+                    finalized_plan_ids.add(plan_id)
+                continue
+            if status in {"plan_required", "draft_updated"}:
+                plan_id = _plan_id_from_tool_response(response)
+                if plan_id in finalized_plan_ids:
+                    continue
+                return response
+    return None
+
+
 def _latest_user_text(llm_request: LlmRequest) -> str:
     for content in reversed(llm_request.contents):
         if content.role != "user":
@@ -831,6 +938,294 @@ def _content_text(content: types.Content) -> str:
     return "\n".join(
         part.text for part in content.parts or [] if isinstance(part.text, str)
     )
+
+
+def _deterministic_tool_response_summary(tool_response: Any) -> str:
+    if not isinstance(tool_response, Mapping):
+        return "Structured orchestrator tool response returned to the A2A client."
+
+    status = _text_field(tool_response, "status", "path")
+    if status == "direct":
+        return _direct_tool_response_summary(tool_response)
+    if status in {"plan_required", "draft_updated"}:
+        identifiers = _draft_plan_identifiers(tool_response)
+        step_ids = _joined_step_ids(identifiers["step_ids"])
+        return (
+            f"Draft plan {identifiers['plan_id']} v{identifiers['plan_version']} "
+            f"requires structured approval on {identifiers['approval_surface_id']}. "
+            f"Step ids: {step_ids}. No specialist graph has executed. Use "
+            "approve_orchestrator_plan with planId, approvalSurfaceId, current "
+            "planVersion, and approved step ids, or reject_orchestrator_plan "
+            "with a reason."
+        )
+    if status == "rejected":
+        identifiers = _draft_plan_identifiers(tool_response)
+        reason = _text_field(tool_response, "reason") or "No reason supplied."
+        return (
+            f"Plan {identifiers['plan_id']} v{identifiers['plan_version']} was "
+            f"rejected on {identifiers['approval_surface_id']}. Reason: {reason} "
+            "No specialist graph executed and no specialist execution artifacts "
+            "were produced."
+        )
+
+    return "Structured orchestrator tool response returned to the A2A client."
+
+
+def _direct_tool_response_summary(tool_response: Mapping[str, Any]) -> str:
+    artifacts = tool_response.get("artifacts")
+    final_response = (
+        artifacts.get("final_response")
+        if isinstance(artifacts, Mapping)
+        else None
+    )
+    if not isinstance(final_response, Mapping):
+        return "Direct orchestrator response returned without plan approval."
+
+    agent_id = _text_field(final_response, "agent_id", "agentId") or "orchestrator"
+    summary = (
+        _text_field(final_response, "summary", "content", "response", "message")
+        or "No summary text returned."
+    )
+    return f"Direct orchestrator response from {agent_id}: {summary}"
+
+
+def _structured_approval_guidance(draft_response: Mapping[str, Any]) -> str:
+    identifiers = _draft_plan_identifiers(draft_response)
+    step_ids = _joined_step_ids(identifiers["step_ids"])
+    return (
+        f"Natural-language approval cannot execute draft plan "
+        f"{identifiers['plan_id']}. Use structured approval with planId "
+        f"{identifiers['plan_id']}, approvalSurfaceId "
+        f"{identifiers['approval_surface_id']}, current planVersion "
+        f"{identifiers['plan_version']}, and approved step ids: {step_ids}."
+    )
+
+
+def _draft_plan_identifiers(response: Mapping[str, Any]) -> dict[str, Any]:
+    plan = _mapping_field(response, "plan", "approvalPlan", "approval_plan")
+    plan_id = _plan_id_from_tool_response(response)
+    approval_surface_id = _text_field(
+        response,
+        "approvalSurfaceId",
+        "approval_surface_id",
+    ) or _text_field(plan, "approvalSurfaceId", "approval_surface_id")
+    plan_version = _int_field(response, "planVersion", "plan_version")
+    if plan_version is None:
+        plan_version = _int_field(plan, "planVersion", "plan_version")
+    step_ids = _step_ids_from_response(response) or _step_ids_from_response(plan)
+    resolved_plan_id = plan_id or "unknown_plan"
+
+    return {
+        "plan_id": resolved_plan_id,
+        "approval_surface_id": approval_surface_id or f"surface_{resolved_plan_id}",
+        "plan_version": plan_version if plan_version is not None else 1,
+        "step_ids": step_ids,
+    }
+
+
+def _plan_id_from_tool_response(response: Mapping[str, Any]) -> str | None:
+    plan = _mapping_field(response, "plan", "approvalPlan", "approval_plan")
+    return _text_field(response, "planId", "plan_id") or _text_field(
+        plan,
+        "planId",
+        "plan_id",
+    )
+
+
+def _step_ids_from_response(response: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(response, Mapping):
+        return []
+
+    step_ids = response.get("stepIds")
+    if not isinstance(step_ids, Sequence) or isinstance(step_ids, str):
+        step_ids = response.get("step_ids")
+    if isinstance(step_ids, Sequence) and not isinstance(step_ids, str):
+        return [str(step_id) for step_id in step_ids if isinstance(step_id, str)]
+
+    steps = response.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, str):
+        return []
+    collected: list[str] = []
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        step_id = _text_field(step, "stepId", "step_id")
+        if step_id:
+            collected.append(step_id)
+    return collected
+
+
+def _joined_step_ids(step_ids: Sequence[str]) -> str:
+    return ", ".join(step_ids) if step_ids else "none"
+
+
+def _looks_like_rejection(text: str) -> bool:
+    normalized = text.casefold()
+    if any(
+        phrase in normalized
+        for phrase in (
+            "do not approve",
+            "don't approve",
+            "cannot approve",
+            "can not approve",
+            "can't approve",
+            "cant approve",
+            "unable to approve",
+            "not able to approve",
+            "do not proceed",
+            "don't proceed",
+            "dont proceed",
+            "do not go ahead",
+            "don't go ahead",
+            "dont go ahead",
+            "do not run",
+            "don't run",
+        )
+    ):
+        return True
+
+    return _has_unnegated_rejection_keyword(normalized)
+
+
+def _looks_like_natural_language_approval(text: str) -> bool:
+    normalized = text.casefold()
+    if _has_negated_rejection_keyword(normalized):
+        return True
+
+    terse_tokens = normalized.strip(" \t\n\r.,!?:;").replace(",", " ").split()
+    if terse_tokens and all(
+        token in {"yes", "y", "ok", "okay", "sure", "please"}
+        for token in terse_tokens
+    ):
+        return any(
+            token in {"yes", "y", "ok", "okay", "sure"} for token in terse_tokens
+        )
+
+    return any(
+        _has_unnegated_phrase(normalized, phrase)
+        for phrase in ("looks good", "run it", "go ahead")
+    ) or _has_unnegated_approval_keyword(normalized)
+
+
+def _has_unnegated_phrase(normalized: str, phrase: str) -> bool:
+    phrase_pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+    pattern = rf"\b{phrase_pattern}\b"
+    return any(
+        not _keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(pattern, normalized)
+    )
+
+
+def _has_unnegated_approval_keyword(normalized: str) -> bool:
+    stripped = normalized.strip(" \t\n\r.,!?:;")
+    if stripped == "approved":
+        return True
+    return any(
+        not _keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(r"\b(?:approve|proceed)\b", normalized)
+    )
+
+
+def _has_unnegated_rejection_keyword(normalized: str) -> bool:
+    return any(
+        not _rejection_keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(r"\b(?:reject|cancel|stop)\b", normalized)
+    )
+
+
+def _has_negated_rejection_keyword(normalized: str) -> bool:
+    return any(
+        _rejection_keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(r"\b(?:reject|cancel|stop)\b", normalized)
+    )
+
+
+def _rejection_keyword_is_negated(prefix: str) -> bool:
+    return _keyword_is_negated(prefix)
+
+
+def _keyword_is_negated(prefix: str) -> bool:
+    return bool(
+        re.search(
+            (
+                r"(?:\b(?:do not|don't|dont|never|not)\b(?:\s+\w+){0,3}"
+                r"|\b(?:no need|do not need|don't need|dont need)\s+to"
+                r"(?:\s+\w+){0,3})$"
+            ),
+            prefix.rstrip(),
+        )
+    )
+
+
+def _rejection_reason_from_text(text: str) -> str:
+    stripped = text.strip()
+    if ":" in stripped:
+        reason = stripped.split(":", maxsplit=1)[1].strip()
+        if reason:
+            return reason
+
+    normalized = stripped.casefold()
+    for phrase in ("because", "since"):
+        marker = f" {phrase} "
+        if marker in normalized:
+            index = normalized.index(marker) + len(marker)
+            reason = stripped[index:].strip(" .")
+            if reason:
+                return f"{reason[:1].upper()}{reason[1:]}."
+
+    for prefix in (
+        "reject it",
+        "reject this",
+        "reject the plan",
+        "do not run it",
+        "don't run it",
+        "cancel it",
+    ):
+        if normalized.startswith(prefix):
+            reason = stripped[len(prefix) :].strip(" .:-")
+            if reason:
+                return reason
+
+    return "User rejected the draft plan."
+
+
+def _mapping_field(
+    mapping: Mapping[str, Any] | None,
+    *field_names: str,
+) -> Mapping[str, Any] | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    for field_name in field_names:
+        value = mapping.get(field_name)
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _text_field(
+    mapping: Mapping[str, Any] | None,
+    *field_names: str,
+) -> str | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    for field_name in field_names:
+        value = mapping.get(field_name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _int_field(
+    mapping: Mapping[str, Any] | None,
+    *field_names: str,
+) -> int | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    for field_name in field_names:
+        value = mapping.get(field_name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 def _deterministic_intent_assessment(llm_request: LlmRequest) -> dict[str, Any]:
@@ -923,6 +1318,53 @@ def _empty_session_snapshot() -> dict[str, Any]:
         },
         "artifactRefs": {},
     }
+
+
+def _plan_snapshot_cache_key(
+    tool_context: ToolContext | None,
+    plan_id: str,
+) -> tuple[str, str]:
+    return (_plan_snapshot_session_scope(tool_context), plan_id)
+
+
+def _plan_snapshot_session_scope(tool_context: ToolContext | None) -> str:
+    if tool_context is None:
+        return _GLOBAL_PLAN_SNAPSHOT_CACHE_SCOPE
+
+    session = _safe_attribute(tool_context, "session")
+    session_id = _optional_text_attribute(session, "id") or _optional_text_attribute(
+        tool_context,
+        "session_id",
+    )
+    if session_id is None:
+        return _GLOBAL_PLAN_SNAPSHOT_CACHE_SCOPE
+
+    app_name = _optional_text_attribute(session, "app_name") or "unknown_app"
+    user_id = (
+        _optional_text_attribute(session, "user_id")
+        or _optional_text_attribute(tool_context, "user_id")
+        or "unknown_user"
+    )
+    return f"{app_name}:{user_id}:{session_id}"
+
+
+def _safe_attribute(owner: Any, name: str) -> Any:
+    if owner is None:
+        return None
+    try:
+        return getattr(owner, name)
+    except Exception:
+        return None
+
+
+def _optional_text_attribute(owner: Any, name: str) -> str | None:
+    value = _safe_attribute(owner, name)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if value is None or isinstance(value, bool):
+        return None
+    return str(value)
 
 
 def _snapshot_has_finalized_plan(
@@ -1154,7 +1596,9 @@ def _plan_field(plan: Mapping[str, Any], *field_names: str) -> Any:
 
 
 __all__ = [
+    "ADK_EVAL_MODE_ENV",
     "AdkOrchestratorAdapter",
+    "DETERMINISTIC_MODEL_ENV",
     "OrchestratorAgent",
     "app",
     "build_app",
