@@ -390,6 +390,149 @@ async def test_deterministic_model_explicit_rejection_after_draft_uses_current_p
 
 
 @pytest.mark.asyncio
+async def test_deterministic_model_pending_draft_routes_edit_to_plan_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    model = DeterministicOrchestratorModel()
+    request = LlmRequest(
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text="Prepare me for a meeting with ABC Manufacturing."
+                    )
+                ],
+            ),
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name="submit_orchestrator_request",
+                        response=_draft_plan_response(),
+                    )
+                ],
+            ),
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text="Please add a data-quality check before synthesis."
+                    )
+                ],
+            ),
+        ],
+        tools_dict={
+            "submit_orchestrator_request": FunctionTool(
+                _submit_orchestrator_request
+            ),
+            "add_plan_instruction": FunctionTool(_add_plan_instruction),
+            "approve_orchestrator_plan": FunctionTool(_approve_orchestrator_plan),
+            "reject_orchestrator_plan": FunctionTool(_reject_orchestrator_plan),
+        },
+    )
+
+    # Act
+    response = await _single_model_response(model, request)
+
+    # Assert
+    assert response.content is not None
+    part = response.content.parts[0]
+    assert part.text is None
+    assert part.function_call is not None
+    assert part.function_call.name == "add_plan_instruction"
+    assert part.function_call.args == {
+        "plan_id": "plan_meeting_prep",
+        "approval_surface_id": "surface_plan_meeting_prep",
+        "step_id": "step_synthesis",
+        "instruction": (
+            "Before synthesis, perform a synthetic data-quality check on source "
+            "freshness, missing context, and caveat wording."
+        ),
+        "edited_plan_version": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_deterministic_model_pending_draft_routes_reorder_to_plan_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    model = DeterministicOrchestratorModel()
+    request = LlmRequest(
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Prepare prospect research on Northstar Components, "
+                            "including risks, opportunities, and talking points."
+                        )
+                    )
+                ],
+            ),
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name="submit_orchestrator_request",
+                        response=_prospect_draft_plan_response(),
+                    )
+                ],
+            ),
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Please reorder so industry research and web-style "
+                            "context happen before product opportunity and credit "
+                            "risk work."
+                        )
+                    )
+                ],
+            ),
+        ],
+        tools_dict={
+            "submit_orchestrator_request": FunctionTool(
+                _submit_orchestrator_request
+            ),
+            "reorder_plan_steps": FunctionTool(_reorder_plan_steps),
+            "approve_orchestrator_plan": FunctionTool(_approve_orchestrator_plan),
+            "reject_orchestrator_plan": FunctionTool(_reject_orchestrator_plan),
+        },
+    )
+
+    # Act
+    response = await _single_model_response(model, request)
+
+    # Assert
+    assert response.content is not None
+    part = response.content.parts[0]
+    assert part.text is None
+    assert part.function_call is not None
+    assert part.function_call.name == "reorder_plan_steps"
+    assert part.function_call.args == {
+        "plan_id": "plan_prospect_research",
+        "approval_surface_id": "surface_plan_prospect_research",
+        "ordered_step_ids": [
+            "step_industry_research",
+            "step_web_search",
+            "step_product_opportunity",
+            "step_credit_risk",
+            "step_synthesis",
+        ],
+        "edited_plan_version": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_deterministic_model_pending_draft_routes_approved_credit_follow_up_as_new_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -564,6 +707,72 @@ async def test_deterministic_classifier_matches_user_request_not_prompt_example(
     ]
 
 
+@pytest.mark.parametrize(
+    ("request_text", "expected_required_agents"),
+    [
+        pytest.param(
+            (
+                "Prepare prospect research on Northstar Components, including "
+                "risks, opportunities, and talking points."
+            ),
+            [
+                "web_search",
+                "industry_research",
+                "product_opportunity",
+                "credit_risk",
+                "synthesis",
+            ],
+            id="prepare-prospect-research",
+        ),
+        pytest.param(
+            (
+                "For ABC Manufacturing, help me prepare credit-risk-sensitive "
+                "talking points for an upcoming review."
+            ),
+            [
+                "credit_risk",
+                "compliance_policy",
+                "synthesis",
+            ],
+            id="credit-risk-sensitive-compliance",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_deterministic_classifier_routes_user_simulation_prompts_to_expected_plans(
+    request_text: str,
+    expected_required_agents: list[str],
+) -> None:
+    # Arrange
+    model = DeterministicOrchestratorModel()
+    request = LlmRequest(
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Assess the business banking relationship-manager "
+                            "request.\n\n"
+                            f"User request: {request_text}\n"
+                            'SLM suggestion: {"intent":"meeting_prep","confidence":0.82}\n'
+                            'Available agents: ["relationship_summary","web_search"]'
+                        )
+                    )
+                ],
+            )
+        ]
+    )
+
+    # Act
+    response = await _single_model_response(model, request)
+
+    # Assert
+    assert response.content is not None
+    assessment = json.loads(response.content.parts[0].text or "{}")
+    assert assessment["required_agents"] == expected_required_agents
+
+
 @pytest.mark.asyncio
 async def test_deterministic_classifier_fallback_validates_to_data_quality() -> None:
     # Arrange
@@ -643,8 +852,55 @@ def _reject_orchestrator_plan(
     }
 
 
+def _add_plan_instruction(
+    plan_id: str,
+    approval_surface_id: str,
+    step_id: str,
+    instruction: str,
+    edited_plan_version: int,
+) -> dict[str, object]:
+    return {
+        "planId": plan_id,
+        "approvalSurfaceId": approval_surface_id,
+        "stepId": step_id,
+        "instruction": instruction,
+        "editedPlanVersion": edited_plan_version,
+    }
+
+
+def _reorder_plan_steps(
+    plan_id: str,
+    approval_surface_id: str,
+    ordered_step_ids: list[str],
+    edited_plan_version: int,
+) -> dict[str, object]:
+    return {
+        "planId": plan_id,
+        "approvalSurfaceId": approval_surface_id,
+        "orderedStepIds": ordered_step_ids,
+        "editedPlanVersion": edited_plan_version,
+    }
+
+
 def _draft_plan_response() -> dict[str, object]:
     return {
         **DRAFT_PLAN_RESPONSE,
         "stepIds": list(DRAFT_PLAN_RESPONSE["stepIds"]),
+    }
+
+
+def _prospect_draft_plan_response() -> dict[str, object]:
+    return {
+        "status": "plan_required",
+        "path": "plan_required",
+        "planId": "plan_prospect_research",
+        "planVersion": 1,
+        "approvalSurfaceId": "surface_plan_prospect_research",
+        "stepIds": [
+            "step_web_search",
+            "step_industry_research",
+            "step_product_opportunity",
+            "step_credit_risk",
+            "step_synthesis",
+        ],
     }

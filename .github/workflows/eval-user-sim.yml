@@ -1,0 +1,124 @@
+name: ADK User Simulation Eval
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  eval-user-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EVAL_OUTPUT_DIR: .ai-native/eval-user-sim
+      EVALSET_ID: orchestrator_user_sim
+      MAX_ALLOWED_INVOCATIONS: "12"
+      ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL: "1"
+      ORCHESTRATOR_DEMO_ADK_EVAL_MODE: "1"
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ vars.GOOGLE_CLOUD_LOCATION || 'us-central1' }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: ".python-version"
+
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.19"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Check lockfile is up to date
+        run: uv lock --check
+
+      - name: Install locked environment
+        run: uv sync --locked
+
+      - name: Prepare result directory
+        run: mkdir -p "${EVAL_OUTPUT_DIR}"
+
+      - name: Validate credentials and invocation limit
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          if [ -z "${GOOGLE_CLOUD_PROJECT}" ]; then
+            echo "GOOGLE_CLOUD_PROJECT secret is required for User Simulation evals." >&2
+            exit 1
+          fi
+
+          if [ -z "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" ]; then
+            echo "GOOGLE_APPLICATION_CREDENTIALS_JSON secret is required for User Simulation evals." >&2
+            exit 1
+          fi
+
+          uv run --locked python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = json.loads(
+              Path("orchestrator_demo/evals/user_sim_eval_config.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          configured_limit = config["user_simulator_config"]["max_allowed_invocations"]
+          workflow_limit = int(os.environ["MAX_ALLOWED_INVOCATIONS"])
+
+          if configured_limit > workflow_limit:
+              raise SystemExit(
+                  "user_sim_eval_config.json max_allowed_invocations "
+                  f"{configured_limit} exceeds workflow limit {workflow_limit}"
+              )
+
+          print(f"User Simulation max_allowed_invocations={configured_limit}")
+          PY
+
+          credentials_file="${RUNNER_TEMP}/google-application-credentials.json"
+          umask 077
+          printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${credentials_file}"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${credentials_file}" >> "${GITHUB_ENV}"
+
+      - name: Run dynamic ADK User Simulation evals
+        shell: bash
+        run: |
+          generated_evalset="orchestrator_demo/orchestrator/${EVALSET_ID}.evalset.json"
+          rm -f "${generated_evalset}"
+          trap 'cp "${generated_evalset}" "${EVAL_OUTPUT_DIR}/" 2>/dev/null || true' EXIT
+
+          set -o pipefail
+          {
+            uv run --locked adk eval_set create \
+              orchestrator_demo/orchestrator \
+              "${EVALSET_ID}"
+
+            uv run --locked adk eval_set add_eval_case \
+              orchestrator_demo/orchestrator \
+              "${EVALSET_ID}" \
+              --scenarios_file orchestrator_demo/evals/conversation_scenarios.json \
+              --session_input_file orchestrator_demo/evals/session_input.json
+
+            uv run --locked adk eval \
+              orchestrator_demo/orchestrator \
+              "${EVALSET_ID}" \
+              --config_file_path orchestrator_demo/evals/user_sim_eval_config.json \
+              --print_detailed_results
+          } 2>&1 | tee .ai-native/eval-user-sim/eval-user-sim.log
+
+      - name: Upload eval-user-sim results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-user-sim-results
+          path: .ai-native/eval-user-sim/
+          include-hidden-files: true
+          if-no-files-found: warn

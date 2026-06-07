@@ -837,6 +837,57 @@ class DeterministicOrchestratorModel(BaseLlm):
             draft_response = _latest_draft_plan_tool_response(llm_request)
             if draft_response is not None:
                 if (
+                    "reorder_plan_steps" in llm_request.tools_dict
+                    and _looks_like_plan_reorder(user_input)
+                ):
+                    identifiers = _draft_plan_identifiers(draft_response)
+                    function_call = types.Part.from_function_call(
+                        name="reorder_plan_steps",
+                        args={
+                            "plan_id": identifiers["plan_id"],
+                            "approval_surface_id": identifiers[
+                                "approval_surface_id"
+                            ],
+                            "ordered_step_ids": _reordered_step_ids(
+                                identifiers["step_ids"]
+                            ),
+                            "edited_plan_version": identifiers["plan_version"],
+                        },
+                    )
+                    if function_call.function_call is not None:
+                        function_call.function_call.id = "call_reorder_plan_steps"
+                    yield LlmResponse(
+                        content=types.Content(role="model", parts=[function_call])
+                    )
+                    return
+
+                if (
+                    "add_plan_instruction" in llm_request.tools_dict
+                    and _looks_like_plan_edit(user_input)
+                ):
+                    identifiers = _draft_plan_identifiers(draft_response)
+                    function_call = types.Part.from_function_call(
+                        name="add_plan_instruction",
+                        args={
+                            "plan_id": identifiers["plan_id"],
+                            "approval_surface_id": identifiers[
+                                "approval_surface_id"
+                            ],
+                            "step_id": _instruction_step_id(
+                                identifiers["step_ids"]
+                            ),
+                            "instruction": _plan_edit_instruction(user_input),
+                            "edited_plan_version": identifiers["plan_version"],
+                        },
+                    )
+                    if function_call.function_call is not None:
+                        function_call.function_call.id = "call_add_plan_instruction"
+                    yield LlmResponse(
+                        content=types.Content(role="model", parts=[function_call])
+                    )
+                    return
+
+                if (
                     "reject_orchestrator_plan" in llm_request.tools_dict
                     and _looks_like_rejection(user_input)
                 ):
@@ -1107,6 +1158,50 @@ def _looks_like_natural_language_approval(text: str) -> bool:
     ) or _has_unnegated_approval_keyword(normalized)
 
 
+def _looks_like_plan_reorder(text: str) -> bool:
+    normalized = text.casefold()
+    return "reorder" in normalized or "move" in normalized
+
+
+def _looks_like_plan_edit(text: str) -> bool:
+    normalized = text.casefold()
+    return (
+        "edit" in normalized
+        or "data-quality" in normalized
+        or "data quality" in normalized
+        or "add " in normalized
+        or "include " in normalized
+    )
+
+
+def _reordered_step_ids(step_ids: Sequence[str]) -> list[str]:
+    priority = ("step_industry_research", "step_web_search")
+    prioritized = [step_id for step_id in priority if step_id in step_ids]
+    remainder = [step_id for step_id in step_ids if step_id not in prioritized]
+    return prioritized + remainder
+
+
+def _instruction_step_id(step_ids: Sequence[str]) -> str:
+    if "step_synthesis" in step_ids:
+        return "step_synthesis"
+    if step_ids:
+        return step_ids[-1]
+    return "step_synthesis"
+
+
+def _plan_edit_instruction(text: str) -> str:
+    normalized = text.casefold()
+    if "data-quality" in normalized or "data quality" in normalized:
+        return (
+            "Before synthesis, perform a synthetic data-quality check on source "
+            "freshness, missing context, and caveat wording."
+        )
+    return (
+        "Incorporate the requested edit before final synthesis while preserving "
+        "structured approval requirements."
+    )
+
+
 def _has_unnegated_phrase(normalized: str, phrase: str) -> bool:
     phrase_pattern = re.escape(phrase).replace(r"\ ", r"\s+")
     pattern = rf"\b{phrase_pattern}\b"
@@ -1238,6 +1333,45 @@ def _deterministic_intent_assessment(llm_request: LlmRequest) -> dict[str, Any]:
             "required_agents": ["internal_knowledge"],
             "rationale": "Deterministic test classifier selected internal knowledge.",
         }
+    if _looks_like_prospect_research(text):
+        intents = [
+            "prospect_research",
+            "industry_research",
+            "product_opportunity",
+            "credit_risk",
+        ]
+        required_agents = [
+            "web_search",
+            "industry_research",
+            "product_opportunity",
+            "credit_risk",
+            "synthesis",
+        ]
+        if _requires_compliance_policy(text):
+            intents.append("compliance_policy")
+            required_agents.insert(-1, "compliance_policy")
+        return {
+            "intents": intents,
+            "confidence": 0.92,
+            "complexity": "complex",
+            "required_agents": required_agents,
+            "rationale": "Deterministic test classifier selected prospect research plan.",
+        }
+    if _looks_like_risk_compliance_plan(text):
+        return {
+            "intents": ["credit_risk", "compliance_policy"],
+            "confidence": 0.91,
+            "complexity": "complex",
+            "required_agents": [
+                "credit_risk",
+                "compliance_policy",
+                "synthesis",
+            ],
+            "rationale": (
+                "Deterministic test classifier selected risk and compliance "
+                "review plan."
+            ),
+        }
     if "meeting" in text or "prepare" in text:
         return {
             "intents": [
@@ -1256,12 +1390,7 @@ def _deterministic_intent_assessment(llm_request: LlmRequest) -> dict[str, Any]:
             ],
             "rationale": "Deterministic test classifier selected meeting prep plan.",
         }
-    if (
-        "prospect" in text
-        or "risks" in text
-        or "opportunities" in text
-        or "talking points" in text
-    ):
+    if "risks" in text or "opportunities" in text or "talking points" in text:
         return {
             "intents": [
                 "prospect_research",
@@ -1290,6 +1419,26 @@ def _deterministic_intent_assessment(llm_request: LlmRequest) -> dict[str, Any]:
             "safe single owner agent."
         ),
     }
+
+
+def _looks_like_prospect_research(text: str) -> bool:
+    return "prospect" in text
+
+
+def _looks_like_risk_compliance_plan(text: str) -> bool:
+    return (
+        "credit-risk-sensitive" in text
+        or "compliance policy" in text
+        or ("credit risk" in text and _requires_compliance_policy(text))
+    )
+
+
+def _requires_compliance_policy(text: str) -> bool:
+    return (
+        "compliance" in text
+        or "policy" in text
+        or "credit-risk-sensitive" in text
+    )
 
 
 def _classifier_user_request_text(text: str) -> str:
