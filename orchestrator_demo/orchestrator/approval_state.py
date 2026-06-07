@@ -35,6 +35,10 @@ class PlanNotFoundError(ApprovalStateError):
     """Raised when a userAction references an unknown draft plan."""
 
 
+class PlanAlreadyExistsError(ApprovalStateError):
+    """Raised when creating a draft for an occupied plan id."""
+
+
 class PlanAlreadyFinalError(ApprovalStateError):
     """Raised when a mutation targets an approved or rejected plan."""
 
@@ -199,9 +203,13 @@ class ApprovalStateStore:
         with self._lock:
             draft = plan.model_copy(deep=True)
             existing = self._records.get(draft.plan_id)
-            if existing is not None and existing.status != "draft":
-                raise PlanAlreadyFinalError(
-                    f"plan {draft.plan_id} is already {existing.status}"
+            if existing is not None:
+                if existing.status != "draft":
+                    raise PlanAlreadyFinalError(
+                        f"plan {draft.plan_id} is already {existing.status}"
+                    )
+                raise PlanAlreadyExistsError(
+                    f"plan {draft.plan_id} already exists as a draft"
                 )
 
             record = ApprovalRecord(draft_plan=draft)
@@ -920,6 +928,7 @@ __all__ = [
     "ApprovalRecord",
     "ApprovalStateError",
     "ApprovalStateStore",
+    "PlanAlreadyExistsError",
     "PlanAlreadyFinalError",
     "PlanMutationError",
     "PlanNotFoundError",

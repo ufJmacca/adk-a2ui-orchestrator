@@ -150,7 +150,8 @@ async def test_deterministic_model_routes_latest_user_turn_after_prior_tool_resp
             (
                 "Plan plan_meeting_prep v2 was rejected on "
                 "surface_plan_meeting_prep. Reason: Too broad for today. No "
-                "specialist graph executed."
+                "specialist graph executed and no specialist execution artifacts "
+                "were produced."
             ),
             id="rejected",
         ),

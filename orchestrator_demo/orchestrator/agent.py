@@ -57,6 +57,7 @@ ADK_EVAL_MODE_ENV = "ORCHESTRATOR_DEMO_ADK_EVAL_MODE"
 _FINAL_APPROVAL_STATUSES = frozenset(
     {"approved", "approved_execution_failed", "rejected"}
 )
+_GLOBAL_PLAN_SNAPSHOT_CACHE_SCOPE = "global"
 
 install_a2ui_response_event_delivery()
 
@@ -112,8 +113,14 @@ class AdkOrchestratorAdapter:
     def __init__(self, agent: OrchestratorAgent | None = None) -> None:
         self._agent = agent or OrchestratorAgent()
         self._session_lock = asyncio.Lock()
-        self._finalized_plan_snapshots_by_id: dict[str, dict[str, Any]] = {}
-        self._latest_draft_plan_snapshots_by_id: dict[str, dict[str, Any]] = {}
+        self._finalized_plan_snapshots_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        self._latest_draft_plan_snapshots_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
 
     def tools(self) -> list[Any]:
         """Return ADK function tools backed by one stateful orchestrator agent."""
@@ -454,15 +461,22 @@ class AdkOrchestratorAdapter:
 
         snapshot = tool_context.state.get(ORCHESTRATOR_SESSION_STATE_KEY)
         if snapshot is None:
+            self._clear_plan_snapshot_cache_for_context(tool_context)
             self._agent.reset_session_snapshot()
             return _empty_session_snapshot()
         if not isinstance(snapshot, Mapping):
             raise ValueError("orchestrator_session must be a JSON object")
-        restored_snapshot = self._snapshot_preserving_finalized_plans(snapshot)
-        restored_snapshot = self._snapshot_preserving_latest_drafts(restored_snapshot)
+        restored_snapshot = self._snapshot_preserving_finalized_plans(
+            snapshot,
+            tool_context,
+        )
+        restored_snapshot = self._snapshot_preserving_latest_drafts(
+            restored_snapshot,
+            tool_context,
+        )
         self._agent.restore_session_snapshot(restored_snapshot)
-        self._remember_finalized_plans(restored_snapshot)
-        self._remember_latest_drafts(restored_snapshot)
+        self._remember_finalized_plans(restored_snapshot, tool_context)
+        self._remember_latest_drafts(restored_snapshot, tool_context)
         return restored_snapshot
 
     def _persist_session_to_context(
@@ -476,12 +490,25 @@ class AdkOrchestratorAdapter:
 
         try:
             snapshot = self._agent.export_session_snapshot()
-            self._remember_finalized_plans(snapshot)
-            self._remember_latest_drafts(snapshot)
+            self._remember_finalized_plans(snapshot, tool_context)
+            self._remember_latest_drafts(snapshot, tool_context)
             tool_context.state[ORCHESTRATOR_SESSION_STATE_KEY] = snapshot
         except Exception:
             if not suppress_errors:
                 raise
+
+    def _clear_plan_snapshot_cache_for_context(
+        self,
+        tool_context: ToolContext | None,
+    ) -> None:
+        session_scope = _plan_snapshot_session_scope(tool_context)
+        for cache in (
+            self._finalized_plan_snapshots_by_key,
+            self._latest_draft_plan_snapshots_by_key,
+        ):
+            for cache_key in list(cache):
+                if cache_key[0] == session_scope:
+                    cache.pop(cache_key, None)
 
     def _skip_model_summarization(self, tool_context: ToolContext | None) -> None:
         if tool_context is None:
@@ -499,6 +526,7 @@ class AdkOrchestratorAdapter:
     def _snapshot_preserving_finalized_plans(
         self,
         snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
     ) -> Mapping[str, Any]:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
@@ -513,7 +541,9 @@ class AdkOrchestratorAdapter:
                 continue
             if incoming_record.get("status") != "draft":
                 continue
-            finalized = self._finalized_plan_snapshots_by_id.get(plan_id)
+            finalized = self._finalized_plan_snapshots_by_key.get(
+                _plan_snapshot_cache_key(tool_context, plan_id)
+            )
             if finalized is None:
                 continue
             finalized_record = finalized.get("approvalRecord")
@@ -539,6 +569,7 @@ class AdkOrchestratorAdapter:
     def _snapshot_preserving_latest_drafts(
         self,
         snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
     ) -> Mapping[str, Any]:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
@@ -553,7 +584,9 @@ class AdkOrchestratorAdapter:
                 continue
             if incoming_record.get("status") != "draft":
                 continue
-            latest = self._latest_draft_plan_snapshots_by_id.get(plan_id)
+            latest = self._latest_draft_plan_snapshots_by_key.get(
+                _plan_snapshot_cache_key(tool_context, plan_id)
+            )
             if latest is None:
                 continue
             latest_record = latest.get("approvalRecord")
@@ -586,7 +619,11 @@ class AdkOrchestratorAdapter:
 
         return snapshot if merged_snapshot is None else merged_snapshot
 
-    def _remember_finalized_plans(self, snapshot: Mapping[str, Any]) -> None:
+    def _remember_finalized_plans(
+        self,
+        snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
+    ) -> None:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
             return
@@ -597,9 +634,10 @@ class AdkOrchestratorAdapter:
         for plan_id, record in approval_records.items():
             if not isinstance(plan_id, str) or not _approval_record_is_final(record):
                 continue
+            cache_key = _plan_snapshot_cache_key(tool_context, plan_id)
             approval_surface_id = _approval_surface_id_for_record(record, plan_id)
-            self._latest_draft_plan_snapshots_by_id.pop(plan_id, None)
-            self._finalized_plan_snapshots_by_id[plan_id] = {
+            self._latest_draft_plan_snapshots_by_key.pop(cache_key, None)
+            self._finalized_plan_snapshots_by_key[cache_key] = {
                 "approvalRecord": deepcopy(record),
                 "requestContext": (
                     deepcopy(request_contexts.get(plan_id))
@@ -616,7 +654,11 @@ class AdkOrchestratorAdapter:
                 ),
             }
 
-    def _remember_latest_drafts(self, snapshot: Mapping[str, Any]) -> None:
+    def _remember_latest_drafts(
+        self,
+        snapshot: Mapping[str, Any],
+        tool_context: ToolContext | None,
+    ) -> None:
         approval_records = snapshot.get("approvalRecords")
         if not isinstance(approval_records, Mapping):
             return
@@ -626,12 +668,13 @@ class AdkOrchestratorAdapter:
         for plan_id, record in approval_records.items():
             if not isinstance(plan_id, str) or not isinstance(record, Mapping):
                 continue
+            cache_key = _plan_snapshot_cache_key(tool_context, plan_id)
             if record.get("status") != "draft":
                 if _approval_record_is_final(record):
-                    self._latest_draft_plan_snapshots_by_id.pop(plan_id, None)
+                    self._latest_draft_plan_snapshots_by_key.pop(cache_key, None)
                 continue
 
-            latest = self._latest_draft_plan_snapshots_by_id.get(plan_id)
+            latest = self._latest_draft_plan_snapshots_by_key.get(cache_key)
             latest_record = (
                 latest.get("approvalRecord")
                 if isinstance(latest, Mapping)
@@ -651,7 +694,8 @@ class AdkOrchestratorAdapter:
                 continue
 
             approval_surface_id = _approval_surface_id_for_record(record, plan_id)
-            self._latest_draft_plan_snapshots_by_id[plan_id] = {
+            self._finalized_plan_snapshots_by_key.pop(cache_key, None)
+            self._latest_draft_plan_snapshots_by_key[cache_key] = {
                 "approvalRecord": deepcopy(record),
                 "requestContext": (
                     deepcopy(request_contexts.get(plan_id))
@@ -920,7 +964,8 @@ def _deterministic_tool_response_summary(tool_response: Any) -> str:
         return (
             f"Plan {identifiers['plan_id']} v{identifiers['plan_version']} was "
             f"rejected on {identifiers['approval_surface_id']}. Reason: {reason} "
-            "No specialist graph executed."
+            "No specialist graph executed and no specialist execution artifacts "
+            "were produced."
         )
 
     return "Structured orchestrator tool response returned to the A2A client."
@@ -1273,6 +1318,53 @@ def _empty_session_snapshot() -> dict[str, Any]:
         },
         "artifactRefs": {},
     }
+
+
+def _plan_snapshot_cache_key(
+    tool_context: ToolContext | None,
+    plan_id: str,
+) -> tuple[str, str]:
+    return (_plan_snapshot_session_scope(tool_context), plan_id)
+
+
+def _plan_snapshot_session_scope(tool_context: ToolContext | None) -> str:
+    if tool_context is None:
+        return _GLOBAL_PLAN_SNAPSHOT_CACHE_SCOPE
+
+    session = _safe_attribute(tool_context, "session")
+    session_id = _optional_text_attribute(session, "id") or _optional_text_attribute(
+        tool_context,
+        "session_id",
+    )
+    if session_id is None:
+        return _GLOBAL_PLAN_SNAPSHOT_CACHE_SCOPE
+
+    app_name = _optional_text_attribute(session, "app_name") or "unknown_app"
+    user_id = (
+        _optional_text_attribute(session, "user_id")
+        or _optional_text_attribute(tool_context, "user_id")
+        or "unknown_user"
+    )
+    return f"{app_name}:{user_id}:{session_id}"
+
+
+def _safe_attribute(owner: Any, name: str) -> Any:
+    if owner is None:
+        return None
+    try:
+        return getattr(owner, name)
+    except Exception:
+        return None
+
+
+def _optional_text_attribute(owner: Any, name: str) -> str | None:
+    value = _safe_attribute(owner, name)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if value is None or isinstance(value, bool):
+        return None
+    return str(value)
 
 
 def _snapshot_has_finalized_plan(
