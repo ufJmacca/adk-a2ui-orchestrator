@@ -9,10 +9,12 @@ from typing import Any
 def __getattr__(name: str) -> Any:
     """Lazily re-export ADK loader entry points from the agent module."""
 
+    if name == "agent":
+        return import_module(f"{__name__}.agent")
     if name in {"app", "root_agent"}:
         agent_module = import_module(f"{__name__}.agent")
         return getattr(agent_module, name)
     raise AttributeError(name)
 
 
-__all__ = ["app", "root_agent"]
+__all__ = ["agent", "app", "root_agent"]
