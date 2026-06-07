@@ -53,16 +53,29 @@ AgentEvaluator.evaluate_eval_set(
 `eval_cases`, and `creation_timestamp`. `EvalConfig` accepts `criteria`,
 `customMetrics`, and `userSimulatorConfig`.
 
-The focused compatibility test is:
+## Local Fixed Eval Workflow
+
+Synchronize the locked environment before running fixed evals:
+
+```bash
+uv sync --locked
+```
+
+The focused pytest wrapper for the checked-in fixed evalset is:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
 ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
-  uv run --locked pytest tests/test_adk_evalsets.py -q
+  uv run --locked pytest tests/test_adk_evalsets.py
 ```
 
 If a future locked ADK build removes or reshapes these imports, the test skips
 with a locked-version reason that names the missing module or symbol.
+
+Fixed evals do not require `OPENROUTER_API_KEY` in deterministic mode. Eval
+commands, pytest failures, ADK CLI output, and captured fixtures must not log
+secrets, `.env` values, real customer data, credentials, or production banking
+decisions.
 
 ## CLI Compatibility
 
@@ -70,7 +83,9 @@ CLI compatibility finding for this slice:
 
 `uv run --locked adk eval --help` confirms that ADK 2.1.0 exposes this command
 shape. Use the loader-compatible orchestrator directory with both deterministic
-eval flags enabled:
+eval flags enabled. The supported narrow CLI target is
+`orchestrator_demo/orchestrator`; package-root `orchestrator_demo` eval loading
+is not the documented path for this repository.
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
@@ -95,3 +110,8 @@ cases, then promote cleaned synthetic cases into the fixed evalset:
 ```bash
 uv run adk web orchestrator_demo --host 0.0.0.0 --port 8000
 ```
+
+Captured sessions must be cleaned, synthetic, and manually promoted into
+`basic_evalset.evalset.json`. Before promotion, remove exploratory turns,
+transient IDs that are not part of the assertion, real names, secrets, `.env`
+values, credentials, and any regulated decision language.
