@@ -427,6 +427,42 @@ def test_readme_dev_ui_debugging_section_keeps_adk_web_debugging_only() -> None:
     assert readme_command_lines.count(expected_command) == 1
 
 
+def test_eval_readme_documents_local_fixed_eval_workflow_and_capture_safety() -> None:
+    # Arrange
+    readme_path = ROOT / "orchestrator_demo" / "evals" / "README.md"
+    expected_pytest_command = "uv run --locked pytest tests/test_adk_evalsets.py"
+    expected_cli_command = (
+        "uv run --locked adk eval \\\n"
+        "  orchestrator_demo/orchestrator \\\n"
+        "  orchestrator_demo/evals/basic_evalset.evalset.json \\\n"
+        "  --config_file_path orchestrator_demo/evals/basic_eval_config.json \\\n"
+        "  --print_detailed_results"
+    )
+    unsupported_package_root_cli_command = (
+        "uv run --locked adk eval \\\n"
+        "  orchestrator_demo \\\n"
+        "  orchestrator_demo/evals/basic_evalset.evalset.json"
+    )
+
+    # Act
+    readme = readme_path.read_text(encoding="utf-8")
+    normalized_readme = _squash_whitespace(readme.casefold())
+
+    # Assert
+    assert "uv sync --locked" in readme
+    assert expected_pytest_command in readme
+    assert expected_cli_command in readme
+    assert unsupported_package_root_cli_command not in readme
+    assert REQUIRED_DEV_UI_DEBUG_COMMAND in readme
+    assert "captured sessions" in normalized_readme
+    assert "cleaned" in normalized_readme
+    assert "synthetic" in normalized_readme
+    assert "manually promoted" in normalized_readme
+    assert "fixed evals do not require `openrouter_api_key`" in normalized_readme
+    assert "deterministic mode" in normalized_readme
+    assert "must not log secrets" in normalized_readme
+
+
 def test_readme_no_longer_documents_custom_http_runtime_paths() -> None:
     # Arrange
     readme_path = ROOT / "README.md"
