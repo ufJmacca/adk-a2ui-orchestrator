@@ -77,6 +77,27 @@ commands, pytest failures, ADK CLI output, and captured fixtures must not log
 secrets, `.env` values, real customer data, credentials, or production banking
 decisions.
 
+## CI Eval Lane
+
+GitHub Actions keeps the `quality` job focused on deterministic software gates:
+lock check, locked sync, Ruff, Mypy, and the full pytest suite.
+
+The separate `eval-basic` job runs only the fixed eval pytest wrapper with
+`ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1` and
+`ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1`:
+
+```bash
+uv run --locked pytest tests/test_adk_evalsets.py -ra
+```
+
+The `-ra` flag keeps explicit skip reasons visible when the locked ADK eval API
+is incompatible, and the pytest wrapper emits case-level diagnostics for eval
+failures. CI also uploads the `eval-basic` log as a GitHub Actions artifact
+named `eval-basic-results`.
+
+The `eval-basic` lane is intentionally separate and non-required until
+maintainers accept the baseline flake rate.
+
 ## CLI Compatibility
 
 CLI compatibility finding for this slice:

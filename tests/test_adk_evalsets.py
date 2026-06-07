@@ -6,10 +6,16 @@ import json
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 from types import ModuleType
+from typing import Any
 
 import pytest
+import yaml
+
+ADK_EVAL_ENV_VARS = {
+    "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL",
+    "ORCHESTRATOR_DEMO_ADK_EVAL_MODE",
+}
 
 
 def _import_adk_eval_symbol(module_name: str, symbol_name: str) -> Any:
@@ -271,6 +277,209 @@ async def test_fixed_eval_runner_clears_agent_module_cache_after_eval_paths(
     assert cached_agent_module._APP is None  # type: ignore[attr-defined]
     assert agent_module not in sys.modules
     assert parent_module not in sys.modules
+
+
+def test_ci_quality_job_keeps_existing_required_gates(repository_root: Path) -> None:
+    # Arrange
+    workflow = _load_ci_workflow(repository_root)
+
+    # Act
+    quality_job = workflow["jobs"].get("quality")
+    quality_run_commands = _job_run_commands(quality_job)
+    eval_env_locations = _job_env_var_locations(quality_job, ADK_EVAL_ENV_VARS)
+
+    # Assert
+    assert quality_job is not None
+    assert quality_run_commands == [
+        "uv lock --check",
+        "uv sync --locked",
+        "uv run --locked ruff check --output-format=github .",
+        "uv run --locked mypy orchestrator_demo",
+        "uv run --locked pytest",
+    ]
+    assert eval_env_locations == []
+
+
+def test_ci_eval_basic_job_runs_fixed_eval_wrapper_separately(
+    repository_root: Path,
+) -> None:
+    # Arrange
+    workflow = _load_ci_workflow(repository_root)
+
+    # Act
+    jobs = workflow["jobs"]
+    quality_job = jobs.get("quality")
+    eval_basic_job = jobs.get("eval-basic")
+    eval_step = (
+        _job_step(eval_basic_job, "Run deterministic fixed ADK evals")
+        if eval_basic_job is not None
+        else {}
+    )
+    eval_env = (
+        _merged_job_step_env(eval_basic_job, eval_step)
+        if eval_basic_job is not None
+        else {}
+    )
+    eval_run_lines = _script_lines(eval_step.get("run", ""))
+    pytest_pipeline = _single_script_line_containing(
+        eval_run_lines,
+        "uv run --locked pytest",
+    )
+
+    # Assert
+    assert quality_job is not None
+    assert eval_basic_job is not None
+    assert eval_basic_job is not quality_job
+    assert eval_env["ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL"] == "1"
+    assert eval_env["ORCHESTRATOR_DEMO_ADK_EVAL_MODE"] == "1"
+    assert "set -o pipefail" in eval_run_lines
+    assert eval_run_lines.index("set -o pipefail") < eval_run_lines.index(
+        pytest_pipeline
+    )
+    assert pytest_pipeline == (
+        "uv run --locked pytest tests/test_adk_evalsets.py -ra 2>&1 "
+        "| tee .ai-native/eval-basic/eval-basic.log"
+    )
+
+
+def test_ci_eval_basic_uploads_eval_result_summary_artifact(
+    repository_root: Path,
+) -> None:
+    # Arrange
+    workflow = _load_ci_workflow(repository_root)
+
+    # Act
+    eval_basic_job = workflow["jobs"].get("eval-basic")
+    eval_step = (
+        _job_step(eval_basic_job, "Run deterministic fixed ADK evals")
+        if eval_basic_job is not None
+        else {}
+    )
+    eval_run_lines = _script_lines(eval_step.get("run", ""))
+    pytest_pipeline = _single_script_line_containing(eval_run_lines, " | tee ")
+    artifact_steps = [
+        step
+        for step in eval_basic_job["steps"]
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ] if eval_basic_job is not None else []
+
+    # Assert
+    assert eval_basic_job is not None
+    assert len(artifact_steps) == 1
+    artifact_step = artifact_steps[0]
+    artifact_config = artifact_step["with"]
+    assert artifact_step["if"] == "${{ always() }}"
+    assert artifact_config["name"] == "eval-basic-results"
+    assert artifact_config["path"] == ".ai-native/eval-basic/"
+    assert artifact_config["include-hidden-files"] is True
+    assert _tee_output_path(pytest_pipeline).is_relative_to(
+        _artifact_directory(artifact_config["path"])
+    )
+
+
+def test_eval_readme_documents_ci_eval_lanes_and_artifacts(
+    repository_root: Path,
+) -> None:
+    # Arrange
+    readme_path = repository_root / "orchestrator_demo" / "evals" / "README.md"
+
+    # Act
+    readme_text = readme_path.read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme_text.casefold().split())
+
+    # Assert
+    assert "`quality`" in readme_text
+    assert "`eval-basic`" in readme_text
+    assert "uv run --locked pytest tests/test_adk_evalsets.py" in readme_text
+    assert "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1" in readme_text
+    assert "ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1" in readme_text
+    assert "github actions artifact" in normalized_readme
+    assert "non-required" in normalized_readme
+    assert "baseline flake rate" in normalized_readme
+
+
+def _load_ci_workflow(repository_root: Path) -> Mapping[str, Any]:
+    workflow_path = repository_root / ".github" / "workflows" / "ci.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+    return workflow
+
+
+def _job_run_commands(job: Mapping[str, Any] | None) -> list[str]:
+    if job is None:
+        return []
+
+    return [step["run"] for step in job["steps"] if "run" in step]
+
+
+def _job_step(job: Mapping[str, Any] | None, step_name: str) -> Mapping[str, Any]:
+    if job is None:
+        return {}
+
+    matching_steps = [step for step in job["steps"] if step.get("name") == step_name]
+    assert len(matching_steps) == 1, (
+        f"expected one workflow step named {step_name!r}; "
+        f"found {[step.get('name') for step in job['steps']]}"
+    )
+    return matching_steps[0]
+
+
+def _job_env_var_locations(
+    job: Mapping[str, Any] | None,
+    env_var_names: set[str],
+) -> list[str]:
+    if job is None:
+        return []
+
+    locations = []
+    for env_var_name in sorted(env_var_names):
+        if env_var_name in job.get("env", {}):
+            locations.append(f"job.env.{env_var_name}")
+
+    for index, step in enumerate(job["steps"]):
+        step_label = step.get("name") or step.get("uses") or f"step[{index}]"
+        for env_var_name in sorted(env_var_names):
+            if env_var_name in step.get("env", {}):
+                locations.append(f"{step_label}.env.{env_var_name}")
+
+    return locations
+
+
+def _merged_job_step_env(
+    job: Mapping[str, Any],
+    step: Mapping[str, Any],
+) -> dict[str, Any]:
+    env = dict(job.get("env", {}))
+    env.update(step.get("env", {}))
+    return env
+
+
+def _script_lines(script: str) -> list[str]:
+    return [line.strip() for line in script.splitlines() if line.strip()]
+
+
+def _single_script_line_containing(lines: list[str], expected_text: str) -> str:
+    matching_lines = [line for line in lines if expected_text in line]
+    assert len(matching_lines) == 1, (
+        f"expected one workflow script line containing {expected_text!r}; "
+        f"found {matching_lines!r}"
+    )
+    return matching_lines[0]
+
+
+def _tee_output_path(pipeline: str) -> Path:
+    _, separator, tee_command = pipeline.partition("|")
+    assert separator == "|", f"expected pytest output to be piped through tee: {pipeline}"
+
+    tee_tokens = tee_command.strip().split()
+    assert tee_tokens == ["tee", ".ai-native/eval-basic/eval-basic.log"]
+    return Path(tee_tokens[1])
+
+
+def _artifact_directory(artifact_path: str) -> Path:
+    normalized_path = Path(artifact_path)
+    assert normalized_path == Path(".ai-native/eval-basic")
+    return normalized_path
 
 
 @pytest.mark.parametrize(
