@@ -115,3 +115,78 @@ Captured sessions must be cleaned, synthetic, and manually promoted into
 `basic_evalset.evalset.json`. Before promotion, remove exploratory turns,
 transient IDs that are not part of the assertion, real names, secrets, `.env`
 values, credentials, and any regulated decision language.
+
+## User Simulation
+
+User Simulation is an opt-in dynamic evaluation lane. The checked-in files in
+this directory define scenario inputs and configuration, but generated User
+Simulation evalsets are not treated as checked-in source fixtures by default.
+Keep generated cases under `orchestrator_demo/evals/generated/` or use the
+local ADK eval set store, then promote only cleaned, synthetic, deterministic
+fixtures when they are intended to become source-controlled regression cases.
+
+The repository is locked to `google-adk[eval]==2.1.0`, so local commands should
+continue to use the locked `uv` environment. Dynamic User Simulation runs still
+remain opt-in because they may require Google Cloud/Vertex credentials, API
+enablement, quota, budgets, and cost controls.
+
+Create a scenario-backed evalset:
+
+```bash
+ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked adk eval_set create \
+  orchestrator_demo/orchestrator \
+  orchestrator_user_sim
+```
+
+Add eval cases from the checked-in scenario pack:
+
+```bash
+ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked adk eval_set add_eval_case \
+  orchestrator_demo/orchestrator \
+  orchestrator_user_sim \
+  --scenarios_file orchestrator_demo/evals/conversation_scenarios.json \
+  --session_input_file orchestrator_demo/evals/session_input.json
+```
+
+Run the generated dynamic evalset:
+
+```bash
+ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked adk eval \
+  orchestrator_demo/orchestrator \
+  orchestrator_user_sim \
+  --config_file_path orchestrator_demo/evals/user_sim_eval_config.json \
+  --print_detailed_results
+```
+
+Under the locked ADK 2.1 CLI, the loader-compatible local app path is
+`orchestrator_demo/orchestrator`. Local `eval_set` commands store the generated
+evalset at `orchestrator_demo/orchestrator/orchestrator_user_sim.evalset.json`;
+that generated path is git-ignored by default. Promote only reviewed, cleaned,
+synthetic, deterministic fixtures into `orchestrator_demo/evals/` when they are
+intended to become checked-in regression cases.
+
+Before enabling scheduled or blocking runs, define project ownership for the
+Google Cloud/Vertex environment, API enablement, quota, budgets, possible
+costs, and cost review ownership. Do not commit credentials, service-account
+files, tokens, `.env` values, generated customer data, or generated eval
+results that have not been reviewed for synthetic-only content.
+
+`user_sim_eval_config.json` intentionally uses User Simulation metrics instead
+of fixed expected-response criteria:
+
+- `hallucinations_v1`
+- `safety_v1`
+- `multi_turn_task_success_v1`
+- `multi_turn_trajectory_quality_v1`
+- `multi_turn_tool_use_quality_v1`
+- `per_turn_user_simulator_quality_v1`
+
+The repository is locked to `google-adk==2.1.0`. Unsupported or unavailable
+User Simulation metrics in ADK 2.1 are non-blocking until validated against the
+locked ADK runtime and the chosen Google Cloud/Vertex project.

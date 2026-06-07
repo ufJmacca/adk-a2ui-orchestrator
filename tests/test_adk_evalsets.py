@@ -4,6 +4,8 @@ import importlib
 import inspect
 import json
 import re
+import shlex
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -22,6 +24,19 @@ def _load_eval_json(repository_root: Path, filename: str) -> Any:
     )
 
 
+def _squash_whitespace(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _readme_bash_tokens_after(readme_text: str, marker: str) -> list[str]:
+    marker_index = readme_text.index(marker)
+    block_start = readme_text.index("```bash", marker_index) + len("```bash")
+    block_end = readme_text.index("```", block_start)
+    command_text = readme_text[block_start:block_end].strip()
+    normalized_command = command_text.replace("\\\n", " ")
+    return shlex.split(normalized_command)
+
+
 def _import_adk_eval_symbol(module_name: str, symbol_name: str) -> Any:
     try:
         module = importlib.import_module(module_name)
@@ -38,6 +53,48 @@ def _import_adk_eval_symbol(module_name: str, symbol_name: str) -> Any:
             "google-adk==2.1.0 eval API shape is incompatible in this locked "
             f"environment: {module_name}.{symbol_name} is missing: {exc}"
         )
+
+
+def _is_git_ignored(repository_root: Path, path: str) -> bool:
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", path],
+        cwd=repository_root,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise AssertionError(f"git check-ignore failed for {path}: {result.returncode}")
+
+
+def _load_cli_root_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    repository_root: Path,
+    agent_path: str,
+) -> Any:
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    get_root_agent = _import_adk_eval_symbol(
+        "google.adk.cli.cli_eval",
+        "get_root_agent",
+    )
+    cli_eval_module_names = ("agent", "agent.agent")
+    saved_modules = {
+        module_name: sys.modules.get(module_name)
+        for module_name in cli_eval_module_names
+    }
+    for module_name in cli_eval_module_names:
+        sys.modules.pop(module_name, None)
+
+    try:
+        return get_root_agent(str(repository_root / agent_path))
+    finally:
+        for module_name in cli_eval_module_names:
+            sys.modules.pop(module_name, None)
+        for module_name, module in saved_modules.items():
+            if module is not None:
+                sys.modules[module_name] = module
 
 
 @pytest.mark.asyncio
@@ -687,6 +744,194 @@ def test_user_simulation_generation_config_is_synthetic_example_only(
     assert "regulated decisions" in instruction
     assert "synthetic specialists" in environment_context
     assert "structured plan approval" in environment_context
+
+
+def test_user_simulation_json_shape_is_static_and_credential_free(
+    repository_root: Path,
+) -> None:
+    # Arrange
+    scenarios = _load_eval_json(repository_root, "conversation_scenarios.json")
+    session_input = _load_eval_json(repository_root, "session_input.json")
+    eval_config = _load_eval_json(repository_root, "user_sim_eval_config.json")
+    generation_config = _load_eval_json(
+        repository_root,
+        "user_simulation_generation_config.example.json",
+    )
+    forbidden_live_credential_fields = {
+        "api_key",
+        "apiKey",
+        "credentials",
+        "credential_file",
+        "service_account",
+        "token",
+    }
+
+    # Act
+    scenario_items = scenarios["scenarios"]
+    config_text = json.dumps(
+        {
+            "session_input": session_input,
+            "eval_config": eval_config,
+            "generation_config": generation_config,
+        },
+        sort_keys=True,
+    )
+
+    # Assert
+    assert len(scenario_items) >= 5
+    assert all(
+        set(scenario) == {"startingPrompt", "conversationPlan", "userPersona"}
+        for scenario in scenario_items
+    )
+    assert session_input == {
+        "appName": "orchestrator_demo",
+        "userId": "synthetic_relationship_manager",
+        "state": {
+            "eval_mode": "user_simulation",
+            "data_policy": "synthetic_only",
+        },
+    }
+    assert "criteria" in eval_config
+    assert "user_simulator_config" in eval_config
+    assert generation_config["count"] == 5
+    assert not any(field in config_text for field in forbidden_live_credential_fields)
+
+
+def test_eval_readme_documents_loadable_user_simulation_evalset_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    repository_root: Path,
+) -> None:
+    # Arrange
+    readme_path = repository_root / "orchestrator_demo" / "evals" / "README.md"
+
+    # Act
+    readme_text = readme_path.read_text(encoding="utf-8")
+    readme_flat = _squash_whitespace(readme_text)
+    create_tokens = _readme_bash_tokens_after(
+        readme_text,
+        "Create a scenario-backed evalset:",
+    )
+    add_tokens = _readme_bash_tokens_after(
+        readme_text,
+        "Add eval cases from the checked-in scenario pack:",
+    )
+    eval_tokens = _readme_bash_tokens_after(
+        readme_text,
+        "Run the generated dynamic evalset:",
+    )
+    create_adk_index = create_tokens.index("adk")
+    add_adk_index = add_tokens.index("adk")
+    eval_adk_index = eval_tokens.index("adk")
+    create_agent_path = create_tokens[create_adk_index + 3]
+    create_evalset_id = create_tokens[create_adk_index + 4]
+    add_agent_path = add_tokens[add_adk_index + 3]
+    add_evalset_id = add_tokens[add_adk_index + 4]
+    eval_agent_path = eval_tokens[eval_adk_index + 2]
+    eval_evalset_id = eval_tokens[eval_adk_index + 3]
+    generated_evalset_path = f"{eval_agent_path}/{eval_evalset_id}.evalset.json"
+    root_agent = _load_cli_root_agent(
+        monkeypatch,
+        repository_root,
+        eval_agent_path,
+    )
+
+    # Assert
+    assert create_tokens[create_adk_index + 1 : create_adk_index + 3] == [
+        "eval_set",
+        "create",
+    ]
+    assert add_tokens[add_adk_index + 1 : add_adk_index + 3] == [
+        "eval_set",
+        "add_eval_case",
+    ]
+    assert eval_tokens[eval_adk_index + 1] == "eval"
+    assert create_agent_path == "orchestrator_demo/orchestrator"
+    assert {create_agent_path, add_agent_path, eval_agent_path} == {
+        create_agent_path
+    }
+    assert create_evalset_id == "orchestrator_user_sim"
+    assert {create_evalset_id, add_evalset_id, eval_evalset_id} == {
+        create_evalset_id
+    }
+    assert root_agent.name == "orchestrator"
+    assert "--scenarios_file" in add_tokens
+    assert "orchestrator_demo/evals/conversation_scenarios.json" in add_tokens
+    assert "--session_input_file" in add_tokens
+    assert "orchestrator_demo/evals/session_input.json" in add_tokens
+    assert "--config_file_path" in eval_tokens
+    assert "orchestrator_demo/evals/user_sim_eval_config.json" in eval_tokens
+    assert "--print_detailed_results" in eval_tokens
+    assert _is_git_ignored(repository_root, generated_evalset_path)
+    assert "generated User Simulation evalsets" in readme_flat
+    assert "checked-in source fixtures" in readme_flat
+
+
+def test_eval_readme_documents_user_simulation_credentials_and_metric_caveats(
+    repository_root: Path,
+) -> None:
+    # Arrange
+    readme_path = repository_root / "orchestrator_demo" / "evals" / "README.md"
+    required_credential_notes = {
+        "google cloud",
+        "vertex",
+        "project ownership",
+        "api enablement",
+        "quota",
+        "budgets",
+        "costs",
+    }
+    configured_metric_names = {
+        "hallucinations_v1",
+        "safety_v1",
+        "multi_turn_task_success_v1",
+        "multi_turn_trajectory_quality_v1",
+        "multi_turn_tool_use_quality_v1",
+        "per_turn_user_simulator_quality_v1",
+    }
+
+    # Act
+    readme_text = readme_path.read_text(encoding="utf-8")
+    readme_lower = readme_text.lower()
+
+    # Assert
+    assert all(note in readme_lower for note in required_credential_notes)
+    assert configured_metric_names <= set(re.findall(r"[a-z0-9_]+_v1", readme_text))
+    assert "google-adk==2.1.0" in readme_text
+    assert "unsupported or unavailable" in readme_lower
+    assert "non-blocking until validated" in readme_lower
+
+
+def test_generated_user_simulation_evalsets_are_ignored_by_default(
+    repository_root: Path,
+) -> None:
+    # Arrange
+    generated_evalset_paths = {
+        "orchestrator_demo/orchestrator/orchestrator_user_sim.evalset.json",
+        "orchestrator_demo/evals/generated/orchestrator_user_sim.evalset.json",
+        "orchestrator_demo/evals/orchestrator_user_sim.evalset.json",
+    }
+    checked_in_user_sim_fixture_paths = {
+        "orchestrator_demo/evals/conversation_scenarios.json",
+        "orchestrator_demo/evals/session_input.json",
+        "orchestrator_demo/evals/user_sim_eval_config.json",
+        "orchestrator_demo/evals/user_simulation_generation_config.example.json",
+    }
+
+    # Act
+    ignored_generated_paths = {
+        path
+        for path in generated_evalset_paths
+        if _is_git_ignored(repository_root, path)
+    }
+    ignored_fixture_paths = {
+        path
+        for path in checked_in_user_sim_fixture_paths
+        if _is_git_ignored(repository_root, path)
+    }
+
+    # Assert
+    assert ignored_generated_paths == generated_evalset_paths
+    assert ignored_fixture_paths == set()
 
 
 def test_basic_eval_config_uses_conservative_fixed_eval_criteria(
