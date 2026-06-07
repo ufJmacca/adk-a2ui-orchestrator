@@ -13,3 +13,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *.db
+orchestrator_demo/orchestrator/orchestrator_user_sim*.evalset.json
+orchestrator_demo/evals/generated/
+orchestrator_demo/evals/orchestrator_user_sim*.evalset.json
