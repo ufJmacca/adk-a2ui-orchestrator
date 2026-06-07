@@ -1,0 +1,6 @@
+{
+  "count": 5,
+  "generation_instruction": "Generate synthetic business banking relationship-manager scenarios that exercise plan review, plan edits, explicit approval, rejection, and safe caveats. Do not include real customer data, real secrets, or regulated decisions.",
+  "environment_context": "The orchestrator has synthetic specialists for internal knowledge, relationship summary, web search, industry research, credit risk, product opportunity, compliance policy, data quality, meeting prep, and synthesis. Complex requests require structured plan approval before specialist graph execution.",
+  "model_name": "gemini-flash-latest"
+}

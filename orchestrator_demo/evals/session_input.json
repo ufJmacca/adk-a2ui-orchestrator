@@ -1,0 +1,8 @@
+{
+  "appName": "orchestrator_demo",
+  "userId": "synthetic_relationship_manager",
+  "state": {
+    "eval_mode": "user_simulation",
+    "data_policy": "synthetic_only"
+  }
+}
