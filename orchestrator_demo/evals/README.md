@@ -148,15 +148,17 @@ Keep generated cases under `orchestrator_demo/evals/generated/` or use the
 local ADK eval set store, then promote only cleaned, synthetic, deterministic
 fixtures when they are intended to become source-controlled regression cases.
 
-The repository is locked to `google-adk[eval]==2.1.0`, with underlying
-`google-adk==2.1.0` ADK APIs. Dynamic User Simulation can use the locked eval
-extra, but live simulator or judge paths may still require Google Cloud and
-Vertex credentials.
+The repository is locked to `google-adk[eval]==2.1.0`, so local commands should
+continue to use the locked `uv` environment. Dynamic User Simulation runs still
+remain opt-in because they may require Google Cloud/Vertex credentials, API
+enablement, quota, budgets, and cost controls.
 
 Create a scenario-backed evalset:
 
 ```bash
-uv run --locked adk eval_set create \
+ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked adk eval_set create \
   orchestrator_demo/orchestrator \
   orchestrator_user_sim
 ```
@@ -164,7 +166,9 @@ uv run --locked adk eval_set create \
 Add eval cases from the checked-in scenario pack:
 
 ```bash
-uv run --locked adk eval_set add_eval_case \
+ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked adk eval_set add_eval_case \
   orchestrator_demo/orchestrator \
   orchestrator_user_sim \
   --scenarios_file orchestrator_demo/evals/conversation_scenarios.json \
@@ -220,12 +224,11 @@ one, the generated scenario-backed evalset. Treat those artifacts as review
 outputs: do not promote generated content into source control until it has been
 checked for synthetic-only content, secrets, and regulated decision language.
 
-These commands may require Google Cloud and Vertex credentials depending on the
-ADK command path being used. Before enabling scheduled or blocking runs, define
-Google Cloud/Vertex project ownership, API enablement, quota, budgets, possible
+Before enabling scheduled or blocking runs, define project ownership for the
+Google Cloud/Vertex environment, API enablement, quota, budgets, possible
 costs, and cost review ownership. Do not commit credentials, service-account
-files, tokens, `.env` values, generated customer data, or generated eval results
-that have not been reviewed for synthetic-only content.
+files, tokens, `.env` values, generated customer data, or generated eval
+results that have not been reviewed for synthetic-only content.
 
 `user_sim_eval_config.json` intentionally uses User Simulation metrics instead
 of fixed expected-response criteria:
