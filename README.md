@@ -147,6 +147,9 @@ repository and documentation hygiene, `uv run pytest tests/test_adk_tool_flows.p
 for ADK tool behavior, and `uv run pytest tests/test_adk_a2a_plugin.py` for A2A
 exposure.
 
+Fixed ADK evalset compatibility, local pytest execution, CLI smoke usage, and
+ADK Web capture guidance are documented in `orchestrator_demo/evals/README.md`.
+
 ## Known Limitations
 
 - synthetic data only.

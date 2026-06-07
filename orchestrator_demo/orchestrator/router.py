@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 from collections.abc import Sequence
 
 from orchestrator_demo.app.logging import log_audit_event
@@ -29,6 +31,8 @@ from orchestrator_demo.registry.agent_registry import AgentRegistry
 SENSITIVE_INTENTS: set[IntentName] = {"credit_risk", "compliance_policy"}
 SENSITIVE_AGENTS = {"credit_risk", "compliance_policy"}
 SYNTHESIS_AGENT_ID = "synthesis"
+_DETERMINISTIC_MODEL_ENV = "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL"
+_ADK_EVAL_MODE_ENV = "ORCHESTRATOR_DEMO_ADK_EVAL_MODE"
 
 
 class RequestRouter:
@@ -98,11 +102,17 @@ class RequestRouter:
             },
         )
 
+        context_kwargs: dict[str, str] = {}
+        plan_scope_id = _deterministic_eval_plan_scope_id(user_input)
+        if plan_scope_id is not None:
+            context_kwargs["plan_scope_id"] = plan_scope_id
+
         return RequestContext(
             user_input=user_input,
             slm_suggestion=slm_suggestion,
             llm_assessment=llm_assessment,
             decision=decision,
+            **context_kwargs,
         )
 
     def _decide(
@@ -287,6 +297,19 @@ def _plan_required_reason(
 
     return f"Plan approval required: {', '.join(reasons)}."
 
+
+def _deterministic_eval_plan_scope_id(user_input: str) -> str | None:
+    if not (
+        _truthy_env(_DETERMINISTIC_MODEL_ENV)
+        and _truthy_env(_ADK_EVAL_MODE_ENV)
+    ):
+        return None
+
+    return hashlib.sha256(user_input.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def _dedupe(values: Sequence[str]) -> list[str]:

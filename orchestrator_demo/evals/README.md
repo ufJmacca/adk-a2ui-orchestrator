@@ -1,19 +1,20 @@
 # ADK Evaluation Compatibility
 
-This directory is reserved for ADK evalsets and User Simulation artifacts. The
-first compatibility slice keeps production behavior unchanged and records the
-locked evaluator surface before adding checked-in eval cases.
+This directory contains ADK evalsets and User Simulation artifacts. The fixed
+evalset keeps production behavior unchanged while exercising deterministic
+tool routing, plan approval, rejection, and safe final-response behavior.
 
 ## Locked Version
 
-The repository remains pinned to `google-adk==2.1.0` in `pyproject.toml` and
-`uv.lock`. No additional eval extras or dependencies are required for the
-current compatibility checks.
+The repository remains pinned to ADK 2.1.0 with `google-adk[eval]==2.1.0` in
+`pyproject.toml` and `uv.lock`, so the locked environment includes the optional
+eval dependencies required by the ADK CLI.
 
 Confirmed import command:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
   uv run --locked python -c "from google.adk.evaluation.agent_evaluator import AgentEvaluator; from google.adk.evaluation.eval_set import EvalSet; from google.adk.evaluation.eval_config import EvalConfig"
 ```
 
@@ -52,26 +53,64 @@ AgentEvaluator.evaluate_eval_set(
 `eval_cases`, and `creation_timestamp`. `EvalConfig` accepts `criteria`,
 `customMetrics`, and `userSimulatorConfig`.
 
-The focused compatibility test is:
+## Local Fixed Eval Workflow
+
+Synchronize the locked environment before running fixed evals:
+
+```bash
+uv sync --locked
+```
+
+The focused pytest wrapper for the checked-in fixed evalset is:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
-  uv run --locked pytest tests/test_adk_evalsets.py -q
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked pytest tests/test_adk_evalsets.py
 ```
 
 If a future locked ADK build removes or reshapes these imports, the test skips
 with a locked-version reason that names the missing module or symbol.
+
+Fixed evals do not require `OPENROUTER_API_KEY` in deterministic mode. Eval
+commands, pytest failures, ADK CLI output, and captured fixtures must not log
+secrets, `.env` values, real customer data, credentials, or production banking
+decisions.
+
+## CI Eval Lane
+
+GitHub Actions keeps the `quality` job focused on deterministic software gates:
+lock check, locked sync, Ruff, Mypy, and the full pytest suite.
+
+The separate `eval-basic` job runs only the fixed eval pytest wrapper with
+`ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1` and
+`ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1`:
+
+```bash
+uv run --locked pytest tests/test_adk_evalsets.py -ra
+```
+
+The `-ra` flag keeps explicit skip reasons visible when the locked ADK eval API
+is incompatible, and the pytest wrapper emits case-level diagnostics for eval
+failures. CI also uploads the `eval-basic` log as a GitHub Actions artifact
+named `eval-basic-results`.
+
+The `eval-basic` lane is intentionally separate and non-required until
+maintainers accept the baseline flake rate.
 
 ## CLI Compatibility
 
 CLI compatibility finding for this slice:
 
 `uv run --locked adk eval --help` confirms that ADK 2.1.0 exposes this command
-shape. Once the checked-in evalset and config exist, use the loader-compatible
-orchestrator directory with the deterministic model enabled:
+shape. Use the loader-compatible orchestrator directory with both deterministic
+eval flags enabled. The supported narrow CLI target is
+`orchestrator_demo/orchestrator`; package-root `orchestrator_demo` eval loading
+is not the documented path for this repository.
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
   uv run --locked adk eval \
   orchestrator_demo/orchestrator \
   orchestrator_demo/evals/basic_evalset.evalset.json \
@@ -81,9 +120,8 @@ ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
 
 The CLI help describes `EVAL_SET_FILE_PATH_OR_ID` as one or more eval set file
 paths or eval set IDs, with optional `:eval_case_id` suffix filtering. The
-checked-in `basic_evalset.evalset.json` and config are added in a later slice,
-so this slice confirms the CLI accepts an eval set file path argument but does
-not yet run a repository evalset fixture.
+checked-in `basic_evalset.evalset.json` and config run under this command in
+the locked environment.
 
 ## ADK Web Capture
 
@@ -94,6 +132,11 @@ cases, then promote cleaned synthetic cases into the fixed evalset:
 uv run adk web orchestrator_demo --host 0.0.0.0 --port 8000
 ```
 
+Captured sessions must be cleaned, synthetic, and manually promoted into
+`basic_evalset.evalset.json`. Before promotion, remove exploratory turns,
+transient IDs that are not part of the assertion, real names, secrets, `.env`
+values, credentials, and any regulated decision language.
+
 ## User Simulation
 
 User Simulation is an opt-in dynamic evaluation lane. The checked-in files in
@@ -103,24 +146,15 @@ Keep generated cases under `orchestrator_demo/evals/generated/` or use the
 local ADK eval set store, then promote only cleaned, synthetic, deterministic
 fixtures when they are intended to become source-controlled regression cases.
 
-The repository lock intentionally keeps `google-adk==2.1.0` without the ADK eval
-extra. User Simulation generation and dynamic `adk eval` execution require an
-out-of-band environment with the same ADK version plus the eval extra installed;
-do not run these dynamic commands as `uv run --locked adk ...` unless
-`google-adk[eval]==2.1.0` has first been added to and locked in the project.
-
-Example out-of-band setup:
-
-```bash
-uv venv .venv-adk-eval
-. .venv-adk-eval/bin/activate
-uv pip install -e . "google-adk[eval]==2.1.0"
-```
+The repository is locked to `google-adk[eval]==2.1.0`, with underlying
+`google-adk==2.1.0` ADK APIs. Dynamic User Simulation can use the locked eval
+extra, but live simulator or judge paths may still require Google Cloud and
+Vertex credentials.
 
 Create a scenario-backed evalset:
 
 ```bash
-adk eval_set create \
+uv run --locked adk eval_set create \
   orchestrator_demo/orchestrator \
   orchestrator_user_sim
 ```
@@ -128,7 +162,7 @@ adk eval_set create \
 Add eval cases from the checked-in scenario pack:
 
 ```bash
-adk eval_set add_eval_case \
+uv run --locked adk eval_set add_eval_case \
   orchestrator_demo/orchestrator \
   orchestrator_user_sim \
   --scenarios_file orchestrator_demo/evals/conversation_scenarios.json \
@@ -139,7 +173,8 @@ Run the generated dynamic evalset:
 
 ```bash
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
-  adk eval \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
+  uv run --locked adk eval \
   orchestrator_demo/orchestrator \
   orchestrator_user_sim \
   --config_file_path orchestrator_demo/evals/user_sim_eval_config.json \
