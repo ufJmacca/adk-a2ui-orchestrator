@@ -52,6 +52,7 @@ from orchestrator_demo.orchestrator.service import (
 
 ORCHESTRATOR_SESSION_STATE_KEY = "orchestrator_session"
 DETERMINISTIC_MODEL_ENV = "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL"
+ADK_EVAL_MODE_ENV = "ORCHESTRATOR_DEMO_ADK_EVAL_MODE"
 _FINAL_APPROVAL_STATUSES = frozenset(
     {"approved", "approved_execution_failed", "rejected"}
 )
@@ -490,7 +491,7 @@ class AdkOrchestratorAdapter:
             return
 
         try:
-            actions.skip_summarization = True
+            actions.skip_summarization = not _deterministic_adk_eval_mode_enabled()
         except AttributeError:
             return
 
@@ -763,6 +764,10 @@ def _runtime_model() -> Any:
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _deterministic_adk_eval_mode_enabled() -> bool:
+    return _truthy_env(DETERMINISTIC_MODEL_ENV) and _truthy_env(ADK_EVAL_MODE_ENV)
 
 
 class DeterministicOrchestratorModel(BaseLlm):
@@ -1154,7 +1159,9 @@ def _plan_field(plan: Mapping[str, Any], *field_names: str) -> Any:
 
 
 __all__ = [
+    "ADK_EVAL_MODE_ENV",
     "AdkOrchestratorAdapter",
+    "DETERMINISTIC_MODEL_ENV",
     "OrchestratorAgent",
     "app",
     "build_app",

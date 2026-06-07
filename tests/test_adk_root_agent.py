@@ -1,5 +1,7 @@
 import inspect
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -104,6 +106,64 @@ def test_agent_module_exports_root_agent_and_app(monkeypatch) -> None:
     assert app.name == "orchestrator"
     assert app.root_agent is root_agent
     assert any(isinstance(plugin, A2uiA2AProtocolPlugin) for plugin in app.plugins)
+
+
+def test_orchestrator_package_lazy_exports_resolve_in_fresh_process() -> None:
+    # Arrange
+    env = {
+        **os.environ,
+        "ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL": "1",
+        "ORCHESTRATOR_DEMO_ADK_EVAL_MODE": "1",
+    }
+    env.pop("OPENROUTER_API_KEY", None)
+    code = """
+import json
+import sys
+
+import orchestrator_demo.orchestrator as o
+
+agent_module_name = "orchestrator_demo.orchestrator.agent"
+before = {
+    "agent_in_sys_modules": agent_module_name in sys.modules,
+    "export_attrs": sorted(
+        name for name in ("agent", "app", "root_agent") if name in o.__dict__
+    ),
+    "all": sorted(o.__all__),
+}
+
+assert before["agent_in_sys_modules"] is False, before
+assert before["export_attrs"] == [], before
+assert before["all"] == ["agent", "app", "root_agent"], before
+
+agent = o.agent
+root_agent = o.root_agent
+app = o.app
+
+assert agent.__name__ == agent_module_name
+assert agent.root_agent is root_agent
+assert root_agent.name == "orchestrator"
+assert app.name == "orchestrator"
+assert app.root_agent is root_agent
+print(json.dumps({"agent": agent.__name__, "app": app.name, "root_agent": root_agent.name}))
+"""
+
+    # Act
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPOSITORY_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    # Assert
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "agent": "orchestrator_demo.orchestrator.agent",
+        "app": "orchestrator",
+        "root_agent": "orchestrator",
+    }
 
 
 def test_root_agent_instruction_requires_tools_and_structured_approval() -> None:
