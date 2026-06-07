@@ -120,6 +120,7 @@ The runner must:
 
 - use `uv run --locked pytest tests/test_adk_evalsets.py`,
 - set `ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1`,
+- set `ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1`,
 - avoid requiring `OPENROUTER_API_KEY` for deterministic fixed evals,
 - skip with a clear message if the locked ADK version does not support the selected evalset runner shape,
 - never log secrets or `.env` values,
@@ -132,8 +133,9 @@ Document local commands in `orchestrator_demo/evals/README.md`:
 ```bash
 uv sync --locked
 ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1 \
+ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1 \
   uv run --locked adk eval \
-  orchestrator_demo \
+  orchestrator_demo/orchestrator \
   orchestrator_demo/evals/basic_evalset.evalset.json \
   --config_file_path orchestrator_demo/evals/basic_eval_config.json \
   --print_detailed_results
@@ -347,7 +349,8 @@ Goal: prove the locked ADK evaluator and CLI can load `orchestrator_demo` and ru
 Acceptance criteria:
 
 - `AgentEvaluator` import and one smoke eval are covered.
-- The smoke eval uses `ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1`.
+- The smoke eval uses `ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL=1` and
+  `ORCHESTRATOR_DEMO_ADK_EVAL_MODE=1`.
 - Skip behavior is clear when the ADK eval API shape is incompatible.
 - No live model credentials are required.
 

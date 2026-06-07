@@ -1049,6 +1049,88 @@ async def test_approval_action_freezes_plan_executes_graph_and_returns_artifacts
     assert result.final_artifacts["final_response"].agent_id == "synthesis"
 
 
+@pytest.mark.parametrize("final_action", ["approved", "rejected"])
+@pytest.mark.asyncio
+async def test_eval_mode_repeated_final_plan_prompt_gets_new_draft_id(
+    monkeypatch: pytest.MonkeyPatch,
+    final_action: str,
+) -> None:
+    # Arrange
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    service = OrchestratorService()
+    user_input = "Prepare me for a meeting with ABC Manufacturing."
+    first = await service.handle_user_request(user_input)
+    assert first.approval_plan is not None
+    first_plan = first.approval_plan
+
+    if final_action == "approved":
+        final_event = _approve_event(
+            first_plan.plan_id,
+            first_plan.approval_surface_id or "",
+            [step.step_id for step in first_plan.steps],
+        )
+    else:
+        final_event = _reject_event(
+            first_plan.plan_id,
+            first_plan.approval_surface_id or "",
+        )
+    finalized = await service.handle_user_action(final_event)
+    assert finalized.status == final_action
+
+    # Act
+    second = await service.handle_user_request(user_input)
+
+    # Assert
+    assert second.path == "plan_required"
+    assert second.approval_plan is not None
+    assert second.context.plan_scope_id == f"{first.context.plan_scope_id}_2"
+    assert second.approval_plan.plan_id == f"{first_plan.plan_id}_2"
+    assert service.approval_record(first_plan.plan_id).status == final_action
+    assert service.approval_record(second.approval_plan.plan_id).status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_eval_mode_repeated_pending_plan_prompt_gets_new_draft_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_DETERMINISTIC_MODEL", "1")
+    monkeypatch.setenv("ORCHESTRATOR_DEMO_ADK_EVAL_MODE", "1")
+    service = OrchestratorService()
+    user_input = "Prepare me for a meeting with ABC Manufacturing."
+    first = await service.handle_user_request(user_input)
+    assert first.approval_plan is not None
+    first_plan = first.approval_plan
+    first_step_id = first_plan.steps[0].step_id
+
+    edited = await service.handle_user_action(
+        _add_instruction_event(
+            first_plan.plan_id,
+            first_plan.approval_surface_id or "",
+            step_id=first_step_id,
+        )
+    )
+    assert edited.status == "draft_updated"
+
+    # Act
+    second = await service.handle_user_request(user_input)
+
+    # Assert
+    assert second.path == "plan_required"
+    assert second.approval_plan is not None
+    assert second.context.plan_scope_id == f"{first.context.plan_scope_id}_2"
+    assert second.approval_plan.plan_id == f"{first_plan.plan_id}_2"
+
+    first_record = service.approval_record(first_plan.plan_id)
+    assert first_record.status == "draft"
+    assert first_record.draft_plan.plan_version == 2
+    assert "Additional instruction: Prioritize covenant follow-ups." in (
+        first_record.draft_plan.steps[0].instruction
+    )
+    assert service.approval_record(second.approval_plan.plan_id).status == "draft"
+
+
 @pytest.mark.asyncio
 async def test_approval_returns_graph_result_when_specialist_a2ui_is_invalid() -> None:
     # Arrange
