@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncGenerator
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -780,14 +781,46 @@ class DeterministicOrchestratorModel(BaseLlm):
         llm_request: LlmRequest,
         stream: bool = False,
     ) -> AsyncGenerator[LlmResponse, None]:
-        if _current_turn_function_response(llm_request) is not None:
+        current_tool_response = _current_turn_function_response(llm_request)
+        if current_tool_response is not None:
             yield _text_response(
-                "Structured orchestrator tool response returned to the A2A client."
+                _deterministic_tool_response_summary(current_tool_response)
             )
             return
 
         if "submit_orchestrator_request" in llm_request.tools_dict:
             user_input = _latest_user_text(llm_request)
+            draft_response = _latest_draft_plan_tool_response(llm_request)
+            if draft_response is not None:
+                if (
+                    "reject_orchestrator_plan" in llm_request.tools_dict
+                    and _looks_like_rejection(user_input)
+                ):
+                    identifiers = _draft_plan_identifiers(draft_response)
+                    function_call = types.Part.from_function_call(
+                        name="reject_orchestrator_plan",
+                        args={
+                            "plan_id": identifiers["plan_id"],
+                            "approval_surface_id": identifiers["approval_surface_id"],
+                            "reason": _rejection_reason_from_text(user_input),
+                            "edited_plan_version": identifiers["plan_version"],
+                        },
+                    )
+                    if function_call.function_call is not None:
+                        function_call.function_call.id = (
+                            "call_reject_orchestrator_plan"
+                        )
+                    yield LlmResponse(
+                        content=types.Content(role="model", parts=[function_call])
+                    )
+                    return
+
+                if _looks_like_natural_language_approval(user_input):
+                    yield _text_response(
+                        _structured_approval_guidance(draft_response)
+                    )
+                    return
+
             function_call = types.Part.from_function_call(
                 name="submit_orchestrator_request",
                 args={"user_input": user_input},
@@ -818,6 +851,31 @@ def _current_turn_function_response(llm_request: LlmRequest) -> Any:
     return None
 
 
+def _latest_draft_plan_tool_response(llm_request: LlmRequest) -> Mapping[str, Any] | None:
+    finalized_plan_ids: set[str] = set()
+    for content in reversed(llm_request.contents):
+        for part in reversed(content.parts or []):
+            function_response = part.function_response
+            if function_response is None or not isinstance(
+                function_response.response,
+                Mapping,
+            ):
+                continue
+            response = function_response.response
+            status = _text_field(response, "status", "path")
+            if status in _FINAL_APPROVAL_STATUSES:
+                plan_id = _plan_id_from_tool_response(response)
+                if plan_id:
+                    finalized_plan_ids.add(plan_id)
+                continue
+            if status in {"plan_required", "draft_updated"}:
+                plan_id = _plan_id_from_tool_response(response)
+                if plan_id in finalized_plan_ids:
+                    continue
+                return response
+    return None
+
+
 def _latest_user_text(llm_request: LlmRequest) -> str:
     for content in reversed(llm_request.contents):
         if content.role != "user":
@@ -836,6 +894,293 @@ def _content_text(content: types.Content) -> str:
     return "\n".join(
         part.text for part in content.parts or [] if isinstance(part.text, str)
     )
+
+
+def _deterministic_tool_response_summary(tool_response: Any) -> str:
+    if not isinstance(tool_response, Mapping):
+        return "Structured orchestrator tool response returned to the A2A client."
+
+    status = _text_field(tool_response, "status", "path")
+    if status == "direct":
+        return _direct_tool_response_summary(tool_response)
+    if status in {"plan_required", "draft_updated"}:
+        identifiers = _draft_plan_identifiers(tool_response)
+        step_ids = _joined_step_ids(identifiers["step_ids"])
+        return (
+            f"Draft plan {identifiers['plan_id']} v{identifiers['plan_version']} "
+            f"requires structured approval on {identifiers['approval_surface_id']}. "
+            f"Step ids: {step_ids}. No specialist graph has executed. Use "
+            "approve_orchestrator_plan with planId, approvalSurfaceId, current "
+            "planVersion, and approved step ids, or reject_orchestrator_plan "
+            "with a reason."
+        )
+    if status == "rejected":
+        identifiers = _draft_plan_identifiers(tool_response)
+        reason = _text_field(tool_response, "reason") or "No reason supplied."
+        return (
+            f"Plan {identifiers['plan_id']} v{identifiers['plan_version']} was "
+            f"rejected on {identifiers['approval_surface_id']}. Reason: {reason} "
+            "No specialist graph executed."
+        )
+
+    return "Structured orchestrator tool response returned to the A2A client."
+
+
+def _direct_tool_response_summary(tool_response: Mapping[str, Any]) -> str:
+    artifacts = tool_response.get("artifacts")
+    final_response = (
+        artifacts.get("final_response")
+        if isinstance(artifacts, Mapping)
+        else None
+    )
+    if not isinstance(final_response, Mapping):
+        return "Direct orchestrator response returned without plan approval."
+
+    agent_id = _text_field(final_response, "agent_id", "agentId") or "orchestrator"
+    summary = (
+        _text_field(final_response, "summary", "content", "response", "message")
+        or "No summary text returned."
+    )
+    return f"Direct orchestrator response from {agent_id}: {summary}"
+
+
+def _structured_approval_guidance(draft_response: Mapping[str, Any]) -> str:
+    identifiers = _draft_plan_identifiers(draft_response)
+    step_ids = _joined_step_ids(identifiers["step_ids"])
+    return (
+        f"Natural-language approval cannot execute draft plan "
+        f"{identifiers['plan_id']}. Use structured approval with planId "
+        f"{identifiers['plan_id']}, approvalSurfaceId "
+        f"{identifiers['approval_surface_id']}, current planVersion "
+        f"{identifiers['plan_version']}, and approved step ids: {step_ids}."
+    )
+
+
+def _draft_plan_identifiers(response: Mapping[str, Any]) -> dict[str, Any]:
+    plan = _mapping_field(response, "plan", "approvalPlan", "approval_plan")
+    plan_id = _plan_id_from_tool_response(response)
+    approval_surface_id = _text_field(
+        response,
+        "approvalSurfaceId",
+        "approval_surface_id",
+    ) or _text_field(plan, "approvalSurfaceId", "approval_surface_id")
+    plan_version = _int_field(response, "planVersion", "plan_version")
+    if plan_version is None:
+        plan_version = _int_field(plan, "planVersion", "plan_version")
+    step_ids = _step_ids_from_response(response) or _step_ids_from_response(plan)
+    resolved_plan_id = plan_id or "unknown_plan"
+
+    return {
+        "plan_id": resolved_plan_id,
+        "approval_surface_id": approval_surface_id or f"surface_{resolved_plan_id}",
+        "plan_version": plan_version if plan_version is not None else 1,
+        "step_ids": step_ids,
+    }
+
+
+def _plan_id_from_tool_response(response: Mapping[str, Any]) -> str | None:
+    plan = _mapping_field(response, "plan", "approvalPlan", "approval_plan")
+    return _text_field(response, "planId", "plan_id") or _text_field(
+        plan,
+        "planId",
+        "plan_id",
+    )
+
+
+def _step_ids_from_response(response: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(response, Mapping):
+        return []
+
+    step_ids = response.get("stepIds")
+    if not isinstance(step_ids, Sequence) or isinstance(step_ids, str):
+        step_ids = response.get("step_ids")
+    if isinstance(step_ids, Sequence) and not isinstance(step_ids, str):
+        return [str(step_id) for step_id in step_ids if isinstance(step_id, str)]
+
+    steps = response.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, str):
+        return []
+    collected: list[str] = []
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        step_id = _text_field(step, "stepId", "step_id")
+        if step_id:
+            collected.append(step_id)
+    return collected
+
+
+def _joined_step_ids(step_ids: Sequence[str]) -> str:
+    return ", ".join(step_ids) if step_ids else "none"
+
+
+def _looks_like_rejection(text: str) -> bool:
+    normalized = text.casefold()
+    if any(
+        phrase in normalized
+        for phrase in (
+            "do not approve",
+            "don't approve",
+            "cannot approve",
+            "can not approve",
+            "can't approve",
+            "cant approve",
+            "unable to approve",
+            "not able to approve",
+            "do not proceed",
+            "don't proceed",
+            "dont proceed",
+            "do not go ahead",
+            "don't go ahead",
+            "dont go ahead",
+            "do not run",
+            "don't run",
+        )
+    ):
+        return True
+
+    return _has_unnegated_rejection_keyword(normalized)
+
+
+def _looks_like_natural_language_approval(text: str) -> bool:
+    normalized = text.casefold()
+    if _has_negated_rejection_keyword(normalized):
+        return True
+
+    terse_tokens = normalized.strip(" \t\n\r.,!?:;").replace(",", " ").split()
+    if terse_tokens and all(
+        token in {"yes", "y", "ok", "okay", "sure", "please"}
+        for token in terse_tokens
+    ):
+        return any(
+            token in {"yes", "y", "ok", "okay", "sure"} for token in terse_tokens
+        )
+
+    return any(
+        _has_unnegated_phrase(normalized, phrase)
+        for phrase in ("looks good", "run it", "go ahead")
+    ) or _has_unnegated_approval_keyword(normalized)
+
+
+def _has_unnegated_phrase(normalized: str, phrase: str) -> bool:
+    phrase_pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+    pattern = rf"\b{phrase_pattern}\b"
+    return any(
+        not _keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(pattern, normalized)
+    )
+
+
+def _has_unnegated_approval_keyword(normalized: str) -> bool:
+    stripped = normalized.strip(" \t\n\r.,!?:;")
+    if stripped == "approved":
+        return True
+    return any(
+        not _keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(r"\b(?:approve|proceed)\b", normalized)
+    )
+
+
+def _has_unnegated_rejection_keyword(normalized: str) -> bool:
+    return any(
+        not _rejection_keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(r"\b(?:reject|cancel|stop)\b", normalized)
+    )
+
+
+def _has_negated_rejection_keyword(normalized: str) -> bool:
+    return any(
+        _rejection_keyword_is_negated(normalized[: match.start()])
+        for match in re.finditer(r"\b(?:reject|cancel|stop)\b", normalized)
+    )
+
+
+def _rejection_keyword_is_negated(prefix: str) -> bool:
+    return _keyword_is_negated(prefix)
+
+
+def _keyword_is_negated(prefix: str) -> bool:
+    return bool(
+        re.search(
+            (
+                r"(?:\b(?:do not|don't|dont|never|not)\b(?:\s+\w+){0,3}"
+                r"|\b(?:no need|do not need|don't need|dont need)\s+to"
+                r"(?:\s+\w+){0,3})$"
+            ),
+            prefix.rstrip(),
+        )
+    )
+
+
+def _rejection_reason_from_text(text: str) -> str:
+    stripped = text.strip()
+    if ":" in stripped:
+        reason = stripped.split(":", maxsplit=1)[1].strip()
+        if reason:
+            return reason
+
+    normalized = stripped.casefold()
+    for phrase in ("because", "since"):
+        marker = f" {phrase} "
+        if marker in normalized:
+            index = normalized.index(marker) + len(marker)
+            reason = stripped[index:].strip(" .")
+            if reason:
+                return f"{reason[:1].upper()}{reason[1:]}."
+
+    for prefix in (
+        "reject it",
+        "reject this",
+        "reject the plan",
+        "do not run it",
+        "don't run it",
+        "cancel it",
+    ):
+        if normalized.startswith(prefix):
+            reason = stripped[len(prefix) :].strip(" .:-")
+            if reason:
+                return reason
+
+    return "User rejected the draft plan."
+
+
+def _mapping_field(
+    mapping: Mapping[str, Any] | None,
+    *field_names: str,
+) -> Mapping[str, Any] | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    for field_name in field_names:
+        value = mapping.get(field_name)
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _text_field(
+    mapping: Mapping[str, Any] | None,
+    *field_names: str,
+) -> str | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    for field_name in field_names:
+        value = mapping.get(field_name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _int_field(
+    mapping: Mapping[str, Any] | None,
+    *field_names: str,
+) -> int | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    for field_name in field_names:
+        value = mapping.get(field_name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 def _deterministic_intent_assessment(llm_request: LlmRequest) -> dict[str, Any]:
