@@ -116,7 +116,7 @@ jobs:
 
       - name: Upload eval-user-sim results
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-user-sim-results
           path: .ai-native/eval-user-sim/
