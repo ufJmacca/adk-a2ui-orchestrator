@@ -9,7 +9,7 @@ description = "Local ADK 2.0+ A2UI orchestrator demo for business banking relati
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "google-adk[eval]==2.1.0",
+    "google-adk[eval]==2.3.0",
     "a2ui-agent-sdk",
     "a2a-sdk>=0.3.4,<0.4",
     "litellm",
