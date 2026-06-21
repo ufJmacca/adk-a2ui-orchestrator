@@ -16,7 +16,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "python-dotenv",
-    "sse-starlette>=3.4.4",
+    "sse-starlette>=3.4.5",
 ]
 
 [dependency-groups]
